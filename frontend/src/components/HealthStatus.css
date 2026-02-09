@@ -1,0 +1,40 @@
+.health-status {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1rem;
+  font-size: 0.9rem;
+}
+
+.status-badge {
+  padding: 0.5rem 1rem;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+  font-weight: 500;
+}
+
+.status-badge.green {
+  background: rgba(76, 175, 80, 0.3);
+}
+
+.status-badge.red {
+  background: rgba(244, 67, 54, 0.3);
+}
+
+.health-details {
+  display: flex;
+  gap: 1.5rem;
+  color: white;
+  opacity: 0.9;
+}
+
+.health-details span {
+  font-size: 0.85rem;
+}
+
+.health-details strong {
+  margin-left: 0.25rem;
+  text-transform: uppercase;
+  font-weight: 600;
+}

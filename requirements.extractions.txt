@@ -1,0 +1,5 @@
+# Document Processing & Extraction
+docling==1.0.0
+docling-core==1.0.0
+langextract
+onnxruntime-gpu

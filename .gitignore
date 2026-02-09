@@ -1,0 +1,75 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Documents (local uploads)
+documents/
+!documents/.gitkeep
+
+# Docker
+.dockerignore
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Frontend
+frontend/build/
+frontend/node_modules/
+frontend/.cache/
+
+# Backend
+backend/.cache/
+backend/venv/
+
+# Database
+neo4j_data/
+neo4j_logs/
+
+# Temporary files
+*.tmp
+*.bak

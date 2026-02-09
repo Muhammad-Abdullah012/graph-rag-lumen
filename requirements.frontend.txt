@@ -1,0 +1,6 @@
+# Frontend dependencies are managed via npm/package.json
+# This file is for reference only
+
+# Build dependencies
+npm >= 8.0.0
+nodejs >= 18.0.0

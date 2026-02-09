@@ -1,0 +1,9 @@
+# Heavy ML packages (slow to install, rarely changes)
+langchain-huggingface
+sentence_transformers
+torch
+transformers
+accelerate
+huggingface_hub
+protobuf
+sentencepiece
