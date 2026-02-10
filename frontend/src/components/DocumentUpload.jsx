@@ -13,7 +13,7 @@ function DocumentUpload({ onUpload }) {
   const handleFileSelect = (e) => {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
-      if (!selectedFile.name.endsWith('.pdf')) {
+      if (!selectedFile.name.toLowerCase().endsWith('.pdf')) {
         setStatus('❌ Please select a PDF file');
         return;
       }

@@ -51,8 +51,8 @@ class TextSplitter:
             chunks_with_metadata = []
             
             for split in splits:
-                chunk_text = split.get("content", "")
-                metadata = split.get("metadata", {})
+                chunk_text = split.page_content
+                metadata = split.metadata
                 
                 # If chunk is too large, split further
                 if len(chunk_text) > chunk_size:

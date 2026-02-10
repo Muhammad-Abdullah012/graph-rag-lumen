@@ -4,6 +4,9 @@ import uuid
 from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
 from pydantic import BaseModel
+from concurrent.futures import ThreadPoolExecutor
+import aiofiles
+import asyncio
 
 from backend.app.modules.extraction import get_pdf_extractor
 from backend.app.modules.splitting import TextSplitter
@@ -16,6 +19,8 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 # Ensure documents directory exists
 Path(settings.documents_path).mkdir(parents=True, exist_ok=True)
+
+task_executor = ThreadPoolExecutor(max_workers=4)
 
 
 class DocumentUploadResponse(BaseModel):
@@ -68,8 +73,9 @@ async def upload_document(
         
         # Save file
         file_path = Path(settings.documents_path) / f"{document_id}_{file.filename}"
-        with open(file_path, 'wb') as f:
-            f.write(await file.read())
+        async with aiofiles.open(file_path, 'wb') as f:
+            content = await file.read()
+            await f.write(content)
         
         logger.info(f"Saved uploaded file: {file_path}")
         
@@ -104,7 +110,7 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def process_document(
+def _process_document_sync(
     document_id: str,
     file_path: str,
     filename: str,
@@ -162,6 +168,17 @@ async def process_document(
             "message": f"Error: {str(e)}"
         }
 
+async def process_document(document_id, file_path, filename, document_url):
+    """Async wrapper that offloads to thread pool"""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        task_executor,
+        _process_document_sync,
+        document_id,
+        file_path,
+        filename,
+        document_url
+    )
 
 @router.get("/status/{document_id}", response_model=ProcessingStatus)
 async def get_processing_status(document_id: str) -> ProcessingStatus:

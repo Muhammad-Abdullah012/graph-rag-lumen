@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import './App.css';
+// import './App.css';
 import DocumentUpload from './components/DocumentUpload';
 import QAChat from './components/QAChat';
 import HealthStatus from './components/HealthStatus';

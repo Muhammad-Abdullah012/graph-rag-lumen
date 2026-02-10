@@ -21,6 +21,18 @@ RUN pip install --no-cache-dir -r requirements.extractions.txt
 COPY requirements.backend.txt ./
 RUN pip install --no-cache-dir -r requirements.backend.txt
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libxcb1 \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libxtst6 \
+    libxi6 \
+    libgl1 \
+    libfontconfig1 \
+    libfreetype6 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 # Copy application
 COPY backend ./backend
 COPY config ./config

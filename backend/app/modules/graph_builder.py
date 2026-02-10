@@ -6,7 +6,7 @@ import uuid
 
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_core.documents import Document
-from langchain_community.llms.ollama import Ollama
+from langchain_ollama import ChatOllama
 
 from backend.app.modules.database import get_neo4j_connection
 from backend.app.modules.ollama_client import get_ollama_client
@@ -24,7 +24,7 @@ class GraphBuilder:
         self.ollama = get_ollama_client()
         
         # Initialize LLM for graph transformation
-        self.llm = Ollama(
+        self.llm = ChatOllama(
             base_url=settings.ollama_base_url.rstrip('/'),
             model=settings.ollama_graph_model,
             temperature=0.3,
