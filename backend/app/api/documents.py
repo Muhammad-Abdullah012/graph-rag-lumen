@@ -59,7 +59,7 @@ async def upload_document(
     """
     try:
         # Validate file
-        if not file.filename.endswith('.pdf'):
+        if not file.filename.lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are allowed")
         
         if file.size > settings.max_upload_size:
@@ -86,7 +86,7 @@ async def upload_document(
         background_tasks.add_task(
             process_document,
             document_id=document_id,
-            file_path=str(file_path),
+            file_path=str(file_path.resolve()),
             filename=file.filename,
             document_url=document_url
         )
