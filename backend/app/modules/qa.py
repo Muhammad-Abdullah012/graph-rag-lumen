@@ -80,7 +80,7 @@ class QASystem:
                 '{settings.vector_index_name}',
                 $top_k,
                 $embedding
-            ) AS (node, score)
+            ) YIELD node, score
             MATCH (node)-[:FROM_DOCUMENT]->(doc:Document)
             RETURN 
                 node.id as chunk_id,
@@ -108,26 +108,30 @@ class QASystem:
     
     def _retrieve_chunks_by_keyword(self, query_text: str, top_k: int) -> List[Dict[str, Any]]:
         """Fallback: retrieve chunks by keyword matching"""
-        words = query_text.lower().split()[:5]  # Use first 5 words
+        words = [word.lower() for word in query_text.strip().split()[:5] if word]
         
-        where_clause = " OR ".join([f"node.text CONTAINS '{word}'" for word in words])
+        if not words:
+            return []
         
-        cypher_query = f"""
+        cypher_query = """
             MATCH (node:DocumentChunk)-[:FROM_DOCUMENT]->(doc:Document)
-            WHERE {where_clause if where_clause else "true"}
+            WHERE ANY(word IN $words WHERE toLower(node.text) CONTAINS word)
             RETURN 
-                node.id as chunk_id,
-                node.text as text,
-                node.page_number as page_number,
-                doc.id as document_id,
-                doc.name as document_name,
-                doc.url as document_url,
-                0.5 as score
-            LIMIT {top_k}
+                node.id AS chunk_id,
+                node.text AS text,
+                node.page_number AS page_number,
+                doc.id AS document_id,
+                doc.name AS document_name,
+                doc.url AS document_url,
+                0.5 AS score
+            LIMIT $top_k
         """
         
         try:
-            return self.db.execute_query(cypher_query)
+            return self.db.execute_query(
+                cypher_query,
+                parameters={"words": words, "top_k": top_k}
+            )
         except Exception as e:
             logger.warning(f"Keyword search failed: {str(e)}")
             return []
