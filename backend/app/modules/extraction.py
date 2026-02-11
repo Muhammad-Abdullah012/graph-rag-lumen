@@ -5,10 +5,9 @@ from pathlib import Path
 from typing import Optional
 
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    AcceleratorOptions,
-    PdfPipelineOptions,
-)
+from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions, RapidOcrOptions
+from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 logger = logging.getLogger(__name__)
@@ -19,21 +18,29 @@ class PDFExtractor:
     
     def __init__(self):
         """Initialize PDF extractor with optimal settings"""
-        self.pdf_options = PdfPipelineOptions(
+        accelerator_options = AcceleratorOptions(
+            device=AcceleratorDevice.CUDA,  # Use CUDA for NVIDIA GPUs
+        )
+        pdf_options = ThreadedPdfPipelineOptions(
             do_code_enrichment=True,
             do_ocr=True,
+            ocr_options=RapidOcrOptions(
+                backend="torch",
+            ),
             do_table_structure=True,
             do_picture_classification=True,
-            accelerator_options=AcceleratorOptions(
-                num_threads=multiprocessing.cpu_count(),
-                device='auto'
-            )
+            do_formula_enrichment=True,
+            ocr_batch_size=8,
+            layout_batch_size=8,
+            table_batch_size=2,
+            accelerator_options=accelerator_options,
         )
         
         self.converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=self.pdf_options
+                    pipeline_cls=ThreadedStandardPdfPipeline,
+                    pipeline_options=pdf_options
                 )
             }
         )
