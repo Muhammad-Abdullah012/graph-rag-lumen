@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Optional
 
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import ThreadedPdfPipelineOptions, RapidOcrOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
+from docling.pipeline.threaded_standard_pdf_pipeline import StandardPdfPipeline
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 logger = logging.getLogger(__name__)
@@ -20,8 +20,10 @@ class PDFExtractor:
         """Initialize PDF extractor with optimal settings"""
         accelerator_options = AcceleratorOptions(
             device=AcceleratorDevice.CUDA,  # Use CUDA for NVIDIA GPUs
+            num_threads=1 # Limit to 1 thread to avoid issues with PyTorch on Windows (no Triton support)
+            # Note: for docker containers we should update it to use all available threads, but for Windows compatibility we need to limit it to 1
         )
-        pdf_options = ThreadedPdfPipelineOptions(
+        pdf_options = PdfPipelineOptions(
             do_code_enrichment=True,
             do_ocr=True,
             ocr_options=RapidOcrOptions(
@@ -30,16 +32,19 @@ class PDFExtractor:
             do_table_structure=True,
             do_picture_classification=True,
             do_formula_enrichment=True,
-            ocr_batch_size=8,
-            layout_batch_size=8,
-            table_batch_size=2,
+            ocr_batch_size=4,
+            layout_batch_size=4,
+            table_batch_size=1,
+            images_scale=2.0,
+            generate_page_images=True,
+            generate_picture_images=True,
             accelerator_options=accelerator_options,
         )
         
         self.converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(
-                    pipeline_cls=ThreadedStandardPdfPipeline,
+                    pipeline_cls=StandardPdfPipeline,
                     pipeline_options=pdf_options
                 )
             }
