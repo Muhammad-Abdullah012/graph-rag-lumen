@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import torch
 
 from backend.app.api import documents, qa, health
 from backend.app.modules.database import get_neo4j_connection
@@ -18,6 +19,12 @@ async def lifespan(app: FastAPI):
     try:
         logger.info("Initializing database connection...")
         get_neo4j_connection()
+        logger.info(f"PyTorch version: {torch.__version__}")
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        logger.info(f"CUDA version: {torch.version.cuda}")
+        logger.info(f"GPU device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
+        if torch.cuda.is_available():
+            torch.set_float32_matmul_precision('high')
         logger.info("Application started successfully")
     except Exception as e:
         logger.error(f"Failed to initialize application: {str(e)}")
