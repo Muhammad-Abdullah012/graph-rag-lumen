@@ -1,27 +1,11 @@
 # Backend Dockerfile
-FROM python:3.11-slim
+FROM pytorch/pytorch:2.10.0-cuda12.6-cudnn9-runtime
 
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy all requirements files
-COPY requirements.ml.txt ./
-
-# Install Python dependencies in order (ML first, then extraction, then backend)
-# This optimizes layer caching - ML packages rarely change
-RUN pip install --no-cache-dir -r requirements.ml.txt
-
-COPY requirements.extractions.txt ./
-RUN pip install --no-cache-dir -r requirements.extractions.txt
-
-COPY requirements.backend.txt ./
-RUN pip install --no-cache-dir -r requirements.backend.txt
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     libxcb1 \
     libx11-6 \
     libxext6 \
@@ -33,6 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfreetype6 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.extractions.txt ./
+RUN pip install --no-cache-dir -r requirements.extractions.txt
+
+COPY requirements.backend.txt ./
+RUN pip install --no-cache-dir -r requirements.backend.txt
+
 # Copy application
 COPY backend ./backend
 COPY config ./config
