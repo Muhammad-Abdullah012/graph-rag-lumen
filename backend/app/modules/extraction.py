@@ -1,8 +1,7 @@
 """PDF Extraction Module using Docling"""
 import logging
-import multiprocessing
+import traceback
 from pathlib import Path
-from typing import Optional
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
@@ -20,8 +19,6 @@ class PDFExtractor:
         """Initialize PDF extractor with optimal settings"""
         accelerator_options = AcceleratorOptions(
             device=AcceleratorDevice.CUDA,  # Use CUDA for NVIDIA GPUs
-            num_threads=1 # Limit to 1 thread to avoid issues with PyTorch on Windows (no Triton support)
-            # Note: for docker containers we should update it to use all available threads, but for Windows compatibility we need to limit it to 1
         )
         pdf_options = PdfPipelineOptions(
             do_code_enrichment=True,
@@ -84,6 +81,7 @@ class PDFExtractor:
             
         except Exception as e:
             logger.error(f"Error extracting PDF {pdf_path}: {str(e)}")
+            traceback.print_exc()
             raise
 
 
