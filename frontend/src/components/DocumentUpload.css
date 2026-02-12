@@ -40,19 +40,19 @@
 .file-label {
   display: block;
   padding: 2rem;
-  border: 2px dashed #797e94;
+  border: 2px dashed #9a9a9a;
   border-radius: 8px;
   text-align: center;
   cursor: pointer;
   transition: all 0.3s ease;
-  background: #777474;
-  color: #d6d9e2;
+  background: #ffffff;
+  color: #333;
   font-weight: 500;
 }
 
 #file-input:hover + .file-label {
-  background: #f0f0f0;
-  border-color: #726e75;
+  background: #f6f6f6;
+  border-color: #8f8f8f;
 }
 
 #file-input:disabled + .file-label {
@@ -92,7 +92,7 @@
 .status-message {
   background: #f0f0f0;
   color: #333;
-  border-left: 4px solid #878a99;
+  border-left: 4px solid #9a9a9a;
 }
 
 .processing-details {
@@ -120,8 +120,8 @@
 }
 
 .upload-info {
-  background: #f0f7ff;
-  border-left: 4px solid #92939b;
+  background: #fafafa;
+  border-left: 4px solid #9a9a9a;
   padding: 1.5rem;
   border-radius: 8px;
 }

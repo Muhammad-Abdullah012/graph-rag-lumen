@@ -45,7 +45,7 @@
 .example-questions li:before {
   content: "→ ";
   margin-right: 0.5rem;
-  color: #667eea;
+  color: #666;
 }
 
 .chat-messages {
@@ -105,7 +105,7 @@
 
 .sources {
   background: #f9f9f9;
-  border-left: 4px solid #667eea;
+  border-left: 4px solid #999;
   padding: 0.75rem 1rem;
   border-radius: 4px;
   margin-top: 0.5rem;
@@ -129,7 +129,7 @@
 }
 
 .sources a {
-  color: #868ba0;
+  color: #666;
   text-decoration: none;
 }
 
@@ -200,7 +200,7 @@
 }
 
 .chat-input:focus {
-  border-color: #9ba2bd;
+  border-color: #9a9a9a;
 }
 
 .chat-send-btn {
