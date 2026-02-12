@@ -75,13 +75,13 @@ function DocumentUpload({ onUpload }) {
         setProcessingStatus(data);
 
         if (data.status === 'completed') {
-          setStatus('✅ Processing completed!');
+          setStatus('Processing completed!');
           clearInterval(interval);
         } else if (data.status === 'failed') {
-          setStatus(`❌ Processing failed: ${data.message}`);
+          setStatus(`Processing failed: ${data.message}`);
           clearInterval(interval);
         } else {
-          setStatus(`⏳ ${data.message}`);
+          setStatus(`${data.message}`);
         }
       } catch (error) {
         console.error('Error checking status:', error);
@@ -106,12 +106,12 @@ function DocumentUpload({ onUpload }) {
             disabled={uploading}
           />
           <label htmlFor="file-input" className="file-label">
-            {file ? `📄 ${file.name}` : '📁 Choose PDF file'}
+            {file ? `${file.name}` : 'Choose PDF file'}
           </label>
         </div>
 
         <button type="submit" className="btn-upload" disabled={!file || uploading}>
-          {uploading ? '⏳ Uploading...' : '📤 Upload & Process'}
+          {uploading ? 'Uploading...' : 'Upload & Process'}
         </button>
       </form>
 

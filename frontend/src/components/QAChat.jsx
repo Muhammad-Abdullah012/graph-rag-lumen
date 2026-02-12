@@ -57,7 +57,7 @@ function QAChat() {
     } catch (error) {
       const errorMessage = {
         role: 'assistant',
-        content: `❌ Error: ${error.message}`,
+        content: `Error: ${error.message}`,
       };
       setMessages(prev => [...prev, errorMessage]);
     } finally {
@@ -70,7 +70,7 @@ function QAChat() {
       <div className="chat-messages">
         {messages.length === 0 ? (
           <div className="empty-chat">
-            <h2>💬 Ask a Question</h2>
+            <h2>Ask a Question</h2>
             <p>Ask anything about your uploaded documents</p>
             <div className="example-questions">
               <h3>Example questions:</h3>
@@ -90,12 +90,12 @@ function QAChat() {
               
               {msg.role === 'assistant' && msg.sources && msg.sources.length > 0 && (
                 <div className="sources">
-                  <h4>📚 Sources:</h4>
+                  <h4>Sources:</h4>
                   <ul>
                     {msg.sources.map((source, sidx) => (
                       <li key={sidx}>
                         <a href={source.document_url} target="_blank" rel="noopener noreferrer">
-                          📄 {source.document_name}
+                          {source.document_name}
                         </a>
                         <small>
                           {source.page_number > 0 && `Page ${source.page_number + 1} | `}
@@ -139,7 +139,7 @@ function QAChat() {
           disabled={loading || !question.trim()}
           className="chat-send-btn"
         >
-          {loading ? '⏳' : '🚀'}
+          {loading ? 'ᯓ➤' : '➤'}
         </button>
       </form>
     </div>
