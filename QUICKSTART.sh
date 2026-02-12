@@ -28,13 +28,13 @@ echo "✓ Created documents/ and logs/"
 echo ""
 echo "Step 3: Building Docker images..."
 echo "This may take a few minutes..."
-docker-compose build
+docker compose build
 echo "✓ Docker images built"
 
 # Step 4: Start services
 echo ""
 echo "Step 4: Starting services..."
-docker-compose up -d
+docker compose up -d
 echo "✓ Services started"
 
 # Step 5: Wait for startup
@@ -53,7 +53,7 @@ done
 # Step 6: Show status
 echo ""
 echo "Step 6: Checking service status..."
-docker-compose ps
+docker compose ps
 
 # Step 7: Health check
 echo ""
