@@ -42,6 +42,7 @@ function HealthStatus() {
       <div className="health-details">
         <span>Neo4j: <strong>{health?.neo4j || 'unknown'}</strong></span>
         <span>Ollama: <strong>{health?.ollama || 'unknown'}</strong></span>
+        <span>Graph: <strong>{health?.graph_loaded ? 'loaded' : 'empty'}</strong></span>
       </div>
     </div>
   );

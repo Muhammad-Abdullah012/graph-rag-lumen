@@ -21,45 +21,34 @@ function QAChat() {
     e.preventDefault();
     if (!question.trim()) return;
 
-    // Add user message
     const userMessage = { role: 'user', content: question };
-    setMessages([...messages, userMessage]);
+    setMessages(prev => [...prev, userMessage]);
     setQuestion('');
     setLoading(true);
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/qa/ask`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          question: question,
-          top_k: 5,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
       });
 
-      if (!response.ok) {
-        throw new Error('Failed to get answer');
-      }
+      if (!response.ok) throw new Error('Failed to get answer');
 
       const data = await response.json();
 
-      // Add assistant message
       const assistantMessage = {
         role: 'assistant',
         content: data.answer,
-        sources: data.sources,
-        confidence: data.confidence,
+        tools_used: data.tools_used || [],
       };
 
       setMessages(prev => [...prev, assistantMessage]);
     } catch (error) {
-      const errorMessage = {
+      setMessages(prev => [...prev, {
         role: 'assistant',
         content: `Error: ${error.message}`,
-      };
-      setMessages(prev => [...prev, errorMessage]);
+      }]);
     } finally {
       setLoading(false);
     }
@@ -70,14 +59,26 @@ function QAChat() {
       <div className="chat-messages">
         {messages.length === 0 ? (
           <div className="empty-chat">
-            <h2>Ask a Question</h2>
-            <p>Ask anything about your uploaded documents</p>
+            <h2>Frage stellen / Ask a Question</h2>
+            <p>Stellen Sie Fragen zum Eurocode-Wissensgraphen</p>
             <div className="example-questions">
-              <h3>Example questions:</h3>
+              <h3>Beispielfragen:</h3>
               <ul>
-                <li>"What is the main topic?"</li>
-                <li>"Summarize the document"</li>
-                <li>"What are the key points?"</li>
+                <li onClick={() => setQuestion("Was bedeutet das Symbol γf?")}>
+                  "Was bedeutet das Symbol γf?"
+                </li>
+                <li onClick={() => setQuestion("Wie lautet die Formel für AEd?")}>
+                  "Wie lautet die Formel für AEd?"
+                </li>
+                <li onClick={() => setQuestion("Was bedeutet die Abkürzung EQU?")}>
+                  "Was bedeutet die Abkürzung EQU?"
+                </li>
+                <li onClick={() => setQuestion("Welche Einheit wird für Kraft empfohlen?")}>
+                  "Welche Einheit wird für Kraft empfohlen?"
+                </li>
+                <li onClick={() => setQuestion("List all Teilsicherheitsbeiwert symbols")}>
+                  "List all Teilsicherheitsbeiwert symbols"
+                </li>
               </ul>
             </div>
           </div>
@@ -87,29 +88,21 @@ function QAChat() {
               <div className="message-content">
                 {msg.content}
               </div>
-              
-              {msg.role === 'assistant' && msg.sources && msg.sources.length > 0 && (
-                <div className="sources">
-                  <h4>Sources:</h4>
-                  <ul>
-                    {msg.sources.map((source, sidx) => (
-                      <li key={sidx}>
-                        <a href={source.document_url} target="_blank" rel="noopener noreferrer">
-                          {source.document_name}
-                        </a>
-                        <small>
-                          {source.page_number > 0 && `Page ${source.page_number + 1} | `}
-                          Relevance: {(source.relevance_score * 100).toFixed(1)}%
-                        </small>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
 
-              {msg.role === 'assistant' && msg.confidence !== undefined && (
-                <div className="confidence">
-                  Confidence: {(msg.confidence * 100).toFixed(1)}%
+              {msg.role === 'assistant' && msg.tools_used && msg.tools_used.length > 0 && (
+                <div className="tools-info">
+                  <details>
+                    <summary>
+                      Agent used {msg.tools_used.length} tool(s)
+                    </summary>
+                    <ul>
+                      {msg.tools_used.map((tool, tidx) => (
+                        <li key={tidx}>
+                          <strong>{tool.tool}</strong>({JSON.stringify(tool.arguments)})
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
                 </div>
               )}
             </div>
@@ -130,16 +123,16 @@ function QAChat() {
           type="text"
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
-          placeholder="Ask a question about your documents..."
+          placeholder="Fragen Sie zum Eurocode... / Ask about Eurocode..."
           disabled={loading}
           className="chat-input"
         />
-        <button 
-          type="submit" 
+        <button
+          type="submit"
           disabled={loading || !question.trim()}
           className="chat-send-btn"
         >
-          {loading ? 'ᯓ➤' : '➤'}
+          {loading ? '...' : '➤'}
         </button>
       </form>
     </div>

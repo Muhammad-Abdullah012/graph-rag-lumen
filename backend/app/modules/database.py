@@ -2,7 +2,7 @@
 import logging
 from typing import Optional, Any, Dict, List
 
-from neo4j import GraphDatabase, Session
+from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 
 from config.settings import settings
@@ -63,55 +63,6 @@ class Neo4jConnection:
         except Exception as e:
             logger.error(f"Error executing query: {str(e)}")
             raise
-    
-    def create_vector_index(self):
-        """Create vector similarity index for embeddings"""
-        try:
-            # Check if index already exists
-            check_query = """
-                SHOW INDEXES WHERE name = $index_name
-            """
-            
-            result = self.execute_query(
-                check_query,
-                {"index_name": settings.vector_index_name}
-            )
-            
-            if result:
-                logger.info(f"Vector index '{settings.vector_index_name}' already exists")
-                return
-            
-            # Create the index
-            create_query = f"""
-                CREATE VECTOR INDEX {settings.vector_index_name}
-                FOR (n:DocumentChunk) ON (n.embedding)
-                OPTIONS {{
-                    indexConfig: {{
-                        `vector.dimensions`: {settings.vector_dimension},
-                        `vector.similarity_function`: 'cosine'
-                    }}
-                }}
-            """
-            
-            self.execute_query(create_query)
-            logger.info(f"Created vector index: {settings.vector_index_name}")
-            
-        except Exception as e:
-            logger.warning(f"Could not create vector index: {str(e)}")
-    
-    def create_constraints(self):
-        """Create database constraints"""
-        constraints = [
-            "CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
-            "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.id IS UNIQUE",
-        ]
-        
-        try:
-            for constraint in constraints:
-                self.execute_query(constraint)
-            logger.info("Database constraints created/verified")
-        except Exception as e:
-            logger.warning(f"Could not create constraints: {str(e)}")
 
 
 # Singleton instance
@@ -123,6 +74,4 @@ def get_neo4j_connection() -> Neo4jConnection:
     global _neo4j_connection
     if _neo4j_connection is None:
         _neo4j_connection = Neo4jConnection()
-        _neo4j_connection.create_constraints()
-        _neo4j_connection.create_vector_index()
     return _neo4j_connection

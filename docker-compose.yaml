@@ -1,6 +1,7 @@
 services:
   neo4j:
     image: neo4j:5.26.1-enterprise
+    container_name: graphrag-neo4j
     env_file:
       - ./.env.neo
     volumes:
@@ -17,7 +18,9 @@ services:
       retries: 5
     restart: unless-stopped
     networks:
-      - graph-rag-network
+      traefik-net:
+        aliases:
+          - neo4j-graphrag
 
   backend:
     build:
@@ -28,6 +31,7 @@ services:
     volumes:
       - ./documents:/documents
       - ./logs:/app/logs
+      - ./:/app
     ports:
       - "9000:8000"
     depends_on:
@@ -36,27 +40,33 @@ services:
     restart: unless-stopped
     gpus: all
     networks:
-      - graph-rag-network
+      - traefik-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+    labels:
+      - "traefik.enable=false"
 
   frontend:
     build:
       context: .
       dockerfile: frontend/Dockerfile
     environment:
-      - REACT_APP_API_URL=http://localhost:8080/api
+      - REACT_APP_API_URL=https://test.data-style.com
     ports:
-      - "3000:3000"
+      - "3006:3000"
+    volumes:
+      - ./:/app
     depends_on:
       - backend
     restart: unless-stopped
     networks:
-      - graph-rag-network
+      - traefik-net
+    labels:
+      - "traefik.enable=false"
 
   nginx:
     image: nginx:alpine
@@ -70,13 +80,24 @@ services:
       - frontend
     restart: unless-stopped
     networks:
-      - graph-rag-network
+      - traefik-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.graphrag.rule=Host(`test.data-style.com`)"
+      - "traefik.http.routers.graphrag.entrypoints=websecure"
+      - "traefik.http.routers.graphrag.tls=true"
+      - "traefik.http.routers.graphrag.tls.certresolver=myresolver"
+      - "traefik.http.routers.graphrag.service=graphrag"
+      - "traefik.http.services.graphrag.loadbalancer.server.port=8080"
+      - "traefik.docker.network=rca-noc-nextjs_traefik-net"
 
 volumes:
   neo4j_data:
   neo4j_logs:
 
 networks:
-  graph-rag-network:
-    driver: bridge
+  traefik-net:
+    external: true
+    name: rca-noc-nextjs_traefik-net
+
 

@@ -3,26 +3,20 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic
 pydantic-settings
-python-multipart==0.0.6
-aiofiles
 
 # Neo4j
 neo4j==5.14.0
 
-# LangChain Core (ML packages in requirements.ml.txt, extraction in requirements.extractions.txt)
-langchain
-langchain-community
-langchain-experimental
-langchain-core
-langchain-ollama
+# LangChain + LangGraph (agent with native tool calling)
+langchain>=0.3.0
+langchain-ollama>=0.2.0
+langgraph>=0.2.0
 
 # HTTP Client
 requests==2.31.0
-aiohttp==3.9.1
 
 # Logging and Monitoring
 python-json-logger==2.0.7
 
 # Utilities
 python-dotenv==1.0.0
-json-repair
