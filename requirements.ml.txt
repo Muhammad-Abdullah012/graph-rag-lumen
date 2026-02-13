@@ -1,8 +1,8 @@
 # Heavy ML packages (slow to install, rarely changes)
-langchain-huggingface
 sentence_transformers
 torch
-transformers
+torchvision
+torchaudio
 accelerate
 huggingface_hub
 protobuf
