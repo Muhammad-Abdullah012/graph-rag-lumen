@@ -1,8 +1,14 @@
-"""Question Answering Routes - Agent-based Q&A over Eurocode knowledge graph"""
+"""Question Answering Routes - Agent-based Q&A over Eurocode knowledge graph.
+
+This is kept for backward compatibility.  The preferred API is
+/api/conversations/{thread_id}/chat (and /chat/stream).
+"""
 import logging
+import uuid
+
 from fastapi import APIRouter
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from backend.app.modules.agent import get_agent
 
@@ -14,6 +20,7 @@ router = APIRouter(prefix="/api/qa", tags=["qa"])
 class QuestionRequest(BaseModel):
     """Question request"""
     question: str
+    thread_id: Optional[str] = None
 
 
 class ToolUsed(BaseModel):
@@ -26,22 +33,25 @@ class AnswerResponse(BaseModel):
     """Question answer response"""
     answer: str
     tools_used: List[ToolUsed]
+    thread_id: str
 
 
 @router.post("/ask", response_model=AnswerResponse)
 async def ask_question(request: QuestionRequest) -> AnswerResponse:
     """
-    Ask a question — the agent queries the Eurocode knowledge graph
-    and returns a grounded answer.
+    Ask a question.  If thread_id is provided the conversation continues;
+    otherwise a throwaway thread is created.
     """
     try:
         logger.info(f"Question received: {request.question}")
         agent = get_agent()
-        result = await agent.aanswer(request.question)
+        thread_id = request.thread_id or str(uuid.uuid4())
+        result = await agent.aanswer(request.question, thread_id=thread_id)
 
         return AnswerResponse(
             answer=result["answer"],
             tools_used=[ToolUsed(**t) for t in result.get("tools_used", [])],
+            thread_id=thread_id,
         )
 
     except Exception as e:
@@ -49,4 +59,5 @@ async def ask_question(request: QuestionRequest) -> AnswerResponse:
         return AnswerResponse(
             answer=f"Error: {str(e)}",
             tools_used=[],
+            thread_id=request.thread_id or "",
         )

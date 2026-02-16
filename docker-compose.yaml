@@ -1,4 +1,26 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: graphrag-postgres
+    environment:
+      POSTGRES_USER: graphrag
+      POSTGRES_PASSWORD: graphrag_secret
+      POSTGRES_DB: graphrag
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graphrag -d graphrag"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      traefik-net:
+        aliases:
+          - postgres-graphrag
+
   neo4j:
     image: neo4j:5.26.1-enterprise
     container_name: graphrag-neo4j
@@ -8,8 +30,14 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     ports:
-      - "8475:7474"
-      - "8688:7687"
+      - "8474:7474"
+      - "8687:7687"
+    environment:
+      - NEO4J_PLUGINS=["apoc", "apoc-extended","graph-data-science"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
+      - NEO4J_gds_enterprise_license_file=/licenses/neo4j.license
+      - NEO4J_server_config_strict__validation_enabled=false
+      - NEO4J_AUTH=neo4j/neo4jpassword
 
     healthcheck:
       test: ["CMD", "wget", "--verbose", "--tries=1", "--spider", "localhost:7474"]
@@ -30,12 +58,15 @@ services:
       - .env
     volumes:
       - ./documents:/documents
+      - ./uploads:/app/uploads
       - ./logs:/app/logs
       - ./:/app
     ports:
       - "9000:8000"
     depends_on:
       neo4j:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     gpus: all
@@ -92,6 +123,7 @@ services:
       - "traefik.docker.network=rca-noc-nextjs_traefik-net"
 
 volumes:
+  postgres_data:
   neo4j_data:
   neo4j_logs:
 

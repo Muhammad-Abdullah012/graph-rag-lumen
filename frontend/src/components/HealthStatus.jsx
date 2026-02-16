@@ -23,16 +23,13 @@ function HealthStatus() {
     };
 
     checkHealth();
-    const interval = setInterval(checkHealth, 10000); // Check every 10 seconds
-
+    const interval = setInterval(checkHealth, 15000);
     return () => clearInterval(interval);
-  }, []);
+  }, [API_BASE_URL]);
 
-  if (loading) return <div className="health-status">🔍 Checking...</div>;
+  if (loading) return <div className="health-status">Checking...</div>;
 
-  const getStatusColor = (status) => {
-    return status === 'ok' ? 'green' : 'red';
-  };
+  const getStatusColor = (status) => (status === 'ok' ? 'green' : 'red');
 
   return (
     <div className="health-status">
@@ -40,8 +37,9 @@ function HealthStatus() {
         {health?.status === 'ok' ? '✅' : '⚠️'} {health?.status || 'unknown'}
       </div>
       <div className="health-details">
-        <span>Neo4j: <strong>{health?.neo4j || 'unknown'}</strong></span>
-        <span>Ollama: <strong>{health?.ollama || 'unknown'}</strong></span>
+        <span>Neo4j: <strong>{health?.neo4j || '?'}</strong></span>
+        <span>Postgres: <strong>{health?.postgres || '?'}</strong></span>
+        <span>Ollama: <strong>{health?.ollama || '?'}</strong></span>
         <span>Graph: <strong>{health?.graph_loaded ? 'loaded' : 'empty'}</strong></span>
       </div>
     </div>

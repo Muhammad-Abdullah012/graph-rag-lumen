@@ -3,10 +3,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (libpq for psycopg)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -21,6 +22,9 @@ RUN uv pip install --no-cache-dir -r requirements.backend.txt
 # Copy application
 COPY backend ./backend
 COPY config ./config
+
+# Create upload directory
+RUN mkdir -p /app/uploads
 
 # Set Python path
 ENV PYTHONPATH=/app

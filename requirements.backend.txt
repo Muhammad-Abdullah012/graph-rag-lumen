@@ -1,16 +1,22 @@
 # Core Backend dependencies
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
+python-multipart>=0.0.6
 pydantic
 pydantic-settings
 
 # Neo4j
 neo4j==5.14.0
 
+# PostgreSQL
+psycopg[binary,pool]>=3.1.0
+pgvector>=0.3.0
+
 # LangChain + LangGraph (agent with native tool calling)
 langchain>=0.3.0
 langchain-ollama>=0.2.0
 langgraph>=0.2.0
+langgraph-checkpoint-postgres>=2.0.0
 
 # HTTP Client
 requests==2.31.0
@@ -20,3 +26,4 @@ python-json-logger==2.0.7
 
 # Utilities
 python-dotenv==1.0.0
+aiofiles>=23.0.0
