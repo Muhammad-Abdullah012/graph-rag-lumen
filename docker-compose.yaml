@@ -65,6 +65,11 @@ services:
       - "traefik.http.middlewares.graphrag-neo4j-redirectregex.redirectregex.regex=^/browser/?(.*)$"
       - "traefik.http.middlewares.graphrag-neo4j-redirectregex.redirectregex.replacement=/neo4j/browser/$1"
       - "traefik.http.middlewares.graphrag-neo4j-redirectregex.redirectregex.permanent=true"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.rule=HostSNI(`test.data-style.com`)"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.entrypoints=neo4j-bolt"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.tls=true"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.tls.certresolver=myresolver"
+      - "traefik.tcp.services.graphrag-neo4j-bolt.loadbalancer.server.port=7687"
       - "traefik.docker.network=rca-noc-nextjs_traefik-net"
 
   backend:
