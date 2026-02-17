@@ -83,12 +83,15 @@
   border: 1px solid #e8e8e8;
   border-radius: 8px;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
 }
 
 .doc-table-header,
 .doc-table-row {
   display: grid;
-  grid-template-columns: 1fr 80px 80px 100px;
+  grid-template-columns: 2fr 120px 140px 180px;
   gap: 0.5rem;
   padding: 0.75rem 1rem;
   align-items: center;
@@ -108,9 +111,15 @@
   font-size: 0.95rem;
 }
 
+.doc-table-body {
+  max-height: 55vh;
+  overflow-y: auto;
+}
+
 .doc-table-row:hover {
   background: #fafafa;
 }
+
 
 .col-name {
   overflow: hidden;
@@ -118,14 +127,15 @@
   white-space: nowrap;
 }
 
-.col-chunks,
-.col-entities {
-  text-align: center;
+.col-size,
+.col-type {
+  text-align: left;
   font-weight: 500;
 }
 
-.col-status {
-  font-size: 0.85rem;
+.col-uploaded {
+  font-size: 0.9rem;
+  color: #666;
 }
 
 .status-completed {
@@ -147,7 +157,21 @@
 
   .doc-table-header,
   .doc-table-row {
-    grid-template-columns: 1fr 60px 60px 80px;
-    font-size: 0.85rem;
+    grid-template-columns: 1fr 80px;
+    grid-template-areas:
+      "name uploaded"
+      "size uploaded"
+      "type uploaded";
+    font-size: 0.9rem;
+    row-gap: 0.35rem;
+  }
+
+  .col-name { grid-area: name; }
+  .col-size { grid-area: size; }
+  .col-type { grid-area: type; }
+  .col-uploaded { grid-area: uploaded; text-align: right; }
+
+  .doc-table-body {
+    max-height: 45vh;
   }
 }

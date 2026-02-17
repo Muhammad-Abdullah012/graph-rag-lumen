@@ -3,7 +3,8 @@
   border-radius: 12px;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
   padding: 2rem;
-  max-width: 600px;
+  width: 100%;
+  max-width: 900px;
 }
 
 .document-upload h2 {

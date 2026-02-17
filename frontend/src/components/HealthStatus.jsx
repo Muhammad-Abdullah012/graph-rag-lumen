@@ -23,8 +23,8 @@ function HealthStatus() {
     };
 
     checkHealth();
-    const interval = setInterval(checkHealth, 15000);
-    return () => clearInterval(interval);
+    // const interval = setInterval(checkHealth, 15000);
+    // return () => clearInterval(interval);
   }, [API_BASE_URL]);
 
   if (loading) return <div className="health-status">Checking...</div>;

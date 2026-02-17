@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import './QAChat.css';
 
-function QAChat({ conversationId, onFirstMessage }) {
+function QAChat({ conversationId, onFirstMessage, onConversationCreated }) {
   const [messages, setMessages] = useState([]);
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(false);
@@ -10,6 +10,18 @@ function QAChat({ conversationId, onFirstMessage }) {
   const inputRef = useRef(null);
 
   const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+  // Create a new conversation via API
+  const createConversation = async () => {
+    const response = await fetch(`${API_BASE_URL}/api/conversations/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'New Conversation' }),
+    });
+    if (!response.ok) throw new Error('Failed to create conversation');
+    const data = await response.json();
+    return data.id;
+  };
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -59,7 +71,7 @@ function QAChat({ conversationId, onFirstMessage }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!question.trim() || !conversationId) return;
+    if (!question.trim()) return;
 
     const userMessage = { role: 'user', content: question };
     setMessages((prev) => [...prev, userMessage]);
@@ -67,15 +79,31 @@ function QAChat({ conversationId, onFirstMessage }) {
     setQuestion('');
     setLoading(true);
 
+    // If no conversation yet, create one first (ChatGPT-like auto-create)
+    let activeId = conversationId;
+    if (!activeId) {
+      try {
+        activeId = await createConversation();
+        if (onConversationCreated) onConversationCreated(activeId);
+      } catch (err) {
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: `Error: ${err.message}` },
+        ]);
+        setLoading(false);
+        return;
+      }
+    }
+
     // Notify parent about first message (for auto-title)
     if (messages.length === 0 && onFirstMessage) {
-      onFirstMessage(currentQuestion);
+      onFirstMessage(currentQuestion, activeId);
     }
 
     try {
-      // Use streaming endpoint
+      // Use non-streaming endpoint
       const response = await fetch(
-        `${API_BASE_URL}/api/conversations/${conversationId}/chat/stream`,
+        `${API_BASE_URL}/api/conversations/${activeId}/chat`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -85,81 +113,25 @@ function QAChat({ conversationId, onFirstMessage }) {
 
       if (!response.ok) throw new Error('Failed to get answer');
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
+      const data = await response.json();
 
-      let assistantContent = '';
-      let toolsUsed = [];
-
-      // Add placeholder assistant message
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: '', tools_used: [] },
+        {
+          role: 'assistant',
+          content: data.answer || '',
+          tools_used: data.tools_used || [],
+        },
       ]);
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const jsonStr = line.slice(6).trim();
-          if (!jsonStr) continue;
-
-          try {
-            const event = JSON.parse(jsonStr);
-            if (event.type === 'token') {
-              assistantContent += event.content;
-              setMessages((prev) => {
-                const updated = [...prev];
-                updated[updated.length - 1] = {
-                  ...updated[updated.length - 1],
-                  content: assistantContent,
-                };
-                return updated;
-              });
-            } else if (event.type === 'tool') {
-              toolsUsed.push({ tool: event.name, arguments: {} });
-              setMessages((prev) => {
-                const updated = [...prev];
-                updated[updated.length - 1] = {
-                  ...updated[updated.length - 1],
-                  tools_used: [...toolsUsed],
-                };
-                return updated;
-              });
-            }
-            // 'done' event — streaming complete
-          } catch {
-            // skip malformed JSON
-          }
-        }
-      }
     } catch (error) {
       setMessages((prev) => [
-        ...prev.filter((m) => m.content !== ''),
+        ...prev,
         { role: 'assistant', content: `Error: ${error.message}` },
       ]);
     } finally {
       setLoading(false);
     }
   };
-
-  if (!conversationId) {
-    return (
-      <div className="qa-chat">
-        <div className="chat-messages">
-          <div className="empty-chat">
-            <h2>Eurocode Knowledge Q&A</h2>
-            <p>Create or select a conversation to start chatting.</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="qa-chat">

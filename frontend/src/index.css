@@ -59,6 +59,13 @@ code {
   overflow: hidden;
 }
 
+/* Allow overflowing children to size correctly inside flex parents */
+.app-body,
+.app-content,
+.sidebar-col {
+  min-height: 0;
+}
+
 .sidebar-col {
   display: flex;
   flex-direction: column;
@@ -74,6 +81,51 @@ code {
   flex-direction: column;
 }
 
+/* ── Tabs ── */
+.tab-bar {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  background: #ffffff;
+  border-bottom: 1px solid #e5e5e5;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+}
+
+.tab-btn {
+  padding: 0.6rem 1.2rem;
+  border: 1px solid #ddd;
+  border-radius: 10px;
+  background: #f7f7f7;
+  cursor: pointer;
+  font-weight: 600;
+  color: #444;
+  transition: all 0.15s ease;
+}
+
+.tab-btn:hover {
+  background: #efefef;
+  border-color: #ccc;
+}
+
+.tab-btn.active {
+  background: #111827;
+  color: white;
+  border-color: #111827;
+  box-shadow: 0 6px 18px rgba(17, 24, 39, 0.18);
+}
+
+.tab-panel {
+  padding: 1.5rem;
+  flex: 1;
+  overflow: auto;
+}
+
+.tab-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1.5rem;
+}
+
 @media (max-width: 768px) {
   .app-body {
     flex-direction: column;
@@ -85,6 +137,10 @@ code {
     border-bottom: 1px solid #e0e0e0;
     max-height: 250px;
     overflow-x: auto;
+  }
+
+  .tab-grid {
+    grid-template-columns: 1fr;
   }
 
   .app-header h1 {

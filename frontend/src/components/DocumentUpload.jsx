@@ -5,8 +5,7 @@ function DocumentUpload({ onUpload }) {
   const [file, setFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [status, setStatus] = useState('');
-  const [documentId, setDocumentId] = useState(null);
-  const [processingStatus, setProcessingStatus] = useState(null);
+  const [uploadedDocs, setUploadedDocs] = useState([]);
 
   const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
@@ -38,7 +37,7 @@ function DocumentUpload({ onUpload }) {
 
     try {
       const formData = new FormData();
-      formData.append('file', file);
+      formData.append('files', file);
 
       const response = await fetch(`${API_BASE_URL}/api/documents/upload`, {
         method: 'POST',
@@ -51,49 +50,22 @@ function DocumentUpload({ onUpload }) {
       }
 
       const data = await response.json();
-      setDocumentId(data.document_id);
-      setStatus('✅ Uploaded! Processing...');
-
-      // Poll for processing status
-      pollProcessingStatus(data.document_id);
-
-      onUpload(data);
+      setStatus(data.message || '✅ Uploaded');
+      setUploadedDocs(data.documents || []);
+      onUpload?.(data);
       setFile(null);
-      setUploading(false);
     } catch (error) {
       setStatus(`❌ Upload failed: ${error.message}`);
+    } finally {
       setUploading(false);
     }
-  };
-
-  const pollProcessingStatus = (docId) => {
-    const interval = setInterval(async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/documents/status/${docId}`);
-        const data = await response.json();
-        
-        setProcessingStatus(data);
-
-        if (data.status === 'completed') {
-          setStatus('Processing completed!');
-          clearInterval(interval);
-        } else if (data.status === 'failed') {
-          setStatus(`Processing failed: ${data.message}`);
-          clearInterval(interval);
-        } else {
-          setStatus(`${data.message}`);
-        }
-      } catch (error) {
-        console.error('Error checking status:', error);
-      }
-    }, 2000);
   };
 
   return (
     <div className="document-upload">
       <h2>Upload PDF Document</h2>
       <p className="description">
-        Upload a PDF document to extract text and build a knowledge graph
+        Store PDFs for future processing. Files are kept in the documents area.
       </p>
 
       <form onSubmit={handleUpload} className="upload-form">
@@ -111,31 +83,30 @@ function DocumentUpload({ onUpload }) {
         </div>
 
         <button type="submit" className="btn-upload" disabled={!file || uploading}>
-          {uploading ? 'Uploading...' : 'Upload & Process'}
+          {uploading ? 'Uploading...' : 'Upload'}
         </button>
       </form>
 
       {status && <div className="status-message">{status}</div>}
 
-      {processingStatus && (
+      {uploadedDocs.length > 0 && (
         <div className="processing-details">
-          <h3>Processing Status</h3>
+          <h3>Uploaded</h3>
           <div className="status-info">
-            <p><strong>Status:</strong> {processingStatus.status}</p>
-            <p><strong>Message:</strong> {processingStatus.message}</p>
+            {uploadedDocs.map((d) => (
+              <p key={d.id}>
+                <strong>{d.original_filename}</strong> ({(d.file_size / (1024 * 1024)).toFixed(2)} MB)
+              </p>
+            ))}
           </div>
         </div>
       )}
 
       <div className="upload-info">
-        <h3>Supported Features:</h3>
+        <h3>Notes</h3>
         <ul>
-          <li>✓ Text extraction with OCR</li>
-          <li>✓ Table structure preservation</li>
-          <li>✓ Code enrichment</li>
-          <li>✓ Image classification</li>
-          <li>✓ Knowledge graph creation</li>
-          <li>✓ Vector embeddings</li>
+          <li>Files are stored only; processing will be added later.</li>
+          <li>Maximum size {50} MB per file.</li>
         </ul>
       </div>
     </div>

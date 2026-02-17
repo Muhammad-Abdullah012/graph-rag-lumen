@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import './ConversationSidebar.css';
 
-function ConversationSidebar({ activeId, onSelect, onNew, refreshSignal }) {
+function ConversationSidebar({ activeId, onSelect, onNewChat, refreshSignal }) {
   const [conversations, setConversations] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -25,22 +25,10 @@ function ConversationSidebar({ activeId, onSelect, onNew, refreshSignal }) {
     fetchConversations();
   }, [fetchConversations, refreshSignal]);
 
-  const handleNew = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/conversations/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'New Conversation' }),
-      });
-      if (response.ok) {
-        const data = await response.json();
-        await fetchConversations();
-        onSelect(data.id);
-        if (onNew) onNew(data.id);
-      }
-    } catch (err) {
-      console.error('Failed to create conversation:', err);
-    }
+  // "New Chat" just clears selection to go into draft mode; conversation is
+  // auto-created when the user sends their first message.
+  const handleNew = () => {
+    if (onNewChat) onNewChat();
   };
 
   const handleDelete = async (e, id) => {
