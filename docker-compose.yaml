@@ -1,4 +1,28 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: graphrag-postgres
+    environment:
+      POSTGRES_USER: graphrag
+      POSTGRES_PASSWORD: graphrag_secret
+      POSTGRES_DB: graphrag
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U graphrag -d graphrag"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      traefik-net:
+        aliases:
+          - postgres-graphrag
+    labels:
+      - "traefik.enable=false"
+
   neo4j:
     image: neo4j:5.26.1-enterprise
     container_name: graphrag-neo4j
@@ -21,6 +45,32 @@ services:
       traefik-net:
         aliases:
           - neo4j-graphrag
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.graphrag-neo4j.rule=Host(`test.data-style.com`) && PathPrefix(`/neo4j`)"
+      - "traefik.http.routers.graphrag-neo4j.entrypoints=websecure"
+      - "traefik.http.routers.graphrag-neo4j.tls=true"
+      - "traefik.http.routers.graphrag-neo4j.tls.certresolver=myresolver"
+      - "traefik.http.routers.graphrag-neo4j.priority=190"
+      - "traefik.http.routers.graphrag-neo4j.middlewares=graphrag-neo4j-stripprefix"
+      - "traefik.http.services.graphrag-neo4j.loadbalancer.server.port=7474"
+      - "traefik.http.middlewares.graphrag-neo4j-stripprefix.stripprefix.prefixes=/neo4j"
+      - "traefik.http.routers.graphrag-neo4j-redirect.rule=Host(`test.data-style.com`) && PathPrefix(`/browser`)"
+      - "traefik.http.routers.graphrag-neo4j-redirect.entrypoints=websecure"
+      - "traefik.http.routers.graphrag-neo4j-redirect.tls=true"
+      - "traefik.http.routers.graphrag-neo4j-redirect.tls.certresolver=myresolver"
+      - "traefik.http.routers.graphrag-neo4j-redirect.priority=195"
+      - "traefik.http.routers.graphrag-neo4j-redirect.middlewares=graphrag-neo4j-redirectregex"
+      - "traefik.http.routers.graphrag-neo4j-redirect.service=graphrag-neo4j"
+      - "traefik.http.middlewares.graphrag-neo4j-redirectregex.redirectregex.regex=^/browser/?(.*)$"
+      - "traefik.http.middlewares.graphrag-neo4j-redirectregex.redirectregex.replacement=/neo4j/browser/$1"
+      - "traefik.http.middlewares.graphrag-neo4j-redirectregex.redirectregex.permanent=true"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.rule=HostSNI(`test.data-style.com`)"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.entrypoints=neo4j-bolt"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.tls=true"
+      - "traefik.tcp.routers.graphrag-neo4j-bolt.tls.certresolver=myresolver"
+      - "traefik.tcp.services.graphrag-neo4j-bolt.loadbalancer.server.port=7687"
+      - "traefik.docker.network=rca-noc-nextjs_traefik-net"
 
   backend:
     build:
@@ -30,6 +80,7 @@ services:
       - .env
     volumes:
       - ./documents:/documents
+      - ./uploads:/app/uploads
       - ./logs:/app/logs
       - ./:/app
     ports:
@@ -37,10 +88,10 @@ services:
     depends_on:
       neo4j:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     gpus: all
-    networks:
-      - traefik-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
       interval: 30s
@@ -48,25 +99,18 @@ services:
       retries: 3
       start_period: 40s
     labels:
-      - "traefik.enable=false"
-
-  frontend:
-    build:
-      context: .
-      dockerfile: frontend/Dockerfile
-    environment:
-      - REACT_APP_API_URL=https://test.data-style.com
-    ports:
-      - "3006:3000"
-    volumes:
-      - ./:/app
-    depends_on:
-      - backend
-    restart: unless-stopped
+      - "traefik.enable=true"
+      - "traefik.http.routers.graphrag-backend.rule=Host(`test.data-style.com`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.graphrag-backend.entrypoints=websecure"
+      - "traefik.http.routers.graphrag-backend.tls=true"
+      - "traefik.http.routers.graphrag-backend.tls.certresolver=myresolver"
+      - "traefik.http.routers.graphrag-backend.priority=200"
+      - "traefik.http.services.graphrag-backend.loadbalancer.server.port=8000"
+      - "traefik.docker.network=rca-noc-nextjs_traefik-net"
     networks:
-      - traefik-net
-    labels:
-      - "traefik.enable=false"
+      traefik-net:
+        aliases:
+          - backend-graphrag
 
   nginx:
     image: nginx:alpine
@@ -83,15 +127,43 @@ services:
       - traefik-net
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.graphrag.rule=Host(`test.data-style.com`)"
-      - "traefik.http.routers.graphrag.entrypoints=websecure"
-      - "traefik.http.routers.graphrag.tls=true"
-      - "traefik.http.routers.graphrag.tls.certresolver=myresolver"
-      - "traefik.http.routers.graphrag.service=graphrag"
-      - "traefik.http.services.graphrag.loadbalancer.server.port=8080"
+      - "traefik.http.routers.graphrag-static.rule=Host(`test.data-style.com`) && PathPrefix(`/documents`)"
+      - "traefik.http.routers.graphrag-static.entrypoints=websecure"
+      - "traefik.http.routers.graphrag-static.tls=true"
+      - "traefik.http.routers.graphrag-static.tls.certresolver=myresolver"
+      - "traefik.http.routers.graphrag-static.priority=150"
+      - "traefik.http.services.graphrag-static.loadbalancer.server.port=8080"
+      - "traefik.docker.network=rca-noc-nextjs_traefik-net"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      - REACT_APP_API_URL=https://test.data-style.com
+    ports:
+      - "3006:3000"
+    volumes:
+      - ./:/app
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      traefik-net:
+        aliases:
+          - frontend-graphrag
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.graphrag-frontend.rule=Host(`test.data-style.com`) && PathPrefix(`/`)"
+      - "traefik.http.routers.graphrag-frontend.entrypoints=websecure"
+      - "traefik.http.routers.graphrag-frontend.tls=true"
+      - "traefik.http.routers.graphrag-frontend.tls.certresolver=myresolver"
+      - "traefik.http.routers.graphrag-frontend.priority=100"
+      - "traefik.http.services.graphrag-frontend.loadbalancer.server.port=3000"
       - "traefik.docker.network=rca-noc-nextjs_traefik-net"
 
 volumes:
+  postgres_data:
   neo4j_data:
   neo4j_logs:
 
