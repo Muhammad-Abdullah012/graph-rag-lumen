@@ -1,11 +1,13 @@
 # Frontend Dockerfile
 FROM node:18-alpine AS builder
 
+ENV NODE_ENV=production
+
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json* ./
 
-RUN npm i
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
 COPY frontend/src ./src
 COPY frontend/public ./public
