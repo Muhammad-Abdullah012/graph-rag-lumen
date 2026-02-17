@@ -92,6 +92,13 @@ code {
   padding: 2rem;
 }
 
+.files-layout {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
 @media (max-width: 768px) {
   .app-container {
     flex-direction: column;
@@ -107,5 +114,9 @@ code {
 
   .app-header h1 {
     font-size: 1.8rem;
+  }
+
+  .files-layout {
+    grid-template-columns: 1fr;
   }
 }

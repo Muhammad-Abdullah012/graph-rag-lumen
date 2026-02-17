@@ -1,16 +1,13 @@
-"""Document Processing Routes"""
+"""Document upload and listing routes."""
 import logging
 import uuid
+from datetime import datetime
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor
-import aiofiles
-import asyncio
+from typing import List
 
-from backend.app.modules.extraction import get_pdf_extractor
-from backend.app.modules.splitting import TextSplitter
-from backend.app.modules.graph_builder import GraphBuilder
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
+
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -18,185 +15,91 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 # Ensure documents directory exists
-Path(settings.documents_path).mkdir(parents=True, exist_ok=True)
+DOCUMENTS_DIR = Path(settings.documents_path)
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
-task_executor = ThreadPoolExecutor(max_workers=4)
+
+# task_executor = ThreadPoolExecutor(max_workers=4)
 
 
-class DocumentUploadResponse(BaseModel):
-    """Response for document upload"""
-    document_id: str
+class StoredDocument(BaseModel):
+    """Metadata for a stored PDF."""
+
     filename: str
+    stored_filename: str
+    url: str
+    size_bytes: int
+    uploaded_at: str
+
+
+class DocumentUploadResponse(StoredDocument):
+    """Upload response payload."""
+
     message: str
-    status: str
 
 
-class ProcessingStatus(BaseModel):
-    """Document processing status"""
-    document_id: str
-    status: str  # pending, processing, completed, failed
-    message: str
+class DocumentListResponse(BaseModel):
+    """List of stored documents."""
 
-
-# Store processing status in memory (in production, use database)
-processing_status = {}
+    documents: List[StoredDocument]
 
 
 @router.post("/upload", response_model=DocumentUploadResponse)
-async def upload_document(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
-) -> DocumentUploadResponse:
-    """
-    Upload and process PDF document
-    
-    Args:
-        file: PDF file
-        background_tasks: Background task queue
-        
-    Returns:
-        Upload response with document ID
-    """
-    try:
-        # Validate file
-        if not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-        
-        if file.size > settings.max_upload_size:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Maximum size: {settings.max_upload_size} bytes"
+async def upload_document(file: UploadFile = File(...)) -> DocumentUploadResponse:
+    """Accept a PDF upload and store it for later use."""
+
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty")
+
+    if len(content) > settings.max_upload_size:
+        max_mb = round(settings.max_upload_size / (1024 * 1024))
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size: {max_mb} MB")
+
+    safe_name = Path(file.filename).name
+    stored_filename = f"{uuid.uuid4().hex}_{safe_name}"
+    file_path = DOCUMENTS_DIR / stored_filename
+    file_path.write_bytes(content)
+
+    uploaded_at = datetime.utcnow().isoformat() + "Z"
+    url = f"/documents/{stored_filename}"
+
+    logger.info("Stored PDF upload at %s", file_path)
+
+    return DocumentUploadResponse(
+        filename=safe_name,
+        stored_filename=stored_filename,
+        url=url,
+        size_bytes=len(content),
+        uploaded_at=uploaded_at,
+        message="Document uploaded successfully",
+    )
+
+
+@router.get("", response_model=DocumentListResponse)
+@router.get("/", response_model=DocumentListResponse, include_in_schema=False)
+async def list_documents() -> DocumentListResponse:
+    """Return metadata for all stored PDFs, newest first."""
+
+    documents: List[StoredDocument] = []
+
+    pdf_files = [p for p in DOCUMENTS_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+
+    for path in sorted(pdf_files, key=lambda p: p.stat().st_mtime, reverse=True):
+        stat = path.stat()
+        original_name = path.name.split("_", 1)[1] if "_" in path.name else path.name
+
+        documents.append(
+            StoredDocument(
+                filename=original_name,
+                stored_filename=path.name,
+                url=f"/documents/{path.name}",
+                size_bytes=stat.st_size,
+                uploaded_at=datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z",
             )
-        
-        # Generate document ID
-        document_id = str(uuid.uuid4())
-        
-        # Save file
-        file_path = Path(settings.documents_path) / f"{document_id}_{file.filename}"
-        async with aiofiles.open(file_path, 'wb') as f:
-            content = await file.read()
-            await f.write(content)
-        
-        logger.info(f"Saved uploaded file: {file_path}")
-        
-        # Create relative URL for document
-        document_url = f"documents/{document_id}_{file.filename}"
-        
-        # Queue background task to process document
-        background_tasks.add_task(
-            process_document,
-            document_id=document_id,
-            file_path=str(file_path.resolve()),
-            filename=file.filename,
-            document_url=document_url
         )
-        
-        processing_status[document_id] = {
-            "status": "pending",
-            "message": "Document queued for processing"
-        }
-        
-        return DocumentUploadResponse(
-            document_id=document_id,
-            filename=file.filename,
-            message="Document uploaded successfully and queued for processing",
-            status="pending"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error uploading document: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-def _process_document_sync(
-    document_id: str,
-    file_path: str,
-    filename: str,
-    document_url: str
-):
-    """
-    Background task to process document
-    
-    Args:
-        document_id: Unique document ID
-        file_path: Path to saved PDF file
-        filename: Original filename
-        document_url: Relative URL to document
-    """
-    try:
-        processing_status[document_id] = {
-            "status": "processing",
-            "message": "Extracting text from PDF..."
-        }
-        
-        logger.info(f"Processing document {document_id}: {filename}")
-        
-        # Extract text from PDF
-        extractor = get_pdf_extractor()
-        extracted_text = extractor.extract(file_path)
-        
-        processing_status[document_id]["message"] = "Splitting text into chunks..."
-        
-        # Split text
-        splitter = TextSplitter()
-        chunks = splitter.split(extracted_text)
-        
-        processing_status[document_id]["message"] = "Building knowledge graph..."
-        
-        # Build graph
-        builder = GraphBuilder()
-        builder.build_graph(
-            chunks=chunks,
-            document_id=document_id,
-            document_name=filename,
-            document_url=document_url
-        )
-        
-        processing_status[document_id] = {
-            "status": "completed",
-            "message": f"Successfully processed {len(chunks)} chunks"
-        }
-        
-        logger.info(f"Successfully processed document {document_id}")
-        
-    except Exception as e:
-        logger.error(f"Error processing document {document_id}: {str(e)}")
-        processing_status[document_id] = {
-            "status": "failed",
-            "message": f"Error: {str(e)}"
-        }
-
-async def process_document(document_id, file_path, filename, document_url):
-    """Async wrapper that offloads to thread pool"""
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        task_executor,
-        _process_document_sync,
-        document_id,
-        file_path,
-        filename,
-        document_url
-    )
-
-@router.get("/status/{document_id}", response_model=ProcessingStatus)
-async def get_processing_status(document_id: str) -> ProcessingStatus:
-    """
-    Get processing status of document
-    
-    Args:
-        document_id: Document ID
-        
-    Returns:
-        Processing status
-    """
-    if document_id not in processing_status:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    status_info = processing_status[document_id]
-    return ProcessingStatus(
-        document_id=document_id,
-        status=status_info.get("status", "unknown"),
-        message=status_info.get("message", "")
-    )
+    return DocumentListResponse(documents=documents)

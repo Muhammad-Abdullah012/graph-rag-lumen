@@ -4,8 +4,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
-from backend.app.api import qa, health, graph
+from backend.app.api import documents, graph, health, qa
 from backend.app.modules.database import get_neo4j_connection
 from backend.app.modules.graph_builder import get_graph_builder
 from config.settings import settings
@@ -56,6 +57,14 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(qa.router)
 app.include_router(graph.router)
+app.include_router(documents.router)
+
+# Serve stored documents as static files
+app.mount(
+    "/documents",
+    StaticFiles(directory=documents.DOCUMENTS_DIR),
+    name="documents",
+)
 
 
 @app.get("/")

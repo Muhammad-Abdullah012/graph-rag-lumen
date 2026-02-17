@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     environment: str = os.getenv("ENVIRONMENT", "development")
 
+    # Documents
+    documents_path: str = os.getenv("DOCUMENTS_PATH", "documents")
+    max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", str(50 * 1024 * 1024)))
+
     class Config:
         env_file = ".env"
         case_sensitive = False
