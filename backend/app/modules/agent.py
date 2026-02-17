@@ -1,5 +1,6 @@
 """Eurocode Agent - LangGraph ReAct agent with graph-query + semantic-search tools
    and PostgreSQL-backed conversation persistence via LangGraph checkpointer."""
+import os
 import json
 import logging
 from typing import List, Dict, Any, Optional
@@ -8,6 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.prebuilt import create_react_agent
+from langgraph.graph import START, StateGraph, MessagesState
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from backend.app.modules.graph_querier import get_graph_querier, GraphQuerier
@@ -16,6 +18,12 @@ from backend.app.modules.database import get_pg_pool
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgresdb")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "lumenit")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "lumenit123")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "lumenitdb")
 
 # ================================================================== #
 #  System prompt
@@ -223,7 +231,9 @@ class EurocodeAgent:
         Yields: `data: <text>\n\n` chunks, tool-call events, and a final `[DONE]`.
         """
         config = {"configurable": {"thread_id": thread_id}}
-        agent_input = {"messages": [("human", question)]}
+        existing_state = await self.agent.aget_state(config)
+        existing_messages = existing_state.values.get("messages", []) if existing_state else []
+        agent_input = {"messages": existing_messages + [("human", question)]}
         tool_names_seen: set = set()
 
         async for event in self.agent.astream_events(
@@ -304,6 +314,9 @@ class EurocodeAgent:
 # ================================================================== #
 _agent: Optional[EurocodeAgent] = None
 
+def get_postgres_connection_string():
+    """Build PostgreSQL connection string"""
+    return f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 
 async def init_agent() -> EurocodeAgent:
     """Initialise the singleton agent with a PostgreSQL checkpointer."""
@@ -311,9 +324,12 @@ async def init_agent() -> EurocodeAgent:
     if _agent is not None:
         return _agent
 
+    DB_URI = get_postgres_connection_string()
+    async with AsyncPostgresSaver.from_conn_string(DB_URI) as temp_checkpointer:
+        await temp_checkpointer.setup()
+
     pool = get_pg_pool()
     checkpointer = AsyncPostgresSaver(pool)
-    await checkpointer.setup()
     logger.info("LangGraph PostgreSQL checkpointer ready")
 
     _agent = EurocodeAgent(checkpointer)
