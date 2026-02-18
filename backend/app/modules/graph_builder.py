@@ -1,520 +1,859 @@
-"""Graph Builder - Creates Neo4j knowledge graph from structured JSON files"""
+"""Graph Builder – Creates a Neo4j knowledge graph following the Graph-RAG schema.
+
+Schema hierarchy
+================
+Document → [Volume] → Chapter → Page → Section
+  Section → {Table, Figure, Formula, Subsection}
+  Section -[:MENTIONS]→ Concept
+  Concept ↔ Concept  (RELATED_TO)
+  Section ↔ Section  (SEMANTICALLY_SIMILAR)
+
+Every node ultimately belongs to exactly one Document.
+Embeddings are stored on Section.embedding and Concept.embedding for hybrid
+retrieval (structural + semantic).
+"""
+from __future__ import annotations
+
+import glob
+import hashlib
 import json
 import logging
 import os
-import glob
-from typing import Dict, Any, Optional
+import re
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.app.modules.database import get_neo4j_connection
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-JSON_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "json")
+JSON_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "json"
+)
+
+# ===================================================================== #
+#  Utility helpers
+# ===================================================================== #
+
+
+def _make_uuid(*parts: str) -> str:
+    """Deterministic UUID-5 from concatenated parts."""
+    raw = "::".join(str(p) for p in parts)
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
+
+
+def _detect_document_type(filename: str) -> str:
+    lower = filename.lower()
+    if "bem" in lower and "ing" in lower:
+        return "bem_ing"
+    if "handbuch" in lower and "eurocode" in lower:
+        return "handbuch_ec"
+    if "normen" in lower and "handbuch" in lower:
+        return "normen_handbuch"
+    if "din" in lower or "en " in lower or "en_" in lower:
+        return "din_en"
+    return "unknown"
+
+
+def _detect_eurocode_part(filename: str, content_head: str = "") -> str:
+    text = f"{filename} {content_head}".lower()
+    for i in range(10):
+        for p in (f"ec{i}", f"ec {i}", f"eurocode {i}", f"eurocode{i}", f"en 199{i}"):
+            if p in text:
+                return f"EC{i}"
+    return ""
+
+
+def _extract_section_number(title: str) -> str:
+    """'1.2.3 Definitions' → '1.2.3'  /  'A.1.2 Annex' → 'A.1.2'"""
+    m = re.match(r"^([A-Z]?\d+(?:\.\d+)*)\s", title)
+    if m:
+        return m.group(1)
+    m = re.match(r"^([A-Z]\.\d+(?:\.\d+)*)\s", title)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _file_checksum(filepath: str) -> str:
+    if not filepath or not os.path.exists(filepath):
+        return ""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ===================================================================== #
+#  Domain concept dictionary (German + English civil-engineering terms)
+# ===================================================================== #
+
+DOMAIN_CONCEPTS: Dict[str, str] = {
+    # German
+    "Einwirkung": "Loads and actions applied to structures",
+    "Widerstand": "Resistance of structural elements",
+    "Bemessung": "Design and dimensioning of structures",
+    "Tragfähigkeit": "Load-bearing capacity",
+    "Gebrauchstauglichkeit": "Serviceability of structures",
+    "Teilsicherheitsbeiwert": "Partial safety factor",
+    "Grenzzustand": "Limit state",
+    "Tragwerk": "Structure / structural system",
+    "Erdbeben": "Earthquake / seismic action",
+    "Fundament": "Foundation",
+    "Bewehrung": "Reinforcement",
+    "Beton": "Concrete",
+    "Stahl": "Steel",
+    "Spannung": "Stress",
+    "Dehnung": "Strain",
+    "Verformung": "Deformation",
+    "Biegemoment": "Bending moment",
+    "Querkraft": "Shear force",
+    "Normalkraft": "Normal force",
+    "Torsion": "Torsion",
+    "Stabilität": "Stability",
+    "Knicken": "Buckling",
+    "Ermüdung": "Fatigue",
+    "Dauerhaftigkeit": "Durability",
+    "Brandschutz": "Fire protection",
+    "Korrosion": "Corrosion",
+    "Setzung": "Settlement",
+    "Erdruck": "Earth pressure",
+    "Grundbruch": "Bearing capacity failure",
+    "Böschungsbruch": "Slope failure",
+    "Pfahlgründung": "Pile foundation",
+    "Brücke": "Bridge",
+    "Tunnel": "Tunnel",
+    "Dach": "Roof",
+    "Wand": "Wall",
+    "Stütze": "Column",
+    "Balken": "Beam",
+    "Platte": "Slab",
+    "Lastfall": "Load case",
+    "Lastkombination": "Load combination",
+    "Schnittgröße": "Internal force",
+    "Sicherheitskonzept": "Safety concept",
+    "Zuverlässigkeit": "Reliability",
+    "Nachweis": "Verification / proof",
+    "Elastizitätsmodul": "Modulus of elasticity",
+    "Schubmodul": "Shear modulus",
+    "Kriechzahl": "Creep coefficient",
+    "Schwinden": "Shrinkage",
+    "Vorspannung": "Prestressing",
+    "Verbund": "Bond / composite action",
+    "Rissbild": "Crack pattern",
+    "Rissbreite": "Crack width",
+    "Durchstanzen": "Punching shear",
+    # English
+    "action": "Loads and actions applied to structures",
+    "resistance": "Resistance of structural elements",
+    "load combination": "Combination of loads for design",
+    "partial factor": "Partial safety factor",
+    "limit state": "Limit state for design verification",
+    "serviceability": "Serviceability limit state (SLS)",
+    "ultimate": "Ultimate limit state (ULS)",
+    "seismic": "Seismic / earthquake action",
+    "foundation": "Foundation / substructure",
+    "reinforcement": "Steel reinforcement in concrete",
+}
+
+
+# ===================================================================== #
+#  GraphBuilder
+# ===================================================================== #
 
 
 class GraphBuilder:
-    """Build a comprehensive Neo4j knowledge graph from structured Eurocode JSON files."""
+    """Build a Neo4j knowledge graph following the Graph-RAG schema."""
 
     def __init__(self):
         self.db = get_neo4j_connection()
 
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------------- #
     #  Public API
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------------- #
+
     def build_all(self) -> Dict[str, Any]:
-        """
-        Scan the json/ folder, parse every JSON file and ingest into Neo4j.
-        Returns a summary dict with counts.
-        """
+        """Scan ``json/`` folder, ingest every JSON file into Neo4j."""
         json_files = glob.glob(os.path.join(JSON_DIR, "*.json"))
         if not json_files:
-            logger.warning(f"No JSON files found in {JSON_DIR}")
+            logger.warning("No JSON files found in %s", JSON_DIR)
             return {"files": 0, "status": "no_files"}
 
-        self._create_constraints()
+        self._create_constraints_and_indexes()
 
-        total_stats: Dict[str, int] = {
-            "files": 0,
-            "documents": 0,
-            "sections": 0,
-            "symbols": 0,
-            "formulas": 0,
-            "definitions": 0,
-            "abbreviations": 0,
-            "units": 0,
-            "references": 0,
+        total: Dict[str, int] = {
+            "files": 0, "documents": 0, "volumes": 0, "chapters": 0,
+            "pages": 0, "sections": 0, "tables": 0, "figures": 0,
+            "formulas": 0, "concepts": 0,
         }
 
         for filepath in json_files:
             try:
-                stats = self._ingest_file(filepath)
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                stats = self.ingest_document(data, source_path=filepath)
                 for k, v in stats.items():
-                    total_stats[k] = total_stats.get(k, 0) + v
-                total_stats["files"] += 1
+                    total[k] = total.get(k, 0) + v
+                total["files"] += 1
             except Exception as e:
-                logger.error(f"Failed to ingest {filepath}: {e}")
+                logger.error("Failed to ingest %s: %s", filepath, e)
 
-        logger.info(f"Graph build complete: {total_stats}")
-        return total_stats
+        logger.info("Graph build complete: %s", total)
+        return total
 
     def clear_graph(self):
-        """Remove all nodes and relationships (use with care)."""
+        """Remove **all** nodes and relationships."""
         self.db.execute_query("MATCH (n) DETACH DELETE n")
         logger.info("Graph cleared")
 
-    # ------------------------------------------------------------------ #
-    #  Constraints & Indexes
-    # ------------------------------------------------------------------ #
-    def _create_constraints(self):
-        constraints = [
-            "CREATE CONSTRAINT doc_name_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.name IS UNIQUE",
-            "CREATE CONSTRAINT section_id_unique IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
-            "CREATE CONSTRAINT symbol_id_unique IF NOT EXISTS FOR (sym:Symbol) REQUIRE sym.id IS UNIQUE",
-            "CREATE CONSTRAINT formula_id_unique IF NOT EXISTS FOR (f:Formula) REQUIRE f.id IS UNIQUE",
-            "CREATE CONSTRAINT abbreviation_id_unique IF NOT EXISTS FOR (a:Abbreviation) REQUIRE a.id IS UNIQUE",
-            "CREATE CONSTRAINT reference_name_unique IF NOT EXISTS FOR (r:Reference) REQUIRE r.name IS UNIQUE",
-            "CREATE CONSTRAINT chapter_id_unique IF NOT EXISTS FOR (ch:Chapter) REQUIRE ch.id IS UNIQUE",
-            "CREATE CONSTRAINT paragraph_id_unique IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.id IS UNIQUE",
-            "CREATE CONSTRAINT table_id_unique IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
-            "CREATE CONSTRAINT image_id_unique IF NOT EXISTS FOR (img:Image) REQUIRE img.id IS UNIQUE",
-            "CREATE CONSTRAINT contentblock_id_unique IF NOT EXISTS FOR (c:ContentBlock) REQUIRE c.id IS UNIQUE",
-        ]
-        for c in constraints:
-            try:
-                self.db.execute_query(c)
-            except Exception as e:
-                logger.debug(f"Constraint may already exist: {e}")
+    # ----------------------------------------------------------------- #
+    #  Main ingestion
+    # ----------------------------------------------------------------- #
 
-        # Full-text indexes for search
-        for idx_query in [
-            """CREATE FULLTEXT INDEX symbol_search IF NOT EXISTS
-               FOR (s:Symbol) ON EACH [s.name, s.definition]""",
-            """CREATE FULLTEXT INDEX abbreviation_search IF NOT EXISTS
-               FOR (a:Abbreviation) ON EACH [a.name, a.definition]""",
-            """CREATE FULLTEXT INDEX definition_search IF NOT EXISTS
-               FOR (d:Definition) ON EACH [d.term, d.definition]""",
-            """CREATE FULLTEXT INDEX paragraph_search IF NOT EXISTS
-               FOR (p:Paragraph) ON EACH [p.text]""",
-            """CREATE FULLTEXT INDEX content_search IF NOT EXISTS
-               FOR (c:ContentBlock) ON EACH [c.text]""",
-        ]:
-            try:
-                self.db.execute_query(idx_query)
-            except Exception:
-                pass
+    def ingest_document(
+        self,
+        data: Dict[str, Any],
+        source_path: str = "",
+        page_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, int]:
+        """Ingest a structured document dict into Neo4j following the schema.
 
-    # ------------------------------------------------------------------ #
-    #  File ingestion
-    # ------------------------------------------------------------------ #
-    def _ingest_file(self, filepath: str) -> Dict[str, int]:
-        """Parse a single JSON file and create graph nodes/relationships."""
-        logger.info(f"Ingesting {filepath}")
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        Handles both OCR-produced dicts (chapters, paragraphs, tables, images,
+        formulas) **and** legacy JSON files (sections with symbols, definitions,
+        abbreviations, units).
+        """
+        self._create_constraints_and_indexes()
 
         stats = {
-            "documents": 0, "sections": 0, "symbols": 0,
-            "formulas": 0, "definitions": 0, "abbreviations": 0,
-            "units": 0, "references": 0,
+            "documents": 0, "volumes": 0, "chapters": 0, "pages": 0,
+            "sections": 0, "tables": 0, "figures": 0, "formulas": 0,
+            "concepts": 0,
         }
 
-        doc_name = data.get("document", os.path.basename(filepath))
-        standard = data.get("standard", "")
-        iso_ref = data.get("iso_reference", "")
-
-        # Create Document node
-        self.db.execute_query(
-            """MERGE (d:Document {name: $name})
-               SET d.standard = $standard,
-                   d.iso_reference = $iso_ref,
-                   d.source_file = $source_file""",
-            {"name": doc_name, "standard": standard,
-             "iso_ref": iso_ref, "source_file": os.path.basename(filepath)},
-        )
-        stats["documents"] = 1
-
-        # Process sections
-        for section_data in data.get("sections", []):
-            section_name = section_data.get("section", "Unknown Section")
-            section_id = f"{doc_name}::{section_name}"
-
-            self.db.execute_query(
-                """MERGE (s:Section {id: $id})
-                   SET s.name = $name
-                   WITH s
-                   MATCH (d:Document {name: $doc_name})
-                   MERGE (s)-[:BELONGS_TO]->(d)""",
-                {"id": section_id, "name": section_name, "doc_name": doc_name},
-            )
-            stats["sections"] += 1
-
-            for sym in section_data.get("symbols", []):
-                stats["symbols"] += self._create_symbol(sym, section_id, doc_name)
-            for defn in section_data.get("definitions", []):
-                stats["definitions"] += self._create_definition(defn, section_id, doc_name)
-            for abbr in section_data.get("abbreviations", []):
-                stats["abbreviations"] += self._create_abbreviation(abbr, section_id, doc_name)
-            for unit in section_data.get("units", []):
-                stats["units"] += self._create_unit(unit, section_id, doc_name)
-
-        # Key formulas (top-level)
-        for formula in data.get("key_formulas", []):
-            stats["formulas"] += self._create_formula(formula, doc_name)
-
-        # References
-        for ref in data.get("references", []):
-            stats["references"] += self._create_reference(ref, doc_name)
-
-        logger.info(f"Ingested {filepath}: {stats}")
-        return stats
-
-    # ------------------------------------------------------------------ #
-    #  Node creation helpers
-    # ------------------------------------------------------------------ #
-    def _create_symbol(self, sym: Dict, section_id: str, doc_name: str) -> int:
-        symbol_name = sym.get("symbol", "")
-        definition = sym.get("definition", "")
-        formula = sym.get("formula", "")
-        reference = sym.get("reference", "")
-        anmerkung = sym.get("anmerkung", "")
-        symbol_id = f"{doc_name}::{symbol_name}"
-
-        self.db.execute_query(
-            """MERGE (sym:Symbol {id: $id})
-               SET sym.name = $name,
-                   sym.definition = $definition,
-                   sym.formula = $formula,
-                   sym.reference = $reference,
-                   sym.anmerkung = $anmerkung
-               WITH sym
-               MATCH (s:Section {id: $section_id})
-               MERGE (sym)-[:DEFINED_IN]->(s)
-               WITH sym
-               MATCH (d:Document {name: $doc_name})
-               MERGE (sym)-[:FROM_DOCUMENT]->(d)""",
-            {"id": symbol_id, "name": symbol_name, "definition": definition,
-             "formula": formula, "reference": reference, "anmerkung": anmerkung,
-             "section_id": section_id, "doc_name": doc_name},
-        )
-
-        # If the symbol has a formula, link to other symbols it references
-        if formula:
-            self._link_formula_symbols(symbol_id, formula, doc_name)
-
-        return 1
-
-    def _create_definition(self, defn: Dict, section_id: str, doc_name: str) -> int:
-        term = defn.get("term", "")
-        definition = defn.get("definition", "")
-        reference = defn.get("reference", "")
-        anmerkung = defn.get("anmerkung", "")
-        defn_id = f"{doc_name}::{term}"
-
-        self.db.execute_query(
-            """MERGE (df:Definition {id: $id})
-               SET df.term = $term,
-                   df.definition = $definition,
-                   df.reference = $reference,
-                   df.anmerkung = $anmerkung
-               WITH df
-               MATCH (s:Section {id: $section_id})
-               MERGE (df)-[:DEFINED_IN]->(s)
-               WITH df
-               MATCH (d:Document {name: $doc_name})
-               MERGE (df)-[:FROM_DOCUMENT]->(d)""",
-            {"id": defn_id, "term": term, "definition": definition,
-             "reference": reference, "anmerkung": anmerkung,
-             "section_id": section_id, "doc_name": doc_name},
-        )
-        return 1
-
-    def _create_abbreviation(self, abbr: Dict, section_id: str, doc_name: str) -> int:
-        name = abbr.get("abbreviation", "")
-        definition = abbr.get("definition", "")
-        abbr_id = f"{doc_name}::{name}"
-
-        self.db.execute_query(
-            """MERGE (a:Abbreviation {id: $id})
-               SET a.name = $name,
-                   a.definition = $definition
-               WITH a
-               MATCH (s:Section {id: $section_id})
-               MERGE (a)-[:DEFINED_IN]->(s)
-               WITH a
-               MATCH (d:Document {name: $doc_name})
-               MERGE (a)-[:FROM_DOCUMENT]->(d)""",
-            {"id": abbr_id, "name": name, "definition": definition,
-             "section_id": section_id, "doc_name": doc_name},
-        )
-        return 1
-
-    def _create_unit(self, unit: Dict, section_id: str, doc_name: str) -> int:
-        quantity = unit.get("quantity", "")
-        unit_val = unit.get("unit", "")
-        unit_id = f"{doc_name}::{quantity}"
-
-        self.db.execute_query(
-            """MERGE (u:Unit {id: $id})
-               SET u.quantity = $quantity,
-                   u.unit = $unit_val
-               WITH u
-               MATCH (s:Section {id: $section_id})
-               MERGE (u)-[:DEFINED_IN]->(s)
-               WITH u
-               MATCH (d:Document {name: $doc_name})
-               MERGE (u)-[:FROM_DOCUMENT]->(d)""",
-            {"id": unit_id, "quantity": quantity, "unit_val": unit_val,
-             "section_id": section_id, "doc_name": doc_name},
-        )
-        return 1
-
-    def _create_formula(self, formula: Dict, doc_name: str) -> int:
-        name = formula.get("name", "")
-        expression = formula.get("formula", "")
-        variables = formula.get("variables", {})
-        formula_id = f"{doc_name}::formula::{name}"
-
-        self.db.execute_query(
-            """MERGE (f:Formula {id: $id})
-               SET f.name = $name,
-                   f.expression = $expression,
-                   f.variables = $variables
-               WITH f
-               MATCH (d:Document {name: $doc_name})
-               MERGE (f)-[:FROM_DOCUMENT]->(d)""",
-            {"id": formula_id, "name": name, "expression": expression,
-             "variables": json.dumps(variables, ensure_ascii=False),
-             "doc_name": doc_name},
-        )
-
-        # Link formula to the symbols it uses
-        for var_symbol in variables.keys():
-            sym_id = f"{doc_name}::{var_symbol}"
-            try:
-                self.db.execute_query(
-                    """MATCH (f:Formula {id: $formula_id})
-                       MATCH (sym:Symbol {id: $sym_id})
-                       MERGE (f)-[:USES_SYMBOL]->(sym)""",
-                    {"formula_id": formula_id, "sym_id": sym_id},
-                )
-            except Exception:
-                pass
-
-        return 1
-
-    def _create_reference(self, ref: str, doc_name: str) -> int:
-        self.db.execute_query(
-            """MERGE (r:Reference {name: $name})
-               WITH r
-               MATCH (d:Document {name: $doc_name})
-               MERGE (d)-[:REFERENCES]->(r)""",
-            {"name": ref, "doc_name": doc_name},
-        )
-        return 1
-
-    def _link_formula_symbols(self, symbol_id: str, formula_str: str, doc_name: str):
-        """Find symbols referenced in a formula expression and create RELATED_TO edges."""
-        try:
-            result = self.db.execute_query(
-                """MATCH (s:Symbol)-[:FROM_DOCUMENT]->(d:Document {name: $doc_name})
-                   RETURN s.name AS name, s.id AS id""",
-                {"doc_name": doc_name},
-            )
-            for row in result:
-                other_name = row.get("name", "")
-                other_id = row.get("id", "")
-                if other_id != symbol_id and other_name and other_name in formula_str:
-                    self.db.execute_query(
-                        """MATCH (s1:Symbol {id: $id1})
-                           MATCH (s2:Symbol {id: $id2})
-                           MERGE (s1)-[:RELATED_TO]->(s2)""",
-                        {"id1": symbol_id, "id2": other_id},
-                    )
-        except Exception as e:
-            logger.debug(f"Could not link formula symbols: {e}")
-
-    # ------------------------------------------------------------------ #
-    #  OCR document ingestion (new structure with chapters/paragraphs/tables/images)
-    # ------------------------------------------------------------------ #
-    def ingest_ocr_document(self, data: Dict[str, Any]) -> Dict[str, int]:
-        """Ingest a structured OCR document into the graph."""
-        self._create_constraints()
-
-        doc_name = data.get("document", "Unknown")
-        source_file = data.get("source_file", "")
+        # ── Document ────────────────────────────────────────────────────
+        doc_name = data.get("document", os.path.basename(source_path))
+        filename = data.get("source_file", os.path.basename(source_path))
         language = data.get("language", "de")
+        doc_id = _make_uuid("document", doc_name)
+        doc_type = _detect_document_type(filename)
+        ec_part = _detect_eurocode_part(
+            filename,
+            (data.get("full_markdown", "") or "")[:3000],
+        )
+        checksum = _file_checksum(source_path)
 
-        stats = {
-            "documents": 0, "chapters": 0, "sections": 0, "paragraphs": 0,
-            "tables": 0, "images": 0, "formulas": 0, "symbols": 0,
-            "definitions": 0, "abbreviations": 0, "units": 0, "references": 0,
-        }
-
-        # Create Document node
         self.db.execute_query(
-            """MERGE (d:Document {name: $name})
-               SET d.source_file = $source_file,
-                   d.language = $language,
-                   d.ocr_processed = true""",
-            {"name": doc_name, "source_file": source_file, "language": language},
+            """MERGE (d:Document {id: $id})
+               SET d.filename         = $filename,
+                   d.document_type    = $doc_type,
+                   d.eurocode_part    = $ec_part,
+                   d.language         = $language,
+                   d.upload_timestamp = datetime(),
+                   d.version          = $version,
+                   d.checksum         = $checksum""",
+            {
+                "id": doc_id, "filename": filename,
+                "doc_type": doc_type, "ec_part": ec_part,
+                "language": language,
+                "version": data.get("version", "1.0"),
+                "checksum": checksum,
+            },
         )
         stats["documents"] = 1
 
-        # Process chapters
-        for ch_data in data.get("chapters", []):
-            ch_title = ch_data.get("title", "")
-            ch_number = ch_data.get("number", "")
-            ch_id = f"{doc_name}::chapter::{ch_number}::{ch_title}"
+        # ── Page nodes (from OCR page_data) ─────────────────────────────
+        page_id_map: Dict[int, str] = {}
+        if page_data:
+            page_id_map = self._create_pages(doc_name, page_data)
+            stats["pages"] = len(page_id_map)
+
+        # ── Chapters ────────────────────────────────────────────────────
+        raw_chapters = data.get("chapters", [])
+        chapter_id_map: Dict[str, str] = {}
+
+        if not raw_chapters:
+            # Create a default chapter so sections are always reachable
+            raw_chapters = [{
+                "title": doc_name,
+                "number": "1",
+                "section_refs": [
+                    s.get("section", "") for s in data.get("sections", [])
+                ],
+            }]
+
+        for ch in raw_chapters:
+            ch_title = ch.get("title", "")
+            ch_number = ch.get("number", str(len(chapter_id_map) + 1))
+            ch_id = _make_uuid("chapter", doc_name, ch_number)
+            chapter_id_map[ch_number] = ch_id
+
+            ch_type = "chapter"
+            if re.match(r"^[A-Z]$", ch_number.strip()):
+                ch_type = "appendix"
+            elif ch_title.lower().startswith(("anhang", "annex", "appendix")):
+                ch_type = "appendix"
+            elif ch_title.lower().startswith(("vorwort", "foreword", "einleitung")):
+                ch_type = "front_matter"
 
             self.db.execute_query(
                 """MERGE (ch:Chapter {id: $id})
-                   SET ch.title = $title, ch.number = $number
+                   SET ch.number       = $number,
+                       ch.title        = $title,
+                       ch.chapter_type = $ch_type,
+                       ch.start_page   = $start_page,
+                       ch.end_page     = $end_page
                    WITH ch
-                   MATCH (d:Document {name: $doc_name})
-                   MERGE (ch)-[:BELONGS_TO]->(d)""",
-                {"id": ch_id, "title": ch_title, "number": ch_number, "doc_name": doc_name},
+                   MATCH (d:Document {id: $doc_id})
+                   MERGE (d)-[:HAS_CHAPTER]->(ch)""",
+                {
+                    "id": ch_id, "number": ch_number, "title": ch_title,
+                    "ch_type": ch_type,
+                    "start_page": ch.get("start_page", 0),
+                    "end_page": ch.get("end_page", 0),
+                    "doc_id": doc_id,
+                },
             )
             stats["chapters"] += 1
 
-        # Process sections (with new sub-items)
-        for section_data in data.get("sections", []):
-            section_name = section_data.get("section", "Unknown Section")
-            section_id = f"{doc_name}::{section_name}"
-            section_level = section_data.get("level", 2)
-            section_content = section_data.get("content", "")[:5000]
+        # ── Sections ────────────────────────────────────────────────────
+        section_map: Dict[str, Dict] = {}
+        prev_by_level: Dict[int, str] = {}
+        section_order_on_page: Dict[int, int] = {}
+
+        for sec_data in data.get("sections", []):
+            sec_title = sec_data.get("section", "Unknown Section")
+            sec_level = sec_data.get("level", 2)
+            sec_number = _extract_section_number(sec_title) or sec_title[:30]
+            sec_id = _make_uuid("section", doc_name, sec_title)
+
+            # Build full_text from paragraphs
+            paragraphs = sec_data.get("paragraphs", [])
+            full_text = " ".join(p.get("text", "") for p in paragraphs).strip()
+            if not full_text:
+                full_text = sec_data.get("content", "")
+            content_preview = full_text[:500]
+
+            # Page range
+            pages_in_sec = sorted(
+                {p.get("page", 0) for p in paragraphs if p.get("page")}
+            )
+            start_page = pages_in_sec[0] if pages_in_sec else 0
+            end_page = pages_in_sec[-1] if pages_in_sec else 0
 
             self.db.execute_query(
                 """MERGE (s:Section {id: $id})
-                   SET s.name = $name, s.level = $level, s.content = $content
-                   WITH s
-                   MATCH (d:Document {name: $doc_name})
-                   MERGE (s)-[:BELONGS_TO]->(d)""",
-                {"id": section_id, "name": section_name, "level": section_level,
-                 "content": section_content, "doc_name": doc_name},
+                   SET s.number          = $number,
+                       s.title           = $title,
+                       s.level           = $level,
+                       s.start_page      = $start_page,
+                       s.end_page        = $end_page,
+                       s.content_preview = $preview,
+                       s.full_text       = $full_text""",
+                {
+                    "id": sec_id, "number": sec_number, "title": sec_title,
+                    "level": sec_level, "start_page": start_page,
+                    "end_page": end_page, "preview": content_preview,
+                    "full_text": full_text[:50000],
+                },
             )
             stats["sections"] += 1
+            section_map[sec_id] = {
+                "title": sec_title, "level": sec_level,
+                "full_text": full_text, "pages": pages_in_sec,
+            }
 
-            # Link section to chapter if applicable
-            for ch_data in data.get("chapters", []):
-                if section_name in ch_data.get("section_refs", []):
-                    ch_id = f"{doc_name}::chapter::{ch_data.get('number', '')}::{ch_data.get('title', '')}"
+            # ── Page ↔ Section links ────────────────────────────────────
+            if page_id_map and pages_in_sec:
+                first_page = pages_in_sec[0]
+                for pg in pages_in_sec:
+                    if pg not in page_id_map:
+                        continue
+                    order = section_order_on_page.get(pg, 0)
+                    section_order_on_page[pg] = order + 1
                     self.db.execute_query(
-                        """MATCH (s:Section {id: $sec_id})
-                           MATCH (ch:Chapter {id: $ch_id})
-                           MERGE (s)-[:IN_CHAPTER]->(ch)""",
-                        {"sec_id": section_id, "ch_id": ch_id},
+                        """MATCH (p:Page {id: $pid})
+                           MATCH (s:Section {id: $sid})
+                           MERGE (p)-[r:HAS_SECTION]->(s)
+                           SET r.order = $order""",
+                        {"pid": page_id_map[pg], "sid": sec_id, "order": order},
                     )
-                    break
+                    if pg != first_page:
+                        self.db.execute_query(
+                            """MATCH (s:Section {id: $sid})
+                               MATCH (p:Page {id: $pid})
+                               MERGE (s)-[:CONTINUES_ON]->(p)""",
+                            {"sid": sec_id, "pid": page_id_map[pg]},
+                        )
 
-            # Process paragraphs
-            for i, para in enumerate(section_data.get("paragraphs", [])):
-                p_text = para.get("text", "")
-                p_page = para.get("page", 0)
-                p_id = f"{doc_name}::para::{section_name}::{i}"
+            # ── Chapter ↔ Page links (derived) ──────────────────────────
+            if page_id_map:
+                for ch in raw_chapters:
+                    if sec_title in ch.get("section_refs", []):
+                        ch_id_val = chapter_id_map.get(ch.get("number", ""))
+                        if ch_id_val:
+                            for pg in pages_in_sec:
+                                if pg in page_id_map:
+                                    self.db.execute_query(
+                                        """MATCH (ch:Chapter {id: $cid})
+                                           MATCH (p:Page {id: $pid})
+                                           MERGE (ch)-[:CONTAINS_PAGE]->(p)""",
+                                        {"cid": ch_id_val, "pid": page_id_map[pg]},
+                                    )
+                        break
 
-                self.db.execute_query(
-                    """MERGE (p:Paragraph {id: $id})
-                       SET p.text = $text, p.page = $page
-                       WITH p
-                       MATCH (s:Section {id: $section_id})
-                       MERGE (p)-[:IN_SECTION]->(s)
-                       WITH p
-                       MATCH (d:Document {name: $doc_name})
-                       MERGE (p)-[:FROM_DOCUMENT]->(d)""",
-                    {"id": p_id, "text": p_text[:3000], "page": p_page,
-                     "section_id": section_id, "doc_name": doc_name},
-                )
-                stats["paragraphs"] += 1
+            # ── Subsection hierarchy ────────────────────────────────────
+            if sec_level > 1:
+                for plevel in range(sec_level - 1, 0, -1):
+                    if plevel in prev_by_level:
+                        self.db.execute_query(
+                            """MATCH (parent:Section {id: $pid})
+                               MATCH (child:Section {id: $cid})
+                               MERGE (parent)-[:HAS_SUBSECTION]->(child)""",
+                            {"pid": prev_by_level[plevel], "cid": sec_id},
+                        )
+                        break
+            prev_by_level[sec_level] = sec_id
 
-            # Process tables
-            for i, table in enumerate(section_data.get("tables", [])):
-                t_id_str = f"{doc_name}::table::{section_name}::{i}"
-                t_html = table.get("html", "")
-                t_caption = table.get("caption", "")
-                t_page = table.get("page", 0)
-
+            # ── Tables ──────────────────────────────────────────────────
+            for i, tbl in enumerate(sec_data.get("tables", [])):
+                tbl_id = _make_uuid("table", doc_name, sec_title, str(i))
                 self.db.execute_query(
                     """MERGE (t:Table {id: $id})
-                       SET t.html = $html, t.caption = $caption, t.page = $page
+                       SET t.number  = $number,
+                           t.caption = $caption,
+                           t.content = $content
                        WITH t
-                       MATCH (s:Section {id: $section_id})
-                       MERGE (t)-[:IN_SECTION]->(s)
-                       WITH t
-                       MATCH (d:Document {name: $doc_name})
-                       MERGE (t)-[:FROM_DOCUMENT]->(d)""",
-                    {"id": t_id_str, "html": t_html[:5000], "caption": t_caption,
-                     "page": t_page, "section_id": section_id, "doc_name": doc_name},
+                       MATCH (s:Section {id: $sid})
+                       MERGE (s)-[:HAS_TABLE]->(t)""",
+                    {
+                        "id": tbl_id,
+                        "number": tbl.get("number", str(i + 1)),
+                        "caption": tbl.get("caption", ""),
+                        "content": (
+                            tbl.get("text", "") or tbl.get("html", "")
+                        )[:10000],
+                        "sid": sec_id,
+                    },
                 )
                 stats["tables"] += 1
 
-            # Process images
-            for i, img in enumerate(section_data.get("images", [])):
-                img_id = f"{doc_name}::image::{section_name}::{i}"
-                img_desc = img.get("description", "")
-                img_type = img.get("type", "image")
-                img_page = img.get("page", 0)
-
+            # ── Figures ─────────────────────────────────────────────────
+            for i, fig in enumerate(sec_data.get("images", [])):
+                fig_id = _make_uuid("figure", doc_name, sec_title, str(i))
                 self.db.execute_query(
-                    """MERGE (img:Image {id: $id})
-                       SET img.description = $description, img.type = $type, img.page = $page
-                       WITH img
-                       MATCH (s:Section {id: $section_id})
-                       MERGE (img)-[:IN_SECTION]->(s)
-                       WITH img
-                       MATCH (d:Document {name: $doc_name})
-                       MERGE (img)-[:FROM_DOCUMENT]->(d)""",
-                    {"id": img_id, "description": img_desc, "type": img_type,
-                     "page": img_page, "section_id": section_id, "doc_name": doc_name},
+                    """MERGE (f:Figure {id: $id})
+                       SET f.number      = $number,
+                           f.caption     = $caption,
+                           f.description = $description,
+                           f.image_type  = $image_type
+                       WITH f
+                       MATCH (s:Section {id: $sid})
+                       MERGE (s)-[:HAS_FIGURE]->(f)""",
+                    {
+                        "id": fig_id,
+                        "number": fig.get("number", str(i + 1)),
+                        "caption": fig.get("description", "")[:200],
+                        "description": fig.get("description", ""),
+                        "image_type": fig.get("type", "image"),
+                        "sid": sec_id,
+                    },
                 )
-                stats["images"] += 1
+                stats["figures"] += 1
 
-            # Process section-level formulas
-            for i, formula in enumerate(section_data.get("formulas", [])):
-                f_id = f"{doc_name}::formula::{section_name}::{i}"
-                f_expr = formula.get("expression", "")
-                f_ctx = formula.get("context", "")
-                f_page = formula.get("page", 0)
-
+            # ── Formulas (section-level) ────────────────────────────────
+            for i, frm in enumerate(sec_data.get("formulas", [])):
+                frm_id = _make_uuid("formula", doc_name, sec_title, str(i))
                 self.db.execute_query(
                     """MERGE (f:Formula {id: $id})
-                       SET f.name = $name, f.expression = $expression, f.page = $page
+                       SET f.latex = $latex
                        WITH f
-                       MATCH (s:Section {id: $section_id})
-                       MERGE (f)-[:IN_SECTION]->(s)
-                       WITH f
-                       MATCH (d:Document {name: $doc_name})
-                       MERGE (f)-[:FROM_DOCUMENT]->(d)""",
-                    {"id": f_id, "name": f_ctx or f_expr[:80], "expression": f_expr,
-                     "page": f_page, "section_id": section_id, "doc_name": doc_name},
+                       MATCH (s:Section {id: $sid})
+                       MERGE (s)-[:HAS_FORMULA]->(f)""",
+                    {
+                        "id": frm_id,
+                        "latex": frm.get("expression", "") or frm.get("formula", ""),
+                        "sid": sec_id,
+                    },
                 )
                 stats["formulas"] += 1
 
-            # Process existing sub-items (symbols, definitions, etc.)
-            for sym in section_data.get("symbols", []):
-                stats["symbols"] += self._create_symbol(sym, section_id, doc_name)
-            for defn in section_data.get("definitions", []):
-                stats["definitions"] += self._create_definition(defn, section_id, doc_name)
-            for abbr in section_data.get("abbreviations", []):
-                stats["abbreviations"] += self._create_abbreviation(abbr, section_id, doc_name)
-            for unit in section_data.get("units", []):
-                stats["units"] += self._create_unit(unit, section_id, doc_name)
+        # ── Top-level key_formulas (legacy format) ──────────────────────
+        for i, kf in enumerate(data.get("key_formulas", [])):
+            frm_id = _make_uuid("formula", doc_name, "key", str(i))
+            latex = kf.get("formula", "") or kf.get("expression", "")
+            if not latex:
+                continue
+            target_sec = None
+            ctx = kf.get("name", "")
+            for sid, sinfo in section_map.items():
+                if ctx and ctx in sinfo.get("title", ""):
+                    target_sec = sid
+                    break
+            if target_sec is None and section_map:
+                target_sec = next(iter(section_map))
 
-        # Top-level formulas
-        for formula in data.get("key_formulas", []):
-            stats["formulas"] += self._create_formula(formula, doc_name)
+            self.db.execute_query(
+                """MERGE (f:Formula {id: $id}) SET f.latex = $latex""",
+                {"id": frm_id, "latex": latex},
+            )
+            if target_sec:
+                self.db.execute_query(
+                    """MATCH (f:Formula {id: $fid})
+                       MATCH (s:Section {id: $sid})
+                       MERGE (s)-[:HAS_FORMULA]->(f)""",
+                    {"fid": frm_id, "sid": target_sec},
+                )
+            stats["formulas"] += 1
 
-        # References
-        for ref in data.get("references", []):
-            stats["references"] += self._create_reference(ref, doc_name)
+        # ── Concept extraction & MENTIONS edges ─────────────────────────
+        concept_count = self._extract_and_create_concepts(
+            doc_id, doc_name, data, section_map,
+        )
+        stats["concepts"] = concept_count
 
-        logger.info(f"OCR document ingested: {stats}")
+        logger.info("Ingested document '%s': %s", doc_name, stats)
         return stats
 
+    # Backward-compatible alias used by ocr_pipeline
+    def ingest_ocr_document(
+        self,
+        data: Dict[str, Any],
+        page_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, int]:
+        return self.ingest_document(data, page_data=page_data)
 
-# ------------------------------------------------------------------ #
-#  Module-level convenience
-# ------------------------------------------------------------------ #
+    # ----------------------------------------------------------------- #
+    #  Page creation
+    # ----------------------------------------------------------------- #
+
+    def _create_pages(
+        self, doc_name: str, page_data: List[Dict[str, Any]],
+    ) -> Dict[int, str]:
+        """Create Page nodes and NEXT_PAGE chain.  Return {page_num: page_id}."""
+        page_id_map: Dict[int, str] = {}
+        for pd in page_data:
+            pnum = pd["page_num"]
+            pid = _make_uuid("page", doc_name, str(pnum))
+            page_id_map[pnum] = pid
+
+            md_lines = pd.get("markdown", "").split("\n")
+            header = md_lines[0].strip()[:200] if md_lines else ""
+            footer = md_lines[-1].strip()[:200] if len(md_lines) > 1 else ""
+
+            self.db.execute_query(
+                """MERGE (p:Page {id: $id})
+                   SET p.page_number = $pnum,
+                       p.header      = $header,
+                       p.footer      = $footer""",
+                {"id": pid, "pnum": pnum, "header": header, "footer": footer},
+            )
+
+        # NEXT_PAGE chain
+        sorted_nums = sorted(page_id_map.keys())
+        for i in range(len(sorted_nums) - 1):
+            self.db.execute_query(
+                """MATCH (p1:Page {id: $id1})
+                   MATCH (p2:Page {id: $id2})
+                   MERGE (p1)-[:NEXT_PAGE]->(p2)""",
+                {
+                    "id1": page_id_map[sorted_nums[i]],
+                    "id2": page_id_map[sorted_nums[i + 1]],
+                },
+            )
+
+        return page_id_map
+
+    # ----------------------------------------------------------------- #
+    #  Constraints & Indexes
+    # ----------------------------------------------------------------- #
+
+    def _create_constraints_and_indexes(self):
+        """Create all required constraints, property indexes and full-text indexes."""
+        constraints = [
+            "CREATE CONSTRAINT doc_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
+            "CREATE CONSTRAINT volume_id_unique IF NOT EXISTS FOR (v:Volume) REQUIRE v.id IS UNIQUE",
+            "CREATE CONSTRAINT chapter_id_unique IF NOT EXISTS FOR (ch:Chapter) REQUIRE ch.id IS UNIQUE",
+            "CREATE CONSTRAINT page_id_unique IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT section_id_unique IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT concept_id_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT table_id_unique IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT figure_id_unique IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
+            "CREATE CONSTRAINT formula_id_unique IF NOT EXISTS FOR (fm:Formula) REQUIRE fm.id IS UNIQUE",
+        ]
+        for q in constraints:
+            try:
+                self.db.execute_query(q)
+            except Exception as e:
+                logger.debug("Constraint may already exist: %s", e)
+
+        indexes = [
+            "CREATE INDEX section_number_idx IF NOT EXISTS FOR (s:Section) ON (s.number)",
+            "CREATE INDEX chapter_number_idx IF NOT EXISTS FOR (ch:Chapter) ON (ch.number)",
+            "CREATE INDEX concept_norm_idx IF NOT EXISTS FOR (c:Concept) ON (c.normalized_name)",
+            "CREATE INDEX page_number_idx IF NOT EXISTS FOR (p:Page) ON (p.page_number)",
+            "CREATE INDEX doc_type_idx IF NOT EXISTS FOR (d:Document) ON (d.document_type)",
+        ]
+        for q in indexes:
+            try:
+                self.db.execute_query(q)
+            except Exception as e:
+                logger.debug("Index may already exist: %s", e)
+
+        fulltext_indexes = [
+            """CREATE FULLTEXT INDEX section_fulltext IF NOT EXISTS
+               FOR (s:Section) ON EACH [s.title, s.full_text, s.content_preview]""",
+            """CREATE FULLTEXT INDEX concept_fulltext IF NOT EXISTS
+               FOR (c:Concept) ON EACH [c.name, c.description]""",
+            """CREATE FULLTEXT INDEX table_fulltext IF NOT EXISTS
+               FOR (t:Table) ON EACH [t.caption, t.content]""",
+            """CREATE FULLTEXT INDEX formula_fulltext IF NOT EXISTS
+               FOR (f:Formula) ON EACH [f.latex]""",
+        ]
+        for q in fulltext_indexes:
+            try:
+                self.db.execute_query(q)
+            except Exception:
+                pass
+
+    # ----------------------------------------------------------------- #
+    #  Concept Extraction
+    # ----------------------------------------------------------------- #
+
+    def _extract_and_create_concepts(
+        self,
+        doc_id: str,
+        doc_name: str,
+        data: Dict[str, Any],
+        section_map: Dict[str, Dict],
+    ) -> int:
+        """Extract concepts via domain dictionary + legacy fields.
+
+        Creates Concept nodes, MENTIONS edges (Section→Concept) and
+        RELATED_TO edges (Concept↔Concept based on co-occurrence).
+        """
+        count = 0
+        created: Dict[str, str] = {}  # normalized_name → concept_id
+
+        def _ensure_concept(name: str, description: str) -> str:
+            nonlocal count
+            normalized = name.lower().strip()
+            if normalized in created:
+                return created[normalized]
+            cid = _make_uuid("concept", normalized)
+            self.db.execute_query(
+                """MERGE (c:Concept {id: $id})
+                   SET c.name            = $name,
+                       c.normalized_name = $normalized,
+                       c.description     = $description""",
+                {"id": cid, "name": name, "normalized": normalized,
+                 "description": description},
+            )
+            created[normalized] = cid
+            count += 1
+            return cid
+
+        def _link_mention(sec_id: str, concept_id: str, confidence: float):
+            self.db.execute_query(
+                """MATCH (s:Section {id: $sid})
+                   MATCH (c:Concept {id: $cid})
+                   MERGE (s)-[r:MENTIONS]->(c)
+                   SET r.confidence = $conf""",
+                {"sid": sec_id, "cid": concept_id, "conf": confidence},
+            )
+
+        # 1) Domain-dictionary scan over section full_text
+        for sec_id, info in section_map.items():
+            text = (info.get("full_text", "") or info.get("title", "")).lower()
+            for concept_name, desc in DOMAIN_CONCEPTS.items():
+                if concept_name.lower() in text:
+                    cid = _ensure_concept(concept_name, desc)
+                    occ = text.count(concept_name.lower())
+                    confidence = min(1.0, 0.3 + occ * 0.1)
+                    _link_mention(sec_id, cid, confidence)
+
+        # 2) Legacy fields → Concepts
+        for sec_data in data.get("sections", []):
+            sec_title = sec_data.get("section", "")
+            sec_id = _make_uuid("section", doc_name, sec_title)
+
+            for sym in sec_data.get("symbols", []):
+                name = sym.get("symbol", "")
+                if name:
+                    cid = _ensure_concept(name, sym.get("definition", ""))
+                    _link_mention(sec_id, cid, 0.9)
+
+            for defn in sec_data.get("definitions", []):
+                term = defn.get("term", "")
+                if term:
+                    cid = _ensure_concept(term, defn.get("definition", ""))
+                    _link_mention(sec_id, cid, 0.95)
+
+            for abbr in sec_data.get("abbreviations", []):
+                name = abbr.get("abbreviation", "")
+                if name:
+                    cid = _ensure_concept(name, abbr.get("definition", ""))
+                    _link_mention(sec_id, cid, 0.85)
+
+            for unit in sec_data.get("units", []):
+                qty = unit.get("quantity", "")
+                if qty:
+                    cid = _ensure_concept(qty, f"Unit: {unit.get('unit', '')}")
+                    _link_mention(sec_id, cid, 0.8)
+
+        # 3) RELATED_TO between co-occurring concepts
+        self._link_related_concepts()
+
+        return count
+
+    def _link_related_concepts(self):
+        """Create RELATED_TO edges between Concepts that co-occur in sections."""
+        try:
+            self.db.execute_query(
+                """MATCH (c1:Concept)<-[:MENTIONS]-(s:Section)-[:MENTIONS]->(c2:Concept)
+                   WHERE c1.id < c2.id
+                   WITH c1, c2, count(s) AS co
+                   WHERE co >= 1
+                   MERGE (c1)-[r:RELATED_TO]->(c2)
+                   SET r.weight = toFloat(co) / 10.0""",
+            )
+        except Exception as e:
+            logger.debug("Could not link related concepts: %s", e)
+
+    # ----------------------------------------------------------------- #
+    #  Embedding generation (Section + Concept)
+    # ----------------------------------------------------------------- #
+
+    def generate_embeddings(self, doc_name: Optional[str] = None) -> int:
+        """Generate embeddings for Section and Concept nodes via Ollama.
+
+        Creates vector indexes if they don't exist.
+        Returns total number of embeddings stored.
+        """
+        from backend.app.modules.ollama_client import get_ollama_client
+        ollama = get_ollama_client()
+        embedded = 0
+
+        # Ensure vector indexes
+        for q in [
+            """CREATE VECTOR INDEX section_embedding_index IF NOT EXISTS
+               FOR (s:Section) ON (s.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}""",
+            """CREATE VECTOR INDEX concept_embedding_index IF NOT EXISTS
+               FOR (c:Concept) ON (c.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}""",
+        ]:
+            try:
+                self.db.execute_query(q)
+            except Exception as e:
+                logger.debug("Vector index note: %s", e)
+
+        # ── Embed Sections ──────────────────────────────────────────────
+        sections = self.db.execute_query(
+            """MATCH (s:Section)
+               WHERE s.embedding IS NULL
+               RETURN s.id AS id, s.title AS title, s.full_text AS text
+               LIMIT 2000""",
+        )
+
+        logger.info("Embedding %d sections …", len(sections))
+        for sec in sections:
+            text = sec.get("text") or sec.get("title", "")
+            if not text or len(text.strip()) < 10:
+                continue
+            try:
+                emb = ollama.generate_embedding(text[:2000])
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (s:Section {id: $id}) SET s.embedding = $emb""",
+                        {"id": sec["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Section embedding failed %s: %s", sec["id"], e)
+
+        # ── Embed Concepts ──────────────────────────────────────────────
+        concepts = self.db.execute_query(
+            """MATCH (c:Concept)
+               WHERE c.embedding IS NULL
+               RETURN c.id AS id, c.name AS name, c.description AS desc
+               LIMIT 2000""",
+        )
+
+        logger.info("Embedding %d concepts …", len(concepts))
+        for con in concepts:
+            text = f"{con.get('name', '')} — {con.get('desc', '')}"
+            if len(text.strip()) < 5:
+                continue
+            try:
+                emb = ollama.generate_embedding(text)
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (c:Concept {id: $id}) SET c.embedding = $emb""",
+                        {"id": con["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Concept embedding failed %s: %s", con["id"], e)
+
+        logger.info("Stored %d embeddings", embedded)
+        return embedded
+
+    # ----------------------------------------------------------------- #
+    #  Cross-document semantic similarity
+    # ----------------------------------------------------------------- #
+
+    def compute_semantic_similarity(
+        self, threshold: float = 0.80, top_k: int = 5,
+    ) -> int:
+        """Find and store SEMANTICALLY_SIMILAR edges between Sections
+        using the vector index."""
+        count = 0
+        sections = self.db.execute_query(
+            """MATCH (s:Section)
+               WHERE s.embedding IS NOT NULL
+               RETURN s.id AS id, s.embedding AS embedding
+               LIMIT 2000""",
+        )
+
+        for sec in sections:
+            try:
+                results = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes(
+                           'section_embedding_index', $top_k, $embedding
+                       ) YIELD node, score
+                       WHERE node.id <> $sid AND score >= $threshold
+                       WITH node, score
+                       MATCH (origin:Section {id: $sid})
+                       MERGE (origin)-[r:SEMANTICALLY_SIMILAR]->(node)
+                       SET r.score = score
+                       RETURN count(r) AS created""",
+                    {
+                        "top_k": top_k, "embedding": sec["embedding"],
+                        "sid": sec["id"], "threshold": threshold,
+                    },
+                )
+                if results:
+                    count += results[0].get("created", 0)
+            except Exception as e:
+                logger.debug("Similarity error for %s: %s", sec["id"], e)
+                break  # vector index probably not ready yet
+
+        logger.info("Created %d semantic-similarity links", count)
+        return count
+
+
+# ===================================================================== #
+#  Module-level singleton
+# ===================================================================== #
+
 _builder: Optional[GraphBuilder] = None
 
 

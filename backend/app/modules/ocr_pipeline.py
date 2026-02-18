@@ -620,12 +620,14 @@ def process_document(pdf_path: str, filename: str) -> Dict[str, Any]:
         # 4. Build Neo4j graph
         _set_status(filename, "processing", "building_graph", started_at=started_at)
         from backend.app.modules.graph_builder import get_graph_builder
-        graph_stats = get_graph_builder().ingest_ocr_document(structured)
+        builder = get_graph_builder()
+        graph_stats = builder.ingest_document(structured, page_data=page_data)
         logger.info("Graph stats: %s", graph_stats)
 
-        # 5. Embeddings
+        # 5. Embeddings on Section + Concept nodes, then cross-document similarity
         _set_status(filename, "processing", "generating_embeddings", started_at=started_at)
-        embed_count = _generate_embeddings(structured)
+        embed_count = builder.generate_embeddings(structured.get("document", filename))
+        similarity_count = builder.compute_semantic_similarity()
 
         # Done
         final_stats = {
@@ -634,6 +636,7 @@ def process_document(pdf_path: str, filename: str) -> Dict[str, Any]:
             "sections": len(structured.get("sections", [])),
             "chapters": len(structured.get("chapters", [])),
             "embeddings": embed_count,
+            "semantic_links": similarity_count,
             "graph": graph_stats,
         }
         _set_status(

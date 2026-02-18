@@ -43,7 +43,7 @@ async def health_check() -> HealthStatus:
     try:
         querier = get_graph_querier()
         stats = querier.get_graph_stats()
-        graph_loaded = stats.get("symbols", 0) > 0
+        graph_loaded = any(value > 0 for value in stats.values())
     except Exception:
         pass
 

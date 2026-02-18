@@ -1,4 +1,4 @@
-"""Eurocode Agent - LangGraph ReAct agent with graph-query tools"""
+"""Eurocode Agent - LangGraph ReAct agent with Graph-RAG tools"""
 import json
 import logging
 from typing import List, Dict, Any, Optional
@@ -17,28 +17,30 @@ logger = logging.getLogger(__name__)
 #  System prompt
 # ================================================================== #
 SYSTEM_MESSAGE = (
-    "You are an expert Eurocode civil-engineering assistant. "
-    "You have access to a knowledge graph containing Eurocode symbols, formulas, "
-    "abbreviations, definitions, units and references. "
-    "ALWAYS use your tools to query the knowledge graph before answering — never guess or invent data. "
-    "If the user asks about symbols, formulas, or definitions, call the appropriate tool first. "
-    "Include exact symbol names, definitions, and formulas from the tool results in your answer. "
-    "If the question is in German, answer in German. If in English, answer in English. "
-    "Be precise and cite the document/section where information was found. "
-    "If no relevant data is found after querying, say so honestly. "
-    "\n\n"
-    "IMPORTANT: The knowledge graph data is in GERMAN. When the user asks in English, "
-    "you MUST translate the search terms to German before calling tools. Examples:\n"
+    "You are an expert Eurocode civil-engineering assistant backed by a Graph-RAG "
+    "knowledge graph. The graph contains Documents, Chapters, Pages, Sections, "
+    "Tables, Figures, Formulas, and Concepts — all linked with structural and "
+    "semantic relationships.\n\n"
+    "ALWAYS use your tools to query the knowledge graph before answering — never "
+    "guess or invent data.\n\n"
+    "Available tool strategies:\n"
+    "• Use `search` as the primary broad search — it queries sections, concepts, "
+    "  tables, figures, formulas, and performs semantic vector search.\n"
+    "• Use `lookup_concept` for specific engineering terms or symbols "
+    "  (γf, Ed, 'Einwirkung', 'limit state', etc.).\n"
+    "• Use `search_formulas` when the user asks about a formula or equation.\n"
+    "• Use `search_tables` when the user asks about table data.\n"
+    "• Use `list_documents` or `list_chapters` for structural navigation.\n\n"
+    "Include exact concept names, definitions, formulas, and section/page citations "
+    "in your answer. If the question is German, answer in German. If English, answer "
+    "in English. Be precise and cite the document and section.\n\n"
+    "IMPORTANT: The knowledge graph data is primarily in GERMAN. When the user asks "
+    "in English, translate search terms to German before calling tools. Examples:\n"
     "- 'partial safety factor' → search for 'Teilsicherheitsbeiwert'\n"
     "- 'action' / 'load' → search for 'Einwirkung'\n"
-    "- 'resistance' → search for 'Widerstand'\n"
-    "- 'force' → search for 'Kraft'\n"
-    "- 'unit weight' → search for 'Wichte'\n"
-    "- 'formula' → search for 'Formel'\n"
-    "- 'abbreviation' → search for the abbreviation directly (EQU, SLS, ULS etc.)\n"
-    "\n"
-    "When looking up specific Greek symbols like γf, γG, γQ etc., use the exact symbol "
-    "characters as they appear. The graph stores them as Unicode: γ (gamma), φ (phi), etc."
+    "- 'resistance' → 'Widerstand'\n"
+    "- 'abbreviation' → search the abbreviation directly (EQU, SLS, ULS)\n\n"
+    "When looking up Greek symbols like γf, γG, γQ, use exact Unicode characters."
 )
 
 prompt = ChatPromptTemplate.from_messages([
@@ -54,96 +56,88 @@ def _setup_tools(querier: GraphQuerier):
     """Create LangChain tools that call the GraphQuerier methods."""
 
     @tool
-    def lookup_symbols(query: str) -> str:
-        """Look up or search for Eurocode symbols.
-        Handles all symbol queries:
-        - Exact lookup by name (e.g. 'γf', 'Ed', 'Fd')
-        - Keyword search by concept (e.g. 'Teilsicherheitsbeiwert', 'partial safety factor')
-        - Section-based listing (e.g. 'Griechische Buchstaben', 'Latin symbols')
-        Tries exact match first, then full-text search, then section search.
-        Input: symbol name, concept keyword, or section name."""
-        combined: List[Dict[str, Any]] = []
-        seen_keys: set = set()
-
-        def _add(items):
-            for item in (items or []):
-                key = (item.get("symbol") or item.get("term") or "", item.get("section", ""))
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    combined.append(item)
-
-        # 1. Exact name lookup
-        _add(querier.lookup_symbol(query))
-        # 2. Keyword search (name / definition)
-        _add(querier.search_symbols(query))
-        # 3. Section-based listing
-        _add(querier.get_symbols_in_section(query))
-
-        if not combined:
-            return f"No symbols found for '{query}'."
-        return json.dumps(combined, ensure_ascii=False, default=str)
-
-    @tool
-    def lookup_formula(formula_name: str) -> str:
-        """Look up a specific formula by name, including the expression and its variable definitions.
-        Use when the user asks about a specific formula like 'AEd formula' or 'Erdbeben formula'.
-        Input: keyword matching the formula name."""
-        results = querier.get_formula(formula_name)
-        if not results:
-            return f"No formula found matching '{formula_name}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def list_formulas() -> str:
-        """List all formulas stored in the knowledge graph.
-        Use when the user asks 'Show all formulas' or 'What formulas are available?'.
-        No input needed."""
-        results = querier.list_formulas()
-        if not results:
-            return "No formulas found in the knowledge graph."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def lookup_abbreviations(abbreviation: str) -> str:
-        """Look up the meaning of an abbreviation (e.g. 'EQU', 'SLS', 'ULS', 'GEO-2', 'STR').
-        Input: the abbreviation."""
-        results = querier.lookup_abbreviation(abbreviation)
-        if not results:
-            return f"No abbreviation found matching '{abbreviation}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def get_unit(quantity_keyword: str) -> str:
-        """Get the recommended Eurocode unit for a physical quantity
-        (e.g. 'Kraft', 'Moment', 'Spannung', 'Dichte').
-        Input: quantity keyword."""
-        results = querier.get_unit(quantity_keyword)
-        if not results:
-            return f"No unit found for quantity '{quantity_keyword}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
     def search(query: str) -> str:
-        """Search across ALL knowledge graph node types: symbols, abbreviations, definitions,
-        units, formulas, paragraphs, tables, images, chapters, sections, and document content blocks.
-        Also performs semantic (vector) similarity search over embedded content.
-        Use this as the primary search tool for any question — it covers everything:
-        definitions, tables, formulas, content passages, and more.
-        Works well with both German and English queries.
-        Input: a natural language search query or keyword."""
+        """Search across the entire Graph-RAG knowledge graph: sections, concepts,
+        tables, figures, formulas, and perform semantic vector similarity.
+        This is the PRIMARY search tool — use it for any question.
+        Works with German and English queries.
+        Input: a natural-language query or keyword."""
         results = querier.general_search(query)
         if not results:
             return f"No results found for '{query}'."
         return json.dumps(results, ensure_ascii=False, default=str)
 
+    @tool
+    def lookup_concept(name: str) -> str:
+        """Look up a specific concept, symbol, abbreviation or definition by name.
+        Concepts include Eurocode symbols (γf, Ed, Fd), engineering terms
+        (Einwirkung, Tragfähigkeit), and abbreviations (EQU, SLS, ULS).
+        Returns the concept description, related concepts, and all sections
+        that mention it.
+        Input: exact concept/symbol name."""
+        combined: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        def _add(items):
+            for item in (items or []):
+                key = item.get("concept") or item.get("symbol") or item.get("term", "")
+                if key not in seen:
+                    seen.add(key)
+                    combined.append(item)
+
+        _add(querier.lookup_concept(name))
+        _add(querier.lookup_symbol(name))
+        _add(querier.search_concepts(name))
+
+        if not combined:
+            return f"No concept found for '{name}'."
+        return json.dumps(combined, ensure_ascii=False, default=str)
+
+    @tool
+    def search_formulas(keyword: str) -> str:
+        """Search for formulas / equations in the knowledge graph.
+        Returns LaTeX expressions with the section and document they appear in.
+        Input: keyword (e.g. 'AEd', 'Erdbeben', 'Formel', 'combination')."""
+        results = querier.search_formulas(keyword)
+        if not results:
+            results = querier.list_formulas()
+        if not results:
+            return f"No formulas found for '{keyword}'."
+        return json.dumps(results, ensure_ascii=False, default=str)
+
+    @tool
+    def search_tables(keyword: str) -> str:
+        """Search for tables in the knowledge graph by caption or content.
+        Input: keyword describing the table."""
+        results = querier.search_tables(keyword)
+        if not results:
+            return f"No tables found for '{keyword}'."
+        return json.dumps(results, ensure_ascii=False, default=str)
+
+    @tool
+    def list_documents() -> str:
+        """List all documents in the knowledge graph with their types and section counts.
+        No input needed."""
+        results = querier.list_documents()
+        if not results:
+            return "No documents found in the knowledge graph."
+        return json.dumps(results, ensure_ascii=False, default=str)
+
+    @tool
+    def list_chapters(document_keyword: str = "") -> str:
+        """List chapters in the knowledge graph, optionally filtered by document.
+        Input: optional document name keyword (leave empty for all)."""
+        results = querier.list_chapters(document_keyword or None)
+        if not results:
+            return f"No chapters found for '{document_keyword}'."
+        return json.dumps(results, ensure_ascii=False, default=str)
+
     return [
         search,
-        lookup_symbols,
-        lookup_abbreviations,
-        lookup_formula,
-        get_unit,
-        list_formulas,
-    ]
+        lookup_concept,
+        search_formulas,
+        search_tables,
+        list_documents,
         list_chapters,
     ]
 
