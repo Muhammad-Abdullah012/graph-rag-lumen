@@ -54,39 +54,39 @@ def _setup_tools(querier: GraphQuerier):
     """Create LangChain tools that call the GraphQuerier methods."""
 
     @tool
-    def lookup_symbol(symbol_name: str) -> str:
-        """Look up the exact definition of a specific Eurocode symbol by its name.
-        Use when the user asks 'What is γf?' or 'Define Ed'.
-        Input: the symbol name exactly as written (e.g. 'γf', 'Ed', 'Fd')."""
-        results = querier.lookup_symbol(symbol_name)
-        if not results:
-            return f"No symbol found with name '{symbol_name}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
+    def lookup_symbols(query: str) -> str:
+        """Look up or search for Eurocode symbols.
+        Handles all symbol queries:
+        - Exact lookup by name (e.g. 'γf', 'Ed', 'Fd')
+        - Keyword search by concept (e.g. 'Teilsicherheitsbeiwert', 'partial safety factor')
+        - Section-based listing (e.g. 'Griechische Buchstaben', 'Latin symbols')
+        Tries exact match first, then full-text search, then section search.
+        Input: symbol name, concept keyword, or section name."""
+        combined: List[Dict[str, Any]] = []
+        seen_keys: set = set()
+
+        def _add(items):
+            for item in (items or []):
+                key = (item.get("symbol") or item.get("term") or "", item.get("section", ""))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    combined.append(item)
+
+        # 1. Exact name lookup
+        _add(querier.lookup_symbol(query))
+        # 2. Keyword search (name / definition)
+        _add(querier.search_symbols(query))
+        # 3. Section-based listing
+        _add(querier.get_symbols_in_section(query))
+
+        if not combined:
+            return f"No symbols found for '{query}'."
+        return json.dumps(combined, ensure_ascii=False, default=str)
 
     @tool
-    def search_symbols(keyword: str) -> str:
-        """Search for symbols whose name or definition contains a keyword.
-        Use when the user asks about a concept like 'Teilsicherheitsbeiwert', 'Einwirkung', 'Widerstand', 'partial safety factor'.
-        Input: a search keyword."""
-        results = querier.search_symbols(keyword)
-        if not results:
-            return f"No symbols found matching '{keyword}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def get_symbols_in_section(section_keyword: str) -> str:
-        """Get all symbols defined in a specific section.
-        Use when the user asks 'List symbols in section Griechische Buchstaben' or 'Show Latin symbols'.
-        Input: a keyword matching the section name."""
-        results = querier.get_symbols_in_section(section_keyword)
-        if not results:
-            return f"No symbols found in section matching '{section_keyword}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def get_formula(formula_name: str) -> str:
-        """Get a specific formula by name, including the expression and its variable definitions.
-        Use when asking about formulas like 'AEd formula' or 'Erdbeben formula'.
+    def lookup_formula(formula_name: str) -> str:
+        """Look up a specific formula by name, including the expression and its variable definitions.
+        Use when the user asks about a specific formula like 'AEd formula' or 'Erdbeben formula'.
         Input: keyword matching the formula name."""
         results = querier.get_formula(formula_name)
         if not results:
@@ -104,21 +104,12 @@ def _setup_tools(querier: GraphQuerier):
         return json.dumps(results, ensure_ascii=False, default=str)
 
     @tool
-    def lookup_abbreviation(abbreviation: str) -> str:
+    def lookup_abbreviations(abbreviation: str) -> str:
         """Look up the meaning of an abbreviation (e.g. 'EQU', 'SLS', 'ULS', 'GEO-2', 'STR').
         Input: the abbreviation."""
         results = querier.lookup_abbreviation(abbreviation)
         if not results:
             return f"No abbreviation found matching '{abbreviation}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def search_definitions(keyword: str) -> str:
-        """Search calculation method definitions (e.g. 'elastisch-plastische Berechnung', 'starr-plastisch').
-        Input: a search keyword."""
-        results = querier.search_definitions(keyword)
-        if not results:
-            return f"No definitions found matching '{keyword}'."
         return json.dumps(results, ensure_ascii=False, default=str)
 
     @tool
@@ -132,35 +123,28 @@ def _setup_tools(querier: GraphQuerier):
         return json.dumps(results, ensure_ascii=False, default=str)
 
     @tool
-    def list_sections(document_keyword: str = "") -> str:
-        """List all sections in the knowledge graph, optionally filtered by document name.
-        Input (optional): document keyword to filter by."""
-        results = querier.list_sections(document_keyword or None)
-        if not results:
-            return "No sections found."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def general_search(query: str) -> str:
-        """Broad search across symbols, abbreviations, definitions, units and formulas.
-        Use as a last resort when you are not sure which specific tool to call.
-        Input: a search query."""
+    def search(query: str) -> str:
+        """Search across ALL knowledge graph node types: symbols, abbreviations, definitions,
+        units, formulas, paragraphs, tables, images, chapters, sections, and document content blocks.
+        Also performs semantic (vector) similarity search over embedded content.
+        Use this as the primary search tool for any question — it covers everything:
+        definitions, tables, formulas, content passages, and more.
+        Works well with both German and English queries.
+        Input: a natural language search query or keyword."""
         results = querier.general_search(query)
         if not results:
             return f"No results found for '{query}'."
         return json.dumps(results, ensure_ascii=False, default=str)
 
     return [
-        lookup_symbol,
-        search_symbols,
-        get_symbols_in_section,
-        get_formula,
-        list_formulas,
-        lookup_abbreviation,
-        search_definitions,
+        search,
+        lookup_symbols,
+        lookup_abbreviations,
+        lookup_formula,
         get_unit,
-        list_sections,
-        general_search,
+        list_formulas,
+    ]
+        list_chapters,
     ]
 
 

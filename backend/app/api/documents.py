@@ -3,7 +3,7 @@ import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -17,9 +17,6 @@ router = APIRouter(prefix="/api/documents", tags=["documents"])
 # Ensure documents directory exists
 DOCUMENTS_DIR = Path(settings.documents_path)
 DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# task_executor = ThreadPoolExecutor(max_workers=4)
 
 
 class StoredDocument(BaseModel):
@@ -36,6 +33,7 @@ class DocumentUploadResponse(StoredDocument):
     """Upload response payload."""
 
     message: str
+    processing_started: bool = False
 
 
 class DocumentListResponse(BaseModel):
@@ -44,9 +42,19 @@ class DocumentListResponse(BaseModel):
     documents: List[StoredDocument]
 
 
+class ProcessingStatusResponse(BaseModel):
+    """Processing status for a document."""
+
+    filename: str
+    status: str
+    step: str
+    error: Optional[str] = None
+    stats: Optional[Dict[str, Any]] = None
+
+
 @router.post("/upload", response_model=DocumentUploadResponse)
 async def upload_document(file: UploadFile = File(...)) -> DocumentUploadResponse:
-    """Accept a PDF upload and store it for later use."""
+    """Accept a PDF upload, store it, and start OCR pipeline in background."""
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
@@ -69,13 +77,58 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentUploadRespons
 
     logger.info("Stored PDF upload at %s", file_path)
 
+    # Start OCR pipeline in background
+    processing_started = False
+    try:
+        from backend.app.modules.ocr_pipeline import process_document_background
+        process_document_background(str(file_path), stored_filename)
+        processing_started = True
+        logger.info("Started background OCR pipeline for %s", stored_filename)
+    except Exception as e:
+        logger.warning("Could not start OCR pipeline: %s", e)
+
     return DocumentUploadResponse(
         filename=safe_name,
         stored_filename=stored_filename,
         url=url,
         size_bytes=len(content),
         uploaded_at=uploaded_at,
-        message="Document uploaded successfully",
+        message="Document uploaded successfully"
+        + (" — OCR processing started in background." if processing_started else ""),
+        processing_started=processing_started,
+    )
+
+
+@router.get("/processing-status", response_model=List[ProcessingStatusResponse])
+async def get_all_processing_status():
+    """Return processing status for all documents."""
+    from backend.app.modules.ocr_pipeline import get_all_processing_statuses
+    rows = get_all_processing_statuses()  # list of dicts from Postgres
+    result = []
+    for row in rows:
+        result.append(ProcessingStatusResponse(
+            filename=row.get("filename", ""),
+            status=row.get("status", "unknown"),
+            step=row.get("step", "unknown"),
+            error=row.get("error"),
+            stats=row.get("stats"),
+        ))
+    return result
+
+
+@router.get("/processing-status/{filename}", response_model=ProcessingStatusResponse)
+async def get_document_processing_status(filename: str):
+    """Return processing status for a specific document."""
+    from backend.app.modules.ocr_pipeline import get_processing_status
+    status = get_processing_status(filename)
+    if not status:
+        raise HTTPException(status_code=404, detail="No processing status found for this document")
+    return ProcessingStatusResponse(
+        filename=filename,
+        status=status.get("status", "unknown"),
+        step=status.get("step", "unknown"),
+        error=status.get("error"),
+        stats=status.get("stats"),
     )
 
 

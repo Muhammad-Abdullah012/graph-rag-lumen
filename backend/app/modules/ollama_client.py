@@ -64,6 +64,37 @@ class OllamaClient:
             logger.error(f"Error generating text: {str(e)}")
             raise
 
+    def generate_embedding(self, text: str, model: Optional[str] = None) -> list:
+        """
+        Generate an embedding vector for the given text.
+
+        Args:
+            text: Input text to embed
+            model: Embedding model (defaults to settings.ollama_embedding_model)
+
+        Returns:
+            List of floats representing the embedding vector
+        """
+        if model is None:
+            model = getattr(settings, "ollama_embedding_model", "nomic-embed-text")
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/embed",
+                json={"model": model, "input": text},
+                timeout=120,
+            )
+            response.raise_for_status()
+            data = response.json()
+            embeddings = data.get("embeddings", [])
+            if embeddings:
+                return embeddings[0]
+            # Fallback: older Ollama API format
+            return data.get("embedding", [])
+        except Exception as e:
+            logger.error(f"Error generating embedding: {str(e)}")
+            return []
+
     def list_models(self) -> list:
         """List available models in Ollama"""
         try:

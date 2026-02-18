@@ -74,6 +74,11 @@ class GraphBuilder:
             "CREATE CONSTRAINT formula_id_unique IF NOT EXISTS FOR (f:Formula) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT abbreviation_id_unique IF NOT EXISTS FOR (a:Abbreviation) REQUIRE a.id IS UNIQUE",
             "CREATE CONSTRAINT reference_name_unique IF NOT EXISTS FOR (r:Reference) REQUIRE r.name IS UNIQUE",
+            "CREATE CONSTRAINT chapter_id_unique IF NOT EXISTS FOR (ch:Chapter) REQUIRE ch.id IS UNIQUE",
+            "CREATE CONSTRAINT paragraph_id_unique IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.id IS UNIQUE",
+            "CREATE CONSTRAINT table_id_unique IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
+            "CREATE CONSTRAINT image_id_unique IF NOT EXISTS FOR (img:Image) REQUIRE img.id IS UNIQUE",
+            "CREATE CONSTRAINT contentblock_id_unique IF NOT EXISTS FOR (c:ContentBlock) REQUIRE c.id IS UNIQUE",
         ]
         for c in constraints:
             try:
@@ -89,6 +94,10 @@ class GraphBuilder:
                FOR (a:Abbreviation) ON EACH [a.name, a.definition]""",
             """CREATE FULLTEXT INDEX definition_search IF NOT EXISTS
                FOR (d:Definition) ON EACH [d.term, d.definition]""",
+            """CREATE FULLTEXT INDEX paragraph_search IF NOT EXISTS
+               FOR (p:Paragraph) ON EACH [p.text]""",
+            """CREATE FULLTEXT INDEX content_search IF NOT EXISTS
+               FOR (c:ContentBlock) ON EACH [c.text]""",
         ]:
             try:
                 self.db.execute_query(idx_query)
@@ -324,6 +333,183 @@ class GraphBuilder:
                     )
         except Exception as e:
             logger.debug(f"Could not link formula symbols: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  OCR document ingestion (new structure with chapters/paragraphs/tables/images)
+    # ------------------------------------------------------------------ #
+    def ingest_ocr_document(self, data: Dict[str, Any]) -> Dict[str, int]:
+        """Ingest a structured OCR document into the graph."""
+        self._create_constraints()
+
+        doc_name = data.get("document", "Unknown")
+        source_file = data.get("source_file", "")
+        language = data.get("language", "de")
+
+        stats = {
+            "documents": 0, "chapters": 0, "sections": 0, "paragraphs": 0,
+            "tables": 0, "images": 0, "formulas": 0, "symbols": 0,
+            "definitions": 0, "abbreviations": 0, "units": 0, "references": 0,
+        }
+
+        # Create Document node
+        self.db.execute_query(
+            """MERGE (d:Document {name: $name})
+               SET d.source_file = $source_file,
+                   d.language = $language,
+                   d.ocr_processed = true""",
+            {"name": doc_name, "source_file": source_file, "language": language},
+        )
+        stats["documents"] = 1
+
+        # Process chapters
+        for ch_data in data.get("chapters", []):
+            ch_title = ch_data.get("title", "")
+            ch_number = ch_data.get("number", "")
+            ch_id = f"{doc_name}::chapter::{ch_number}::{ch_title}"
+
+            self.db.execute_query(
+                """MERGE (ch:Chapter {id: $id})
+                   SET ch.title = $title, ch.number = $number
+                   WITH ch
+                   MATCH (d:Document {name: $doc_name})
+                   MERGE (ch)-[:BELONGS_TO]->(d)""",
+                {"id": ch_id, "title": ch_title, "number": ch_number, "doc_name": doc_name},
+            )
+            stats["chapters"] += 1
+
+        # Process sections (with new sub-items)
+        for section_data in data.get("sections", []):
+            section_name = section_data.get("section", "Unknown Section")
+            section_id = f"{doc_name}::{section_name}"
+            section_level = section_data.get("level", 2)
+            section_content = section_data.get("content", "")[:5000]
+
+            self.db.execute_query(
+                """MERGE (s:Section {id: $id})
+                   SET s.name = $name, s.level = $level, s.content = $content
+                   WITH s
+                   MATCH (d:Document {name: $doc_name})
+                   MERGE (s)-[:BELONGS_TO]->(d)""",
+                {"id": section_id, "name": section_name, "level": section_level,
+                 "content": section_content, "doc_name": doc_name},
+            )
+            stats["sections"] += 1
+
+            # Link section to chapter if applicable
+            for ch_data in data.get("chapters", []):
+                if section_name in ch_data.get("section_refs", []):
+                    ch_id = f"{doc_name}::chapter::{ch_data.get('number', '')}::{ch_data.get('title', '')}"
+                    self.db.execute_query(
+                        """MATCH (s:Section {id: $sec_id})
+                           MATCH (ch:Chapter {id: $ch_id})
+                           MERGE (s)-[:IN_CHAPTER]->(ch)""",
+                        {"sec_id": section_id, "ch_id": ch_id},
+                    )
+                    break
+
+            # Process paragraphs
+            for i, para in enumerate(section_data.get("paragraphs", [])):
+                p_text = para.get("text", "")
+                p_page = para.get("page", 0)
+                p_id = f"{doc_name}::para::{section_name}::{i}"
+
+                self.db.execute_query(
+                    """MERGE (p:Paragraph {id: $id})
+                       SET p.text = $text, p.page = $page
+                       WITH p
+                       MATCH (s:Section {id: $section_id})
+                       MERGE (p)-[:IN_SECTION]->(s)
+                       WITH p
+                       MATCH (d:Document {name: $doc_name})
+                       MERGE (p)-[:FROM_DOCUMENT]->(d)""",
+                    {"id": p_id, "text": p_text[:3000], "page": p_page,
+                     "section_id": section_id, "doc_name": doc_name},
+                )
+                stats["paragraphs"] += 1
+
+            # Process tables
+            for i, table in enumerate(section_data.get("tables", [])):
+                t_id_str = f"{doc_name}::table::{section_name}::{i}"
+                t_html = table.get("html", "")
+                t_caption = table.get("caption", "")
+                t_page = table.get("page", 0)
+
+                self.db.execute_query(
+                    """MERGE (t:Table {id: $id})
+                       SET t.html = $html, t.caption = $caption, t.page = $page
+                       WITH t
+                       MATCH (s:Section {id: $section_id})
+                       MERGE (t)-[:IN_SECTION]->(s)
+                       WITH t
+                       MATCH (d:Document {name: $doc_name})
+                       MERGE (t)-[:FROM_DOCUMENT]->(d)""",
+                    {"id": t_id_str, "html": t_html[:5000], "caption": t_caption,
+                     "page": t_page, "section_id": section_id, "doc_name": doc_name},
+                )
+                stats["tables"] += 1
+
+            # Process images
+            for i, img in enumerate(section_data.get("images", [])):
+                img_id = f"{doc_name}::image::{section_name}::{i}"
+                img_desc = img.get("description", "")
+                img_type = img.get("type", "image")
+                img_page = img.get("page", 0)
+
+                self.db.execute_query(
+                    """MERGE (img:Image {id: $id})
+                       SET img.description = $description, img.type = $type, img.page = $page
+                       WITH img
+                       MATCH (s:Section {id: $section_id})
+                       MERGE (img)-[:IN_SECTION]->(s)
+                       WITH img
+                       MATCH (d:Document {name: $doc_name})
+                       MERGE (img)-[:FROM_DOCUMENT]->(d)""",
+                    {"id": img_id, "description": img_desc, "type": img_type,
+                     "page": img_page, "section_id": section_id, "doc_name": doc_name},
+                )
+                stats["images"] += 1
+
+            # Process section-level formulas
+            for i, formula in enumerate(section_data.get("formulas", [])):
+                f_id = f"{doc_name}::formula::{section_name}::{i}"
+                f_expr = formula.get("expression", "")
+                f_ctx = formula.get("context", "")
+                f_page = formula.get("page", 0)
+
+                self.db.execute_query(
+                    """MERGE (f:Formula {id: $id})
+                       SET f.name = $name, f.expression = $expression, f.page = $page
+                       WITH f
+                       MATCH (s:Section {id: $section_id})
+                       MERGE (f)-[:IN_SECTION]->(s)
+                       WITH f
+                       MATCH (d:Document {name: $doc_name})
+                       MERGE (f)-[:FROM_DOCUMENT]->(d)""",
+                    {"id": f_id, "name": f_ctx or f_expr[:80], "expression": f_expr,
+                     "page": f_page, "section_id": section_id, "doc_name": doc_name},
+                )
+                stats["formulas"] += 1
+
+            # Process existing sub-items (symbols, definitions, etc.)
+            for sym in section_data.get("symbols", []):
+                stats["symbols"] += self._create_symbol(sym, section_id, doc_name)
+            for defn in section_data.get("definitions", []):
+                stats["definitions"] += self._create_definition(defn, section_id, doc_name)
+            for abbr in section_data.get("abbreviations", []):
+                stats["abbreviations"] += self._create_abbreviation(abbr, section_id, doc_name)
+            for unit in section_data.get("units", []):
+                stats["units"] += self._create_unit(unit, section_id, doc_name)
+
+        # Top-level formulas
+        for formula in data.get("key_formulas", []):
+            stats["formulas"] += self._create_formula(formula, doc_name)
+
+        # References
+        for ref in data.get("references", []):
+            stats["references"] += self._create_reference(ref, doc_name)
+
+        logger.info(f"OCR document ingested: {stats}")
+        return stats
 
 
 # ------------------------------------------------------------------ #

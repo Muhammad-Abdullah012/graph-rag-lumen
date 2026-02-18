@@ -1,8 +1,9 @@
 """Graph Management Routes - Build & inspect the knowledge graph"""
 import logging
-from fastapi import APIRouter
+from pathlib import Path
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from backend.app.modules.graph_builder import get_graph_builder
 from backend.app.modules.graph_querier import get_graph_querier
@@ -67,3 +68,80 @@ async def graph_stats() -> GraphStatsResponse:
     except Exception as e:
         logger.error(f"Could not get graph stats: {str(e)}")
         return GraphStatsResponse(stats={"error": str(e)})
+
+
+@router.post("/process-document/{filename}")
+async def process_document_manually(filename: str):
+    """
+    Manually trigger OCR pipeline for a document already in the documents folder.
+    Useful for re-processing or processing documents uploaded before the pipeline existed.
+    """
+    from config.settings import settings
+    docs_dir = Path(settings.documents_path)
+
+    # Find the file
+    file_path = docs_dir / filename
+    if not file_path.exists():
+        # Try to find by partial match
+        matches = [p for p in docs_dir.iterdir() if filename in p.name and p.suffix.lower() == ".pdf"]
+        if not matches:
+            raise HTTPException(status_code=404, detail=f"Document not found: {filename}")
+        file_path = matches[0]
+
+    try:
+        from backend.app.modules.ocr_pipeline import process_document_background
+        process_document_background(str(file_path), file_path.name)
+        return {"status": "processing_started", "filename": file_path.name}
+    except Exception as e:
+        logger.error(f"Failed to start processing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/process-all-documents")
+async def process_all_documents():
+    """
+    Trigger OCR pipeline for all PDF documents in the documents folder.
+    Each document is processed in a background thread.
+    """
+    from config.settings import settings
+    docs_dir = Path(settings.documents_path)
+
+    pdf_files = [p for p in docs_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+
+    if not pdf_files:
+        return {"status": "no_documents", "message": "No PDF files found in documents folder."}
+
+    started = []
+    try:
+        from backend.app.modules.ocr_pipeline import process_document_background
+        for pdf_path in pdf_files:
+            process_document_background(str(pdf_path), pdf_path.name)
+            started.append(pdf_path.name)
+    except Exception as e:
+        logger.error(f"Failed to start batch processing: {e}")
+
+    return {
+        "status": "processing_started",
+        "documents": started,
+        "count": len(started),
+    }
+
+
+class SemanticSearchResponse(BaseModel):
+    """Semantic search results"""
+    query: str
+    results: list
+
+
+@router.post("/semantic-search", response_model=SemanticSearchResponse)
+async def semantic_search_endpoint(query: str, top_k: int = 10):
+    """
+    Perform semantic search across all document content.
+    """
+    try:
+        querier = get_graph_querier()
+        results = querier.semantic_search(query, top_k=top_k)
+        return SemanticSearchResponse(query=query, results=results)
+    except Exception as e:
+        logger.error(f"Semantic search failed: {str(e)}")
+        return SemanticSearchResponse(query=query, results=[])

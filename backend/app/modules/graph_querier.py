@@ -234,38 +234,82 @@ class GraphQuerier:
         )
 
     # ------------------------------------------------------------------ #
-    #  General / broad search
+    #  General / broad search  (ALL node types)
     # ------------------------------------------------------------------ #
     def general_search(self, query: str) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Broad search across all node types. Returns categorised results.
+        Broad search across every node type in the graph.
+        Includes: symbols, abbreviations, definitions, units, formulas,
+        paragraphs, tables, images, and content blocks (vector + full-text).
+        Returns a dict keyed by category.
         """
         results: Dict[str, List] = {}
 
-        # Symbols
+        # ── structured knowledge nodes ──────────────────────────────────
         syms = self.search_symbols(query)
         if syms:
             results["symbols"] = syms
 
-        # Abbreviations
         abbrs = self.lookup_abbreviation(query)
         if abbrs:
             results["abbreviations"] = abbrs
 
-        # Definitions
         defs = self.search_definitions(query)
         if defs:
             results["definitions"] = defs
 
-        # Units
         units = self.get_unit(query)
         if units:
             results["units"] = units
 
-        # Formulas
         formulas = self.get_formula(query)
         if formulas:
             results["formulas"] = formulas
+
+        # ── OCR-extracted content nodes ──────────────────────────────────
+        paras = self.search_paragraphs(query, limit=8)
+        if paras:
+            results["paragraphs"] = paras
+
+        tables = self.search_tables(query, limit=5)
+        if tables:
+            results["tables"] = tables
+
+        images = self.search_images(query, limit=5)
+        if images:
+            results["images"] = images
+
+        # ── vector / full-text content blocks ────────────────────────────
+        content = self.search_content(query, limit=8)
+        if content:
+            results["content"] = content
+
+        # ── semantic (vector) search ─────────────────────────────────────
+        try:
+            semantic = self.semantic_search(query, top_k=6)
+            if semantic:
+                # Deduplicate against what search_content already returned
+                existing_texts = {
+                    r.get("text", "")[:80]
+                    for r in results.get("content", [])
+                }
+                unique_semantic = [
+                    r for r in semantic
+                    if r.get("text", "")[:80] not in existing_texts
+                ]
+                if unique_semantic:
+                    results["semantic"] = unique_semantic
+        except Exception as e:
+            logger.debug("Semantic search skipped in general_search: %s", e)
+
+        # ── sections & chapters ──────────────────────────────────────────
+        sections = self.list_sections(query)
+        if sections:
+            results["sections"] = sections[:10]
+
+        chapters = self.list_chapters(query)
+        if chapters:
+            results["chapters"] = chapters[:10]
 
         return results
 
@@ -283,11 +327,216 @@ class GraphQuerier:
                OPTIONAL MATCH (u:Unit) WITH docs, secs, syms, forms, abbrs, count(u) AS units
                OPTIONAL MATCH (r:Reference) WITH docs, secs, syms, forms, abbrs, units, count(r) AS refs
                OPTIONAL MATCH (df:Definition) WITH docs, secs, syms, forms, abbrs, units, refs, count(df) AS defs
+               OPTIONAL MATCH (ch:Chapter) WITH docs, secs, syms, forms, abbrs, units, refs, defs, count(ch) AS chapters
+               OPTIONAL MATCH (p:Paragraph) WITH docs, secs, syms, forms, abbrs, units, refs, defs, chapters, count(p) AS paragraphs
+               OPTIONAL MATCH (t:Table) WITH docs, secs, syms, forms, abbrs, units, refs, defs, chapters, paragraphs, count(t) AS tables
+               OPTIONAL MATCH (img:Image) WITH docs, secs, syms, forms, abbrs, units, refs, defs, chapters, paragraphs, tables, count(img) AS images
+               OPTIONAL MATCH (cb:ContentBlock) WITH docs, secs, syms, forms, abbrs, units, refs, defs, chapters, paragraphs, tables, images, count(cb) AS content_blocks
                RETURN docs AS documents, secs AS sections, syms AS symbols,
                       forms AS formulas, abbrs AS abbreviations, units AS units,
-                      refs AS references, defs AS definitions""",
+                      refs AS references, defs AS definitions,
+                      chapters AS chapters, paragraphs AS paragraphs,
+                      tables AS tables, images AS images,
+                      content_blocks AS content_blocks""",
         )
         return result[0] if result else {}
+
+    # ------------------------------------------------------------------ #
+    #  Semantic search (vector similarity on ContentBlock embeddings)
+    # ------------------------------------------------------------------ #
+    def semantic_search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+        """
+        Perform semantic search using vector similarity on ContentBlock embeddings.
+        Falls back to full-text search if vector index is not available.
+        """
+        try:
+            from backend.app.modules.ollama_client import get_ollama_client
+            ollama = get_ollama_client()
+            embedding = ollama.generate_embedding(query)
+
+            if embedding:
+                results = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes(
+                           'content_embedding_index', $top_k, $embedding
+                       ) YIELD node, score
+                       MATCH (node)-[:FROM_DOCUMENT]->(doc:Document)
+                       RETURN node.text AS text,
+                              node.section AS section,
+                              node.type AS content_type,
+                              node.page AS page,
+                              doc.name AS document,
+                              score
+                       ORDER BY score DESC""",
+                    {"top_k": top_k, "embedding": embedding},
+                )
+                if results:
+                    return results
+        except Exception as e:
+            logger.warning("Vector search failed, falling back to text search: %s", e)
+
+        # Fallback: full-text search on paragraphs and content blocks
+        return self.search_content(query, top_k)
+
+    def search_content(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Full-text search across Paragraphs and ContentBlocks."""
+        results = []
+
+        # Search paragraphs via full-text index
+        try:
+            para_results = self.db.execute_query(
+                """CALL db.index.fulltext.queryNodes('paragraph_search', $query)
+                   YIELD node, score
+                   MATCH (node)-[:IN_SECTION]->(sec:Section)-[:BELONGS_TO]->(doc:Document)
+                   RETURN node.text AS text,
+                          sec.name AS section,
+                          'paragraph' AS content_type,
+                          node.page AS page,
+                          doc.name AS document,
+                          score
+                   ORDER BY score DESC
+                   LIMIT $limit""",
+                {"query": keyword, "limit": limit},
+            )
+            results.extend(para_results)
+        except Exception:
+            pass
+
+        # Fallback: CONTAINS on paragraphs
+        if not results:
+            try:
+                results = self.db.execute_query(
+                    """MATCH (p:Paragraph)-[:IN_SECTION]->(sec:Section)-[:BELONGS_TO]->(doc:Document)
+                       WHERE toLower(p.text) CONTAINS toLower($kw)
+                       RETURN p.text AS text,
+                              sec.name AS section,
+                              'paragraph' AS content_type,
+                              p.page AS page,
+                              doc.name AS document,
+                              0.5 AS score
+                       LIMIT $limit""",
+                    {"kw": keyword, "limit": limit},
+                )
+            except Exception:
+                pass
+
+        # Also search content blocks
+        try:
+            cb_results = self.db.execute_query(
+                """CALL db.index.fulltext.queryNodes('content_search', $query)
+                   YIELD node, score
+                   MATCH (node)-[:FROM_DOCUMENT]->(doc:Document)
+                   RETURN node.text AS text,
+                          node.section AS section,
+                          node.type AS content_type,
+                          node.page AS page,
+                          doc.name AS document,
+                          score
+                   ORDER BY score DESC
+                   LIMIT $limit""",
+                {"query": keyword, "limit": limit},
+            )
+            results.extend(cb_results)
+        except Exception:
+            pass
+
+        # De-duplicate and sort by score
+        seen = set()
+        unique = []
+        for r in sorted(results, key=lambda x: x.get("score", 0), reverse=True):
+            key = (r.get("text", "")[:100], r.get("document", ""))
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return unique[:limit]
+
+    # ------------------------------------------------------------------ #
+    #  Chapter queries
+    # ------------------------------------------------------------------ #
+    def list_chapters(self, document_keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List all chapters, optionally filtered by document."""
+        if document_keyword:
+            return self.db.execute_query(
+                """MATCH (ch:Chapter)-[:BELONGS_TO]->(d:Document)
+                   WHERE toLower(d.name) CONTAINS toLower($kw)
+                   RETURN ch.title AS title, ch.number AS number, d.name AS document
+                   ORDER BY ch.number""",
+                {"kw": document_keyword},
+            )
+        return self.db.execute_query(
+            """MATCH (ch:Chapter)-[:BELONGS_TO]->(d:Document)
+               RETURN ch.title AS title, ch.number AS number, d.name AS document
+               ORDER BY d.name, ch.number""",
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Paragraph queries
+    # ------------------------------------------------------------------ #
+    def search_paragraphs(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search paragraphs by keyword."""
+        try:
+            results = self.db.execute_query(
+                """CALL db.index.fulltext.queryNodes('paragraph_search', $query)
+                   YIELD node, score
+                   MATCH (node)-[:IN_SECTION]->(sec:Section)-[:BELONGS_TO]->(doc:Document)
+                   RETURN node.text AS text,
+                          node.page AS page,
+                          sec.name AS section,
+                          doc.name AS document,
+                          score
+                   ORDER BY score DESC
+                   LIMIT $limit""",
+                {"query": keyword, "limit": limit},
+            )
+            if results:
+                return results
+        except Exception:
+            pass
+
+        return self.db.execute_query(
+            """MATCH (p:Paragraph)-[:IN_SECTION]->(sec:Section)-[:BELONGS_TO]->(doc:Document)
+               WHERE toLower(p.text) CONTAINS toLower($kw)
+               RETURN p.text AS text,
+                      p.page AS page,
+                      sec.name AS section,
+                      doc.name AS document
+               LIMIT $limit""",
+            {"kw": keyword, "limit": limit},
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Table queries
+    # ------------------------------------------------------------------ #
+    def search_tables(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search tables by caption or content keyword."""
+        return self.db.execute_query(
+            """MATCH (t:Table)-[:IN_SECTION]->(sec:Section)-[:BELONGS_TO]->(doc:Document)
+               WHERE toLower(t.caption) CONTAINS toLower($kw)
+                  OR toLower(t.html) CONTAINS toLower($kw)
+               RETURN t.caption AS caption,
+                      t.html AS html,
+                      t.page AS page,
+                      sec.name AS section,
+                      doc.name AS document
+               LIMIT $limit""",
+            {"kw": keyword, "limit": limit},
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Image queries
+    # ------------------------------------------------------------------ #
+    def search_images(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search images by description keyword."""
+        return self.db.execute_query(
+            """MATCH (img:Image)-[:IN_SECTION]->(sec:Section)-[:BELONGS_TO]->(doc:Document)
+               WHERE toLower(img.description) CONTAINS toLower($kw)
+               RETURN img.description AS description,
+                      img.type AS image_type,
+                      img.page AS page,
+                      sec.name AS section,
+                      doc.name AS document
+               LIMIT $limit""",
+            {"kw": keyword, "limit": limit},
+        )
 
 
 # ------------------------------------------------------------------ #
