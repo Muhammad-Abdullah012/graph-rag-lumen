@@ -6,9 +6,10 @@ Pipeline stages
 2. Run Mistral OCR on every chunk → combined Markdown.
 3. Parse Markdown with **mistune** AST (not regex) into structured sections.
 4. Save structured JSON + raw Markdown to backend/json/.
-5. Ingest into Neo4j via GraphBuilder.
-6. Generate multilingual embeddings with nomic-embed-text and store as
-   ContentBlock nodes with a vector index.
+5. Ingest into Neo4j via GraphBuilder (Document, Chapter, Page, Section,
+   Table, Figure, Formula, Concept nodes).
+6. Generate embeddings on Section and Concept nodes via GraphBuilder.
+7. Compute cross-document semantic similarity links.
 
 Processing status is persisted in PostgreSQL (see processing_db module).
 """
@@ -23,10 +24,17 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from mistralai.extra import response_format_from_pydantic_model
 
 from pypdf import PdfReader, PdfWriter
 
+from backend.app.modules.latex_utils import latex_to_unicode
+
 logger = logging.getLogger(__name__)
+
+class Image(BaseModel):
+    image_type: ImageType = Field(..., description="The type of the image. Must be one of 'graph', 'text', 'table' or 'image'.")
+    description: str = Field(..., description="A description of the image.")
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +135,26 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
                     "type": "document_url",
                     "document_url": f"data:application/pdf;base64,{b64}",
                 },
+                bbox_annotation_format=response_format_from_pydantic_model(Image),
                 include_image_base64=True,
+                extract_header=True,
+                extract_footer=True,
                 table_format="html",
             )
 
             for idx, page in enumerate(resp.pages):
                 page_md = page.markdown
                 images_info: List[Dict[str, Any]] = []
+                annotations: List[Dict[str, Any]] = []
+
+                # Capture bbox annotations (image/table descriptions) when present
+                for ann in getattr(page, "annotations", []) or getattr(page, "bbox_annotations", []):
+                    annotations.append({
+                        "id": getattr(ann, "id", ""),
+                        "type": getattr(ann, "image_type", getattr(ann, "type", "")),
+                        "description": getattr(ann, "description", ""),
+                        "bbox": getattr(ann, "bbox", None),
+                    })
 
                 if hasattr(page, "images") and page.images:
                     for img in page.images:
@@ -149,6 +170,7 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
                     "page_num": global_offset + idx + 1,
                     "markdown": page_md,
                     "images": images_info,
+                    "annotations": annotations,
                 })
                 all_md.append(page_md)
 
@@ -268,6 +290,13 @@ def _parse_markdown_to_structured(
     doc_name = Path(source_filename).stem
     tokens: List[Dict] = _get_md_parser()(full_markdown) or []
 
+    # Pre-index annotations by page number for later attachment
+    annotations_by_page = {
+        pd.get("page_num"): pd.get("annotations", [])
+        for pd in page_data or []
+        if pd.get("annotations")
+    }
+
     # ---- detect document language ----------------------------------------
     lower = full_markdown[:3000].lower()
     de_hits = sum(1 for w in {"der ", "die ", "das ", "und ", "ist ", "von "} if w in lower)
@@ -357,6 +386,7 @@ def _parse_markdown_to_structured(
             if raw:
                 pend_formulas.append({
                     "expression": raw,
+                    "unicode": latex_to_unicode(raw),
                     "context": current["section"] if current else "",
                     "page": _estimate_page(raw, page_data),
                 })
@@ -367,6 +397,7 @@ def _parse_markdown_to_structured(
             if raw and len(raw) > 3:
                 pend_formulas.append({
                     "expression": raw,
+                    "unicode": latex_to_unicode(raw),
                     "context": current["section"] if current else "",
                     "page": _estimate_page(raw, page_data),
                 })
@@ -378,6 +409,7 @@ def _parse_markdown_to_structured(
             if info in ("math", "latex", "tex") and raw:
                 pend_formulas.append({
                     "expression": raw,
+                    "unicode": latex_to_unicode(raw),
                     "context": current["section"] if current else "",
                     "page": _estimate_page(raw, page_data),
                 })
@@ -428,11 +460,53 @@ def _parse_markdown_to_structured(
                 p["text"] for p in sec["paragraphs"][:3]
             )[:5000]
 
+        # Attach bbox annotations (tables/images) that fall on this section's pages
+        pages_for_sec = set()
+        for p in sec.get("paragraphs", []):
+            if p.get("page"):
+                pages_for_sec.add(p["page"])
+        for t in sec.get("tables", []):
+            if t.get("page"):
+                pages_for_sec.add(t["page"])
+        for img in sec.get("images", []):
+            if img.get("page"):
+                pages_for_sec.add(img["page"])
+        for frm in sec.get("formulas", []):
+            if frm.get("page"):
+                pages_for_sec.add(frm["page"])
+
+        for pg in pages_for_sec:
+            for ann in annotations_by_page.get(pg, []):
+                desc = (ann.get("description") or "").strip()
+                if not desc:
+                    continue
+                atype = (ann.get("type") or ann.get("image_type") or "").lower()
+                if "table" in atype:
+                    if not any(desc == t.get("caption") or desc == t.get("text") for t in sec.get("tables", [])):
+                        sec.setdefault("tables", []).append({
+                            "id": f"bbox_table_{len(sec.get('tables', []))+1}",
+                            "text": desc,
+                            "caption": desc,
+                            "page": pg,
+                            "annotation": desc,
+                            "type": atype or "table",
+                        })
+                else:
+                    if not any(desc == i.get("description") for i in sec.get("images", [])):
+                        sec.setdefault("images", []).append({
+                            "id": f"bbox_img_{len(sec.get('images', []))+1}",
+                            "description": desc,
+                            "type": atype or "image",
+                            "page": pg,
+                            "annotation": desc,
+                        })
+
     # collect all formulas for top-level key_formulas
     all_formulas: List[Dict] = [
         {
             "name": f.get("context") or f["expression"][:80],
             "formula": f["expression"],
+            "unicode": f.get("unicode", latex_to_unicode(f["expression"])),
             "variables": {},
         }
         for sec in sections
@@ -451,124 +525,6 @@ def _parse_markdown_to_structured(
         "references": [],
         "full_markdown": full_markdown,
     }
-
-
-# ---------------------------------------------------------------------------
-#  Embedding generation
-# ---------------------------------------------------------------------------
-
-def _split_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
-    chunks: List[str] = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        next_start = end - overlap
-        if next_start <= start:
-            break
-        start = next_start
-    return chunks
-
-
-def _generate_embeddings(structured: Dict[str, Any]) -> int:
-    """Generate embeddings for all content and store ContentBlock nodes in Neo4j.
-
-    Uses the multilingual nomic-embed-text model via Ollama (handles German).
-    Returns number of embeddings stored successfully.
-    """
-    from backend.app.modules.ollama_client import get_ollama_client
-    from backend.app.modules.database import get_neo4j_connection
-
-    db = get_neo4j_connection()
-    ollama = get_ollama_client()
-    doc_name = structured["document"]
-
-    # Ensure vector index exists (idempotent)
-    try:
-        db.execute_query(
-            """CREATE VECTOR INDEX content_embedding_index IF NOT EXISTS
-               FOR (c:ContentBlock) ON (c.embedding)
-               OPTIONS {indexConfig: {
-                   `vector.dimensions`: 768,
-                   `vector.similarity_function`: 'cosine'
-               }}"""
-        )
-    except Exception as e:
-        logger.debug("Vector index note: %s", e)
-
-    # Build chunk list
-    chunks: List[Dict[str, Any]] = []
-
-    for sec in structured.get("sections", []):
-        sec_name = sec.get("section", "Unknown")
-
-        content = sec.get("content", "")
-        if len(content) > 50:
-            chunks.append({
-                "id": f"{doc_name}::content::{sec_name}",
-                "text": content[:2000], "section": sec_name,
-                "type": "section_content", "page": 0,
-            })
-
-        for i, para in enumerate(sec.get("paragraphs", [])):
-            text = para.get("text", "")
-            if len(text) > 30:
-                chunks.append({
-                    "id": f"{doc_name}::para::{sec_name}::{i}",
-                    "text": text[:2000], "section": sec_name,
-                    "type": "paragraph", "page": para.get("page", 0),
-                })
-
-        for i, table in enumerate(sec.get("tables", [])):
-            t_text = table.get("text", "")
-            if len(t_text) > 20:
-                chunks.append({
-                    "id": f"{doc_name}::table::{sec_name}::{i}",
-                    "text": t_text[:2000], "section": sec_name,
-                    "type": "table", "page": table.get("page", 0),
-                })
-
-    # Sliding-window chunks over the full markdown for broad semantic coverage
-    full_md = structured.get("full_markdown", "")
-    if full_md:
-        for i, chunk_text in enumerate(_split_text(full_md, chunk_size=1000, overlap=200)):
-            chunks.append({
-                "id": f"{doc_name}::md::{i}",
-                "text": chunk_text, "section": "full_document",
-                "type": "markdown_chunk", "page": 0,
-            })
-
-    logger.info("Embedding %d chunks for '%s' …", len(chunks), doc_name)
-    embedded = 0
-
-    for chunk in chunks:
-        try:
-            embedding = ollama.generate_embedding(chunk["text"])
-            if not embedding:
-                continue
-            db.execute_query(
-                """MERGE (c:ContentBlock {id: $id})
-                   SET c.text      = $text,
-                       c.section   = $section,
-                       c.type      = $type,
-                       c.page      = $page,
-                       c.embedding = $embedding
-                   WITH c
-                   MATCH (d:Document {name: $doc_name})
-                   MERGE (c)-[:FROM_DOCUMENT]->(d)""",
-                {
-                    "id": chunk["id"], "text": chunk["text"],
-                    "section": chunk["section"], "type": chunk["type"],
-                    "page": chunk.get("page", 0),
-                    "embedding": embedding, "doc_name": doc_name,
-                },
-            )
-            embedded += 1
-        except Exception as e:
-            logger.warning("Embedding failed for %s: %s", chunk["id"], e)
-
-    logger.info("Stored %d/%d embeddings for '%s'", embedded, len(chunks), doc_name)
-    return embedded
 
 
 # ---------------------------------------------------------------------------

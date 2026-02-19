@@ -24,6 +24,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.app.modules.database import get_neo4j_connection
+from backend.app.modules.latex_utils import latex_to_unicode
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -220,9 +221,8 @@ class GraphBuilder:
     ) -> Dict[str, int]:
         """Ingest a structured document dict into Neo4j following the schema.
 
-        Handles both OCR-produced dicts (chapters, paragraphs, tables, images,
-        formulas) **and** legacy JSON files (sections with symbols, definitions,
-        abbreviations, units).
+        Handles OCR-produced dicts (chapters, paragraphs, tables, images,
+        formulas) and structured JSON files.
         """
         self._create_constraints_and_indexes()
 
@@ -387,12 +387,20 @@ class GraphBuilder:
                             {"sid": sec_id, "pid": page_id_map[pg]},
                         )
 
-            # ── Chapter ↔ Page links (derived) ──────────────────────────
-            if page_id_map:
-                for ch in raw_chapters:
-                    if sec_title in ch.get("section_refs", []):
-                        ch_id_val = chapter_id_map.get(ch.get("number", ""))
-                        if ch_id_val:
+            # ── Chapter ↔ Section / Page links ───────────────────────────
+            for ch in raw_chapters:
+                if sec_title in ch.get("section_refs", []):
+                    ch_id_val = chapter_id_map.get(ch.get("number", ""))
+                    if ch_id_val:
+                        # Direct Chapter→Section link (always)
+                        self.db.execute_query(
+                            """MATCH (ch:Chapter {id: $cid})
+                               MATCH (s:Section {id: $sid})
+                               MERGE (ch)-[:HAS_SECTION]->(s)""",
+                            {"cid": ch_id_val, "sid": sec_id},
+                        )
+                        # Chapter→Page links (when pages exist)
+                        if page_id_map:
                             for pg in pages_in_sec:
                                 if pg in page_id_map:
                                     self.db.execute_query(
@@ -401,7 +409,7 @@ class GraphBuilder:
                                            MERGE (ch)-[:CONTAINS_PAGE]->(p)""",
                                         {"cid": ch_id_val, "pid": page_id_map[pg]},
                                     )
-                        break
+                    break
 
             # ── Subsection hierarchy ────────────────────────────────────
             if sec_level > 1:
@@ -423,7 +431,8 @@ class GraphBuilder:
                     """MERGE (t:Table {id: $id})
                        SET t.number  = $number,
                            t.caption = $caption,
-                           t.content = $content
+                           t.content = $content,
+                           t.annotation = $annotation
                        WITH t
                        MATCH (s:Section {id: $sid})
                        MERGE (s)-[:HAS_TABLE]->(t)""",
@@ -434,6 +443,7 @@ class GraphBuilder:
                         "content": (
                             tbl.get("text", "") or tbl.get("html", "")
                         )[:10000],
+                        "annotation": tbl.get("annotation", ""),
                         "sid": sec_id,
                     },
                 )
@@ -447,7 +457,8 @@ class GraphBuilder:
                        SET f.number      = $number,
                            f.caption     = $caption,
                            f.description = $description,
-                           f.image_type  = $image_type
+                           f.image_type  = $image_type,
+                           f.annotation  = $annotation
                        WITH f
                        MATCH (s:Section {id: $sid})
                        MERGE (s)-[:HAS_FIGURE]->(f)""",
@@ -457,6 +468,7 @@ class GraphBuilder:
                         "caption": fig.get("description", "")[:200],
                         "description": fig.get("description", ""),
                         "image_type": fig.get("type", "image"),
+                        "annotation": fig.get("annotation", ""),
                         "sid": sec_id,
                     },
                 )
@@ -465,15 +477,20 @@ class GraphBuilder:
             # ── Formulas (section-level) ────────────────────────────────
             for i, frm in enumerate(sec_data.get("formulas", [])):
                 frm_id = _make_uuid("formula", doc_name, sec_title, str(i))
+                raw_latex = frm.get("expression", "") or frm.get("formula", "")
+                # Prefer pre-computed unicode from OCR; fallback to converter
+                unicode_formula = frm.get("unicode") or latex_to_unicode(raw_latex)
                 self.db.execute_query(
                     """MERGE (f:Formula {id: $id})
-                       SET f.latex = $latex
+                       SET f.latex   = $latex,
+                           f.unicode = $unicode
                        WITH f
                        MATCH (s:Section {id: $sid})
                        MERGE (s)-[:HAS_FORMULA]->(f)""",
                     {
                         "id": frm_id,
-                        "latex": frm.get("expression", "") or frm.get("formula", ""),
+                        "latex": raw_latex,
+                        "unicode": unicode_formula,
                         "sid": sec_id,
                     },
                 )
@@ -485,6 +502,8 @@ class GraphBuilder:
             latex = kf.get("formula", "") or kf.get("expression", "")
             if not latex:
                 continue
+            # Prefer pre-computed unicode from OCR; fallback to converter
+            unicode_formula = kf.get("unicode") or latex_to_unicode(latex)
             target_sec = None
             ctx = kf.get("name", "")
             for sid, sinfo in section_map.items():
@@ -495,8 +514,10 @@ class GraphBuilder:
                 target_sec = next(iter(section_map))
 
             self.db.execute_query(
-                """MERGE (f:Formula {id: $id}) SET f.latex = $latex""",
-                {"id": frm_id, "latex": latex},
+                """MERGE (f:Formula {id: $id})
+                   SET f.latex   = $latex,
+                       f.unicode = $unicode""",
+                {"id": frm_id, "latex": latex, "unicode": unicode_formula},
             )
             if target_sec:
                 self.db.execute_query(
@@ -515,14 +536,6 @@ class GraphBuilder:
 
         logger.info("Ingested document '%s': %s", doc_name, stats)
         return stats
-
-    # Backward-compatible alias used by ocr_pipeline
-    def ingest_ocr_document(
-        self,
-        data: Dict[str, Any],
-        page_data: Optional[List[Dict[str, Any]]] = None,
-    ) -> Dict[str, int]:
-        return self.ingest_document(data, page_data=page_data)
 
     # ----------------------------------------------------------------- #
     #  Page creation
@@ -609,7 +622,7 @@ class GraphBuilder:
             """CREATE FULLTEXT INDEX table_fulltext IF NOT EXISTS
                FOR (t:Table) ON EACH [t.caption, t.content]""",
             """CREATE FULLTEXT INDEX formula_fulltext IF NOT EXISTS
-               FOR (f:Formula) ON EACH [f.latex]""",
+               FOR (f:Formula) ON EACH [f.latex, f.unicode]""",
         ]
         for q in fulltext_indexes:
             try:
@@ -722,11 +735,11 @@ class GraphBuilder:
             logger.debug("Could not link related concepts: %s", e)
 
     # ----------------------------------------------------------------- #
-    #  Embedding generation (Section + Concept)
+    #  Embedding generation (Section + Concept + Formula)
     # ----------------------------------------------------------------- #
 
     def generate_embeddings(self, doc_name: Optional[str] = None) -> int:
-        """Generate embeddings for Section and Concept nodes via Ollama.
+        """Generate embeddings for Section, Concept, and Formula nodes via Ollama.
 
         Creates vector indexes if they don't exist.
         Returns total number of embeddings stored.
@@ -745,6 +758,24 @@ class GraphBuilder:
                }}""",
             """CREATE VECTOR INDEX concept_embedding_index IF NOT EXISTS
                FOR (c:Concept) ON (c.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}""",
+            """CREATE VECTOR INDEX formula_embedding_index IF NOT EXISTS
+               FOR (f:Formula) ON (f.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}""",
+            """CREATE VECTOR INDEX table_embedding_index IF NOT EXISTS
+               FOR (t:Table) ON (t.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}""",
+            """CREATE VECTOR INDEX figure_embedding_index IF NOT EXISTS
+               FOR (f:Figure) ON (f.embedding)
                OPTIONS {indexConfig: {
                    `vector.dimensions`: 768,
                    `vector.similarity_function`: 'cosine'
@@ -802,6 +833,86 @@ class GraphBuilder:
                     embedded += 1
             except Exception as e:
                 logger.warning("Concept embedding failed %s: %s", con["id"], e)
+
+        # ── Embed Formulas ─────────────────────────────────────────────
+        formulas = self.db.execute_query(
+            """MATCH (f:Formula)
+               WHERE f.embedding IS NULL
+               RETURN f.id AS id, coalesce(f.unicode, f.latex) AS text
+               LIMIT 2000""",
+        )
+
+        logger.info("Embedding %d formulas …", len(formulas))
+        for frm in formulas:
+            text = frm.get("text", "")
+            if len(text.strip()) < 3:
+                continue
+            try:
+                emb = ollama.generate_embedding(text[:2000])
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (f:Formula {id: $id}) SET f.embedding = $emb""",
+                        {"id": frm["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Formula embedding failed %s: %s", frm["id"], e)
+
+        # ── Embed Tables ─────────────────────────────────────────────
+        tables = self.db.execute_query(
+            """MATCH (t:Table)
+               WHERE t.embedding IS NULL
+               RETURN t.id AS id,
+                      t.caption AS caption,
+                      t.content AS content,
+                      coalesce(t.annotation, "") AS annotation
+               LIMIT 2000""",
+        )
+
+        logger.info("Embedding %d tables …", len(tables))
+        for tbl in tables:
+            text_parts = [tbl.get("caption", ""), tbl.get("content", ""), tbl.get("annotation", "")]
+            text = "\n".join(part for part in text_parts if part)
+            if len(text.strip()) < 5:
+                continue
+            try:
+                emb = ollama.generate_embedding(text[:2000])
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (t:Table {id: $id}) SET t.embedding = $emb""",
+                        {"id": tbl["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Table embedding failed %s: %s", tbl["id"], e)
+
+        # ── Embed Figures ─────────────────────────────────────────---
+        figures = self.db.execute_query(
+            """MATCH (f:Figure)
+               WHERE f.embedding IS NULL
+               RETURN f.id AS id,
+                      f.caption AS caption,
+                      f.description AS description,
+                      coalesce(f.annotation, "") AS annotation
+               LIMIT 2000""",
+        )
+
+        logger.info("Embedding %d figures …", len(figures))
+        for fig in figures:
+            text_parts = [fig.get("caption", ""), fig.get("description", ""), fig.get("annotation", "")]
+            text = "\n".join(part for part in text_parts if part)
+            if len(text.strip()) < 5:
+                continue
+            try:
+                emb = ollama.generate_embedding(text[:2000])
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (f:Figure {id: $id}) SET f.embedding = $emb""",
+                        {"id": fig["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Figure embedding failed %s: %s", fig["id"], e)
 
         logger.info("Stored %d embeddings", embedded)
         return embedded

@@ -2,7 +2,7 @@
 
 Supports
 ========
-- Structural navigation  (Document → Chapter → Page → Section)
+- Structural navigation  (Document → Chapter → Section)
 - Full-text search        (Section, Concept, Table, Formula)
 - Semantic (vector) search on Section and Concept embeddings
 - Concept-aware retrieval (MENTIONS, RELATED_TO)
@@ -35,8 +35,7 @@ class GraphQuerier:
             """MATCH (d:Document)
                OPTIONAL MATCH (d)-[:HAS_CHAPTER]->(ch:Chapter)
                WITH d, count(DISTINCT ch) AS ch_count
-               OPTIONAL MATCH (d)-[:HAS_CHAPTER]->(:Chapter)-[:CONTAINS_PAGE]->
-                              (:Page)-[:HAS_SECTION]->(s:Section)
+               OPTIONAL MATCH (d)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s:Section)
                RETURN d.id AS id,
                       d.filename AS filename,
                       d.document_type AS document_type,
@@ -78,8 +77,7 @@ class GraphQuerier:
     def get_chapter_sections(self, chapter_id: str) -> List[Dict[str, Any]]:
         """Get all sections under a chapter (via pages)."""
         return self.db.execute_query(
-            """MATCH (ch:Chapter {id: $id})-[:CONTAINS_PAGE]->(p:Page)
-                     -[:HAS_SECTION]->(s:Section)
+            """MATCH (ch:Chapter {id: $id})-[:HAS_SECTION]->(s:Section)
                RETURN DISTINCT s.id AS id, s.number AS number, s.title AS title,
                       s.level AS level, s.start_page AS start_page,
                       s.end_page AS end_page,
@@ -92,16 +90,14 @@ class GraphQuerier:
         """List sections, optionally filtered by document keyword."""
         if document_keyword:
             return self.db.execute_query(
-                """MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:CONTAINS_PAGE]->
-                         (:Page)-[:HAS_SECTION]->(s:Section)
+                """MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s:Section)
                    WHERE toLower(d.filename) CONTAINS toLower($kw)
                    RETURN DISTINCT s.title AS section, d.filename AS document
                    ORDER BY s.title
                    UNION
                    MATCH (s:Section)
                    WHERE toLower(s.title) CONTAINS toLower($kw)
-                   OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                                  (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+                   OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Chapter)<-[:HAS_CHAPTER]-(d:Document)
                    RETURN DISTINCT s.title AS section, d.filename AS document
                    ORDER BY s.title
                    LIMIT 50""",
@@ -109,8 +105,7 @@ class GraphQuerier:
             )
         return self.db.execute_query(
             """MATCH (s:Section)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Chapter)<-[:HAS_CHAPTER]-(d:Document)
                RETURN DISTINCT s.title AS section, d.filename AS document
                ORDER BY d.filename, s.title
                LIMIT 200""",
@@ -133,7 +128,8 @@ class GraphQuerier:
                               caption: t.caption, content: t.content}) AS tables,
                       collect(DISTINCT {id: f.id, number: f.number,
                               caption: f.caption, description: f.description}) AS figures,
-                      collect(DISTINCT {id: frm.id, latex: frm.latex}) AS formulas,
+                      collect(DISTINCT {id: frm.id, latex: frm.latex,
+                              formula: coalesce(frm.unicode, frm.latex)}) AS formulas,
                       collect(DISTINCT {id: sub.id, title: sub.title,
                               number: sub.number}) AS subsections,
                       collect(DISTINCT {name: c.name,
@@ -152,10 +148,9 @@ class GraphQuerier:
             results = self.db.execute_query(
                 """CALL db.index.fulltext.queryNodes('section_fulltext', $query)
                    YIELD node, score
-                   OPTIONAL MATCH (node)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                                  (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(node)
                    RETURN node.id AS id, node.title AS title,
-                          node.content_preview AS preview,
+                          substring(node.full_text, 0, 1500) AS content,
                           node.start_page AS page,
                           d.filename AS document, score
                    ORDER BY score DESC
@@ -171,10 +166,9 @@ class GraphQuerier:
             """MATCH (s:Section)
                WHERE toLower(s.title) CONTAINS toLower($kw)
                   OR toLower(s.full_text) CONTAINS toLower($kw)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                RETURN s.id AS id, s.title AS title,
-                      s.content_preview AS preview,
+                      substring(s.full_text, 0, 1500) AS content,
                       s.start_page AS page,
                       d.filename AS document, 0.5 AS score
                LIMIT $limit""",
@@ -231,8 +225,7 @@ class GraphQuerier:
         return self.db.execute_query(
             """MATCH (c:Concept)<-[m:MENTIONS]-(s:Section)
                WHERE c.normalized_name = toLower($name) OR c.name = $name
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                RETURN s.title AS section, s.content_preview AS preview,
                       m.confidence AS confidence, d.filename AS document,
                       s.start_page AS page
@@ -258,12 +251,34 @@ class GraphQuerier:
     def search_tables(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search tables by caption or content."""
         try:
+            from backend.app.modules.ollama_client import get_ollama_client
+
+            embedding = get_ollama_client().generate_embedding(keyword)
+            if embedding:
+                results = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes('table_embedding_index', $limit, $embedding)
+                       YIELD node, score
+                       MATCH (s:Section)-[:HAS_TABLE]->(node)
+                       OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+                       RETURN node.caption AS caption, node.content AS content,
+                              node.annotation AS annotation, node.number AS number,
+                              node.embedding AS embedding,
+                              s.title AS section, d.filename AS document, score
+                       ORDER BY score DESC
+                       LIMIT $limit""",
+                    {"embedding": embedding, "limit": limit},
+                )
+                if results:
+                    return results
+        except Exception:
+            pass
+
+        try:
             results = self.db.execute_query(
                 """CALL db.index.fulltext.queryNodes('table_fulltext', $query)
                    YIELD node, score
                    MATCH (s:Section)-[:HAS_TABLE]->(node)
-                   OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                                  (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                    RETURN node.caption AS caption, node.content AS content,
                           node.number AS number, s.title AS section,
                           d.filename AS document, score
@@ -280,8 +295,7 @@ class GraphQuerier:
             """MATCH (s:Section)-[:HAS_TABLE]->(t:Table)
                WHERE toLower(t.caption) CONTAINS toLower($kw)
                   OR toLower(t.content) CONTAINS toLower($kw)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                RETURN t.caption AS caption, t.content AS content,
                       t.number AS number, s.title AS section,
                       d.filename AS document
@@ -291,12 +305,34 @@ class GraphQuerier:
 
     def search_figures(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search figures by caption / description."""
+        try:
+            from backend.app.modules.ollama_client import get_ollama_client
+
+            embedding = get_ollama_client().generate_embedding(keyword)
+            if embedding:
+                results = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes('figure_embedding_index', $limit, $embedding)
+                       YIELD node, score
+                       MATCH (s:Section)-[:HAS_FIGURE]->(node)
+                       OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+                       RETURN node.caption AS caption, node.description AS description,
+                              node.annotation AS annotation, node.number AS number,
+                              node.image_type AS image_type, node.embedding AS embedding,
+                              s.title AS section, d.filename AS document, score
+                       ORDER BY score DESC
+                       LIMIT $limit""",
+                    {"embedding": embedding, "limit": limit},
+                )
+                if results:
+                    return results
+        except Exception:
+            pass
+
         return self.db.execute_query(
             """MATCH (s:Section)-[:HAS_FIGURE]->(f:Figure)
                WHERE toLower(f.caption) CONTAINS toLower($kw)
                   OR toLower(f.description) CONTAINS toLower($kw)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                RETURN f.caption AS caption, f.description AS description,
                       f.number AS number, f.image_type AS image_type,
                       s.title AS section, d.filename AS document
@@ -311,9 +347,11 @@ class GraphQuerier:
                 """CALL db.index.fulltext.queryNodes('formula_fulltext', $query)
                    YIELD node, score
                    MATCH (s:Section)-[:HAS_FORMULA]->(node)
-                   OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                                  (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
-                   RETURN node.latex AS latex, node.id AS id,
+                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+                   RETURN node.latex AS latex,
+                          coalesce(node.unicode, node.latex) AS formula,
+                          node.embedding AS embedding,
+                          node.id AS id,
                           s.title AS section, d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
@@ -327,9 +365,12 @@ class GraphQuerier:
         return self.db.execute_query(
             """MATCH (s:Section)-[:HAS_FORMULA]->(f:Formula)
                WHERE toLower(f.latex) CONTAINS toLower($kw)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
-               RETURN f.latex AS latex, f.id AS id,
+                  OR toLower(f.unicode) CONTAINS toLower($kw)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               RETURN f.latex AS latex,
+                      coalesce(f.unicode, f.latex) AS formula,
+                      f.embedding AS embedding,
+                      f.id AS id,
                       s.title AS section, d.filename AS document
                LIMIT $limit""",
             {"kw": keyword, "limit": limit},
@@ -339,9 +380,10 @@ class GraphQuerier:
         """List all formulas."""
         return self.db.execute_query(
             """MATCH (s:Section)-[:HAS_FORMULA]->(f:Formula)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
-               RETURN f.latex AS latex, f.id AS id,
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               RETURN f.latex AS latex,
+                      coalesce(f.unicode, f.latex) AS formula,
+                      f.id AS id,
                       s.title AS section, d.filename AS document
                ORDER BY s.title
                LIMIT 100""",
@@ -363,11 +405,9 @@ class GraphQuerier:
                     """CALL db.index.vector.queryNodes(
                            'section_embedding_index', $top_k, $embedding
                        ) YIELD node, score
-                       OPTIONAL MATCH (node)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                                      (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+                       OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(node)
                        RETURN node.title AS title,
-                              node.content_preview AS preview,
-                              node.full_text AS text,
+                              substring(node.full_text, 0, 1500) AS content,
                               node.start_page AS page,
                               d.filename AS document,
                               score
@@ -414,8 +454,7 @@ class GraphQuerier:
         """Get sections semantically similar to a given section (cross-document)."""
         return self.db.execute_query(
             """MATCH (s:Section {id: $id})-[r:SEMANTICALLY_SIMILAR]-(similar:Section)
-               OPTIONAL MATCH (similar)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(similar)
                RETURN similar.title AS title,
                       similar.content_preview AS preview,
                       d.filename AS document,
@@ -529,129 +568,6 @@ class GraphQuerier:
             pass
 
         return stats
-
-    # ================================================================== #
-    #  9. LEGACY COMPAT (symbols, abbreviations, definitions, units)
-    #     These now query Concept nodes that were created from those fields
-    # ================================================================== #
-
-    def lookup_symbol(self, symbol_name: str) -> List[Dict[str, Any]]:
-        """Look up a symbol (now stored as a Concept) by name."""
-        return self.db.execute_query(
-            """MATCH (c:Concept)
-               WHERE c.name = $name OR c.normalized_name = toLower($name)
-               OPTIONAL MATCH (c)<-[m:MENTIONS]-(s:Section)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
-               RETURN c.name AS symbol, c.description AS definition,
-                      s.title AS section, d.filename AS document,
-                      m.confidence AS confidence
-               ORDER BY m.confidence DESC""",
-            {"name": symbol_name},
-        )
-
-    def search_symbols(self, keyword: str) -> List[Dict[str, Any]]:
-        """Search symbols (concepts) by keyword."""
-        return self.search_concepts(keyword, limit=15)
-
-    def get_symbols_in_section(self, section_keyword: str) -> List[Dict[str, Any]]:
-        """Get all concepts mentioned in sections matching keyword."""
-        return self.db.execute_query(
-            """MATCH (s:Section)-[m:MENTIONS]->(c:Concept)
-               WHERE toLower(s.title) CONTAINS toLower($kw)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
-               RETURN c.name AS symbol, c.description AS definition,
-                      s.title AS section, d.filename AS document,
-                      m.confidence AS confidence
-               ORDER BY c.name""",
-            {"kw": section_keyword},
-        )
-
-    def lookup_abbreviation(self, abbr: str) -> List[Dict[str, Any]]:
-        """Look up an abbreviation (now a Concept)."""
-        results = self.db.execute_query(
-            """MATCH (c:Concept)
-               WHERE c.name = $name OR c.normalized_name = toLower($name)
-               OPTIONAL MATCH (c)<-[:MENTIONS]-(s:Section)
-               RETURN c.name AS abbreviation, c.description AS definition,
-                      s.title AS section
-               LIMIT 10""",
-            {"name": abbr},
-        )
-        if not results:
-            results = self.db.execute_query(
-                """MATCH (c:Concept)
-                   WHERE toLower(c.name) CONTAINS toLower($kw)
-                      OR toLower(c.description) CONTAINS toLower($kw)
-                   OPTIONAL MATCH (c)<-[:MENTIONS]-(s:Section)
-                   RETURN c.name AS abbreviation, c.description AS definition,
-                          s.title AS section
-                   LIMIT 10""",
-                {"kw": abbr},
-            )
-        return results
-
-    def search_definitions(self, keyword: str) -> List[Dict[str, Any]]:
-        """Search definitions (now Concepts with descriptions)."""
-        return self.db.execute_query(
-            """MATCH (c:Concept)
-               WHERE toLower(c.description) CONTAINS toLower($kw)
-                  OR toLower(c.name) CONTAINS toLower($kw)
-               OPTIONAL MATCH (c)<-[m:MENTIONS]-(s:Section)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
-               RETURN c.name AS term, c.description AS definition,
-                      s.title AS section, d.filename AS document,
-                      m.confidence AS confidence
-               ORDER BY m.confidence DESC
-               LIMIT 15""",
-            {"kw": keyword},
-        )
-
-    def get_unit(self, quantity_keyword: str) -> List[Dict[str, Any]]:
-        """Get unit info (now a Concept whose description starts with 'Unit:')."""
-        return self.db.execute_query(
-            """MATCH (c:Concept)
-               WHERE (toLower(c.name) CONTAINS toLower($kw)
-                   OR toLower(c.description) CONTAINS toLower($kw))
-                 AND c.description STARTS WITH 'Unit:'
-               RETURN c.name AS quantity,
-                      substring(c.description, 6) AS unit
-               LIMIT 10""",
-            {"kw": quantity_keyword},
-        )
-
-    def get_formula(self, formula_keyword: str) -> List[Dict[str, Any]]:
-        """Get a formula by keyword."""
-        return self.search_formulas(formula_keyword, limit=5)
-
-    # ================================================================== #
-    #  10. CONTENT SEARCH (backward compat for agent)
-    # ================================================================== #
-
-    def search_content(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Full-text search across section content (replaces ContentBlock search)."""
-        return self.search_sections(keyword, limit=limit)
-
-    def search_paragraphs(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search section content (paragraphs are now part of Section.full_text)."""
-        return self.db.execute_query(
-            """MATCH (s:Section)
-               WHERE toLower(s.full_text) CONTAINS toLower($kw)
-               OPTIONAL MATCH (s)<-[:HAS_SECTION]-(:Page)<-[:CONTAINS_PAGE]-
-                              (:Chapter)<-[:HAS_CHAPTER]-(d:Document)
-               RETURN s.full_text AS text,
-                      s.start_page AS page,
-                      s.title AS section,
-                      d.filename AS document
-               LIMIT $limit""",
-            {"kw": keyword, "limit": limit},
-        )
-
-    def search_images(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search figures (images) by description."""
-        return self.search_figures(keyword, limit=limit)
 
 
 # ===================================================================== #

@@ -1,12 +1,11 @@
-"""Eurocode Agent - LangGraph ReAct agent with Graph-RAG tools"""
+"""Eurocode Agent - LangChain agent with Graph-RAG tools"""
 import json
 import logging
 from typing import List, Dict, Any, Optional
 
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 
 from backend.app.modules.graph_querier import get_graph_querier, GraphQuerier
 from config.settings import settings
@@ -17,129 +16,108 @@ logger = logging.getLogger(__name__)
 #  System prompt
 # ================================================================== #
 SYSTEM_MESSAGE = (
-    "You are an expert Eurocode civil-engineering assistant backed by a Graph-RAG "
+    "You are a Eurocode structural engineering expert backed by a Graph-RAG "
     "knowledge graph. The graph contains Documents, Chapters, Pages, Sections, "
-    "Tables, Figures, Formulas, and Concepts — all linked with structural and "
-    "semantic relationships.\n\n"
-    "ALWAYS use your tools to query the knowledge graph before answering — never "
-    "guess or invent data.\n\n"
-    "Available tool strategies:\n"
-    "• Use `search` as the primary broad search — it queries sections, concepts, "
-    "  tables, figures, formulas, and performs semantic vector search.\n"
-    "• Use `lookup_concept` for specific engineering terms or symbols "
-    "  (γf, Ed, 'Einwirkung', 'limit state', etc.).\n"
-    "• Use `search_formulas` when the user asks about a formula or equation.\n"
-    "• Use `search_tables` when the user asks about table data.\n"
-    "• Use `list_documents` or `list_chapters` for structural navigation.\n\n"
-    "Include exact concept names, definitions, formulas, and section/page citations "
-    "in your answer. If the question is German, answer in German. If English, answer "
-    "in English. Be precise and cite the document and section.\n\n"
-    "IMPORTANT: The knowledge graph data is primarily in GERMAN. When the user asks "
-    "in English, translate search terms to German before calling tools. Examples:\n"
-    "- 'partial safety factor' → search for 'Teilsicherheitsbeiwert'\n"
-    "- 'action' / 'load' → search for 'Einwirkung'\n"
-    "- 'resistance' → 'Widerstand'\n"
-    "- 'abbreviation' → search the abbreviation directly (EQU, SLS, ULS)\n\n"
-    "When looking up Greek symbols like γf, γG, γQ, use exact Unicode characters."
+    "Tables, Figures, Formulas, and Concepts — linked by structural and semantic "
+    "relationships.\n\n"
+    "CRITICAL RULE — LANGUAGE:\n"
+    "Detect the language of the user's question. "
+    "If the user writes in English, you MUST answer in English. "
+    "If the user writes in German, you MUST answer in German. "
+    "The search results from the knowledge graph are in German — that is fine, "
+    "but your final answer MUST match the user's language.\n\n"
+    "CRITICAL RULE — ANSWER QUALITY:\n"
+    "1. Read the search results carefully and extract ONLY the information that "
+    "   directly answers the user's question.\n"
+    "2. Do NOT dump or list raw search results. Synthesize a clear, direct answer.\n"
+    "3. If the question asks 'which types' or 'what are', give a specific list.\n"
+    "4. If the question asks 'how', explain the procedure step by step.\n"
+    "5. Ignore search results that are not relevant to the question.\n"
+    "6. Cite the document name, section number, and page when possible.\n"
+    "7. Render formulas in LaTeX format.\n\n"
+    "TOOL USAGE:\n"
+    "1. Always use `search` first for every question.\n"
+    "2. Use `lookup` for specific terms, symbols, or abbreviations.\n"
+    "3. Use `navigate` only for document structure questions.\n"
+    "4. If the first search does not answer the question, try a different query.\n\n"
+    "SEARCH TIPS — the graph data is in GERMAN, so translate search terms:\n"
+    "- scope / application → Anwendungsbereich\n"
+    "- bridge → Brücke\n"
+    "- excluded / exclusion → ausgeschlossen / Ausschluss\n"
+    "- partial safety factor → Teilsicherheitsbeiwert\n"
+    "- action / load → Einwirkung\n"
+    "- resistance → Widerstand\n"
+    "- Use Greek symbols as Unicode: γf, γG, γQ"
 )
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_MESSAGE),
-    MessagesPlaceholder(variable_name="messages"),
-])
 
 
 # ================================================================== #
 #  Tool definitions using @tool decorator
 # ================================================================== #
 def _setup_tools(querier: GraphQuerier):
-    """Create LangChain tools that call the GraphQuerier methods."""
+    """Create 3 essential LangChain tools for the Graph-RAG agent."""
 
     @tool
     def search(query: str) -> str:
-        """Search across the entire Graph-RAG knowledge graph: sections, concepts,
-        tables, figures, formulas, and perform semantic vector similarity.
-        This is the PRIMARY search tool — use it for any question.
-        Works with German and English queries.
-        Input: a natural-language query or keyword."""
+        """Search the entire Eurocode knowledge graph: sections, concepts,
+        tables, figures, formulas, and semantic vector search.
+        Primary tool — use for every question.
+        Input: search term or phrase. Use GERMAN terms for best results
+        (e.g. 'Anwendungsbereich' not 'scope')."""
         results = querier.general_search(query)
         if not results:
             return f"No results found for '{query}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
+        # Build focused output — prioritize sections with content
+        # TODO: Need to update it properly
+        output: Dict[str, Any] = {}
+        for key, items in results.items():
+            if isinstance(items, list):
+                # Limit items per category
+                limit = 5 if key in ("sections", "semantic") else 3
+                output[key] = items[:limit]
+            else:
+                output[key] = items
+        return json.dumps(output, ensure_ascii=False, default=str)
 
     @tool
-    def lookup_concept(name: str) -> str:
-        """Look up a specific concept, symbol, abbreviation or definition by name.
-        Concepts include Eurocode symbols (γf, Ed, Fd), engineering terms
-        (Einwirkung, Tragfähigkeit), and abbreviations (EQU, SLS, ULS).
-        Returns the concept description, related concepts, and all sections
-        that mention it.
-        Input: exact concept/symbol name."""
+    def lookup(name: str) -> str:
+        """Look up a specific concept, symbol, or abbreviation.
+        Returns description, related concepts, and all sections mentioning it.
+        Input: exact name (e.g. 'γf', 'Einwirkung', 'EQU', 'Teilsicherheitsbeiwert')."""
         combined: List[Dict[str, Any]] = []
         seen: set = set()
 
         def _add(items):
             for item in (items or []):
-                key = item.get("concept") or item.get("symbol") or item.get("term", "")
-                if key not in seen:
+                key = item.get("concept") or item.get("term") or item.get("section", "")
+                if key and key not in seen:
                     seen.add(key)
                     combined.append(item)
 
         _add(querier.lookup_concept(name))
-        _add(querier.lookup_symbol(name))
-        _add(querier.search_concepts(name))
+        _add(querier.search_concepts(name, limit=5))
+        _add(querier.get_concept_sections(name))
 
         if not combined:
             return f"No concept found for '{name}'."
-        return json.dumps(combined, ensure_ascii=False, default=str)
+        return json.dumps(combined[:15], ensure_ascii=False, default=str)
 
     @tool
-    def search_formulas(keyword: str) -> str:
-        """Search for formulas / equations in the knowledge graph.
-        Returns LaTeX expressions with the section and document they appear in.
-        Input: keyword (e.g. 'AEd', 'Erdbeben', 'Formel', 'combination')."""
-        results = querier.search_formulas(keyword)
-        if not results:
-            results = querier.list_formulas()
-        if not results:
-            return f"No formulas found for '{keyword}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def search_tables(keyword: str) -> str:
-        """Search for tables in the knowledge graph by caption or content.
-        Input: keyword describing the table."""
-        results = querier.search_tables(keyword)
-        if not results:
-            return f"No tables found for '{keyword}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    @tool
-    def list_documents() -> str:
-        """List all documents in the knowledge graph with their types and section counts.
-        No input needed."""
-        results = querier.list_documents()
-        if not results:
+    def navigate(document_keyword: str = "") -> str:
+        """List documents and chapters in the knowledge graph.
+        Optionally filter by document name.
+        Input: optional document name keyword (empty for all)."""
+        docs = querier.list_documents()
+        chapters = querier.list_chapters(document_keyword or None)
+        result = {
+            "documents": docs[:20] if docs else [],
+            "chapters": chapters[:30] if chapters else [],
+        }
+        if not docs and not chapters:
             return "No documents found in the knowledge graph."
-        return json.dumps(results, ensure_ascii=False, default=str)
+        return json.dumps(result, ensure_ascii=False, default=str)
 
-    @tool
-    def list_chapters(document_keyword: str = "") -> str:
-        """List chapters in the knowledge graph, optionally filtered by document.
-        Input: optional document name keyword (leave empty for all)."""
-        results = querier.list_chapters(document_keyword or None)
-        if not results:
-            return f"No chapters found for '{document_keyword}'."
-        return json.dumps(results, ensure_ascii=False, default=str)
-
-    return [
-        search,
-        lookup_concept,
-        search_formulas,
-        search_tables,
-        list_documents,
-        list_chapters,
-    ]
+    return [search, lookup, navigate]
 
 
 # ================================================================== #
@@ -147,7 +125,7 @@ def _setup_tools(querier: GraphQuerier):
 # ================================================================== #
 class EurocodeAgent:
     """
-    LangGraph ReAct agent that uses native tool calling to query
+    LangChain agent that uses tool calling to query
     the Eurocode knowledge graph and produce grounded answers.
     """
 
@@ -159,14 +137,14 @@ class EurocodeAgent:
         self.llm = ChatOllama(
             base_url=settings.ollama_base_url,
             model=settings.ollama_llm_model,
-            temperature=0.1,
+            temperature=0,
         )
 
-        # Create the LangGraph ReAct agent
-        self.agent = create_react_agent(
+        # Create the agent
+        self.agent = create_agent(
             model=self.llm,
             tools=self.tools,
-            prompt=prompt,
+            system_prompt=SYSTEM_MESSAGE,
         )
 
         logger.info(
