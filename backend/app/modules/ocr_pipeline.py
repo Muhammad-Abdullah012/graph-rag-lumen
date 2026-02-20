@@ -21,17 +21,23 @@ import logging
 import os
 import tempfile
 import threading
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from mistralai.extra import response_format_from_pydantic_model
-
+from enum import Enum
 from pypdf import PdfReader, PdfWriter
 
 from backend.app.modules.latex_utils import latex_to_unicode
 
 logger = logging.getLogger(__name__)
+
+class ImageType(str, Enum):
+    GRAPH = "graph"
+    TEXT = "text"
+    TABLE = "table"
+    IMAGE = "image"
 
 class Image(BaseModel):
     image_type: ImageType = Field(..., description="The type of the image. Must be one of 'graph', 'text', 'table' or 'image'.")
