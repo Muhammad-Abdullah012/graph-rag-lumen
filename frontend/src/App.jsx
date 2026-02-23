@@ -5,7 +5,7 @@ import HealthStatus from './components/HealthStatus';
 import QAChat from './components/QAChat';
 
 function App() {
-  const [activeTab, setActiveTab] = useState('files');
+  const [activeTab, setActiveTab] = useState('chat');
   const [refreshKey, setRefreshKey] = useState(0);
 
   const handleUploadComplete = () => setRefreshKey((prev) => prev + 1);

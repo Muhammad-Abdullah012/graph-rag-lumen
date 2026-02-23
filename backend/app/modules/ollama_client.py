@@ -1,5 +1,6 @@
 """Ollama LLM Integration"""
 import logging
+import time
 from typing import Optional
 import requests
 
@@ -65,35 +66,57 @@ class OllamaClient:
             raise
 
     def generate_embedding(self, text: str, model: Optional[str] = None) -> list:
-        """
-        Generate an embedding vector for the given text.
+        """Generate an embedding vector for the given text.
+
+        Retries up to 3 times with exponential backoff (2 s, 4 s, 8 s) on
+        timeout errors.  Other transient errors are also retried but logged
+        at ERROR level.  Returns an empty list only after all attempts fail.
 
         Args:
-            text: Input text to embed
-            model: Embedding model (defaults to settings.ollama_embedding_model)
+            text: Input text to embed.
+            model: Embedding model (defaults to settings.ollama_embedding_model).
 
         Returns:
-            List of floats representing the embedding vector
+            List of floats representing the embedding vector, or [] on failure.
         """
         if model is None:
             model = getattr(settings, "ollama_embedding_model", "nomic-embed-text")
 
-        try:
-            response = requests.post(
-                f"{self.base_url}/api/embed",
-                json={"model": model, "input": text},
-                timeout=120,
-            )
-            response.raise_for_status()
-            data = response.json()
-            embeddings = data.get("embeddings", [])
-            if embeddings:
-                return embeddings[0]
-            # Fallback: older Ollama API format
-            return data.get("embedding", [])
-        except Exception as e:
-            logger.error(f"Error generating embedding: {str(e)}")
-            return []
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/api/embed",
+                    json={"model": model, "input": text},
+                    timeout=120,
+                )
+                response.raise_for_status()
+                data = response.json()
+                embeddings = data.get("embeddings", [])
+                if embeddings:
+                    return embeddings[0]
+                # Fallback: older Ollama API format
+                return data.get("embedding", [])
+            except requests.exceptions.Timeout:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                logger.warning(
+                    "Embedding request timed out (attempt %d/%d). Retrying in %ds…",
+                    attempt, max_retries, wait,
+                )
+                if attempt < max_retries:
+                    time.sleep(wait)
+            except Exception as e:
+                logger.error(
+                    "Error generating embedding (attempt %d/%d): %s",
+                    attempt, max_retries, e,
+                )
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+
+        logger.error(
+            "Embedding failed after %d attempts for text: %r", max_retries, text[:80]
+        )
+        return []
 
     def list_models(self) -> list:
         """List available models in Ollama"""

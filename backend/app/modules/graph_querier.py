@@ -194,7 +194,33 @@ class GraphQuerier:
         )
 
     def search_concepts(self, keyword: str, limit: int = 15) -> List[Dict[str, Any]]:
-        """Search concepts by keyword (full-text + fallback)."""
+        """Search concepts by keyword.
+
+        Strategy order:
+          1. Vector search on concept_embedding_index  (semantic)
+          2. Full-text search on concept_fulltext index
+          3. CONTAINS fallback
+        """
+        # Strategy 1: vector search
+        try:
+            from backend.app.modules.ollama_client import get_ollama_client
+            embedding = get_ollama_client().generate_embedding(keyword)
+            if embedding:
+                results = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes(
+                           'concept_embedding_index', $limit, $embedding
+                       ) YIELD node, score
+                       RETURN node.name AS concept, node.description AS description,
+                              node.normalized_name AS normalized_name, score
+                       ORDER BY score DESC""",
+                    {"limit": limit, "embedding": embedding},
+                )
+                if results:
+                    return results
+        except Exception:
+            pass
+
+        # Strategy 2: full-text search
         try:
             results = self.db.execute_query(
                 """CALL db.index.fulltext.queryNodes('concept_fulltext', $query)
@@ -210,6 +236,7 @@ class GraphQuerier:
         except Exception:
             pass
 
+        # Strategy 3: CONTAINS fallback
         return self.db.execute_query(
             """MATCH (c:Concept)
                WHERE toLower(c.name) CONTAINS toLower($kw)
@@ -328,6 +355,27 @@ class GraphQuerier:
         except Exception:
             pass
 
+        # Strategy 2: full-text index on figure_fulltext (caption + description + annotation)
+        try:
+            results = self.db.execute_query(
+                """CALL db.index.fulltext.queryNodes('figure_fulltext', $query)
+                   YIELD node, score
+                   MATCH (s:Section)-[:HAS_FIGURE]->(node)
+                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+                   RETURN node.caption AS caption, node.description AS description,
+                          node.annotation AS annotation, node.number AS number,
+                          node.image_type AS image_type,
+                          s.title AS section, d.filename AS document, score
+                   ORDER BY score DESC
+                   LIMIT $limit""",
+                {"query": keyword, "limit": limit},
+            )
+            if results:
+                return results
+        except Exception:
+            pass
+
+        # Strategy 3: CONTAINS fallback
         return self.db.execute_query(
             """MATCH (s:Section)-[:HAS_FIGURE]->(f:Figure)
                WHERE toLower(f.caption) CONTAINS toLower($kw)
@@ -341,7 +389,38 @@ class GraphQuerier:
         )
 
     def search_formulas(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search formulas by LaTeX content."""
+        """Search formulas by LaTeX content.
+
+        Strategy order:
+          1. Vector search on formula_embedding_index (semantic — handles natural-language queries)
+          2. Full-text search on formula_fulltext index  (keyword/LaTeX fragments)
+          3. CONTAINS fallback
+        """
+        # Strategy 1: vector search (handles "formula for load combination" type queries)
+        try:
+            from backend.app.modules.ollama_client import get_ollama_client
+            embedding = get_ollama_client().generate_embedding(keyword)
+            if embedding:
+                results = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes('formula_embedding_index', $limit, $embedding)
+                       YIELD node, score
+                       MATCH (s:Section)-[:HAS_FORMULA]->(node)
+                       OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+                       RETURN node.latex AS latex,
+                              coalesce(node.unicode, node.latex) AS formula,
+                              node.embedding AS embedding,
+                              node.id AS id,
+                              s.title AS section, d.filename AS document, score
+                       ORDER BY score DESC
+                       LIMIT $limit""",
+                    {"embedding": embedding, "limit": limit},
+                )
+                if results:
+                    return results
+        except Exception:
+            pass
+
+        # Strategy 2: full-text search
         try:
             results = self.db.execute_query(
                 """CALL db.index.fulltext.queryNodes('formula_fulltext', $query)
@@ -487,7 +566,7 @@ class GraphQuerier:
         if concepts:
             results["concepts"] = concepts
 
-        # Concept → Section expansion
+        # Concept → Section expansion (full-text concepts)
         for c in (concepts or [])[:3]:
             cname = c.get("concept", "")
             if cname:

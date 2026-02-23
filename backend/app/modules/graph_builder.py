@@ -24,7 +24,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.app.modules.database import get_neo4j_connection
-from backend.app.modules.latex_utils import latex_to_unicode
+from backend.app.modules.latex_utils import latex_to_unicode, normalize_latex
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -335,6 +335,16 @@ class GraphBuilder:
                 full_text = sec_data.get("content", "")
             content_preview = full_text[:500]
 
+            # Skip heading-only stubs with no meaningful content or child elements
+            if (
+                len(full_text.strip()) < 50
+                and not sec_data.get("tables")
+                and not sec_data.get("images")
+                and not sec_data.get("formulas")
+            ):
+                logger.debug("Skipping empty section: '%s'", sec_title)
+                continue
+
             # Page range
             pages_in_sec = sorted(
                 {p.get("page", 0) for p in paragraphs if p.get("page")}
@@ -477,7 +487,7 @@ class GraphBuilder:
             # ── Formulas (section-level) ────────────────────────────────
             for i, frm in enumerate(sec_data.get("formulas", [])):
                 frm_id = _make_uuid("formula", doc_name, sec_title, str(i))
-                raw_latex = frm.get("expression", "") or frm.get("formula", "")
+                raw_latex = normalize_latex(frm.get("expression", "") or frm.get("formula", ""))
                 # Prefer pre-computed unicode from OCR; fallback to converter
                 unicode_formula = frm.get("unicode") or latex_to_unicode(raw_latex)
                 self.db.execute_query(
@@ -499,7 +509,7 @@ class GraphBuilder:
         # ── Top-level key_formulas (legacy format) ──────────────────────
         for i, kf in enumerate(data.get("key_formulas", [])):
             frm_id = _make_uuid("formula", doc_name, "key", str(i))
-            latex = kf.get("formula", "") or kf.get("expression", "")
+            latex = normalize_latex(kf.get("formula", "") or kf.get("expression", ""))
             if not latex:
                 continue
             # Prefer pre-computed unicode from OCR; fallback to converter
@@ -623,6 +633,8 @@ class GraphBuilder:
                FOR (t:Table) ON EACH [t.caption, t.content]""",
             """CREATE FULLTEXT INDEX formula_fulltext IF NOT EXISTS
                FOR (f:Formula) ON EACH [f.latex, f.unicode]""",
+            """CREATE FULLTEXT INDEX figure_fulltext IF NOT EXISTS
+               FOR (f:Figure) ON EACH [f.caption, f.description, f.annotation]""",
         ]
         for q in fulltext_indexes:
             try:

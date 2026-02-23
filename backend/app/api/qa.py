@@ -26,6 +26,7 @@ class AnswerResponse(BaseModel):
     """Question answer response"""
     answer: str
     tools_used: List[ToolUsed]
+    route: str = ""
 
 
 @router.post("/ask", response_model=AnswerResponse)
@@ -42,6 +43,7 @@ async def ask_question(request: QuestionRequest) -> AnswerResponse:
         return AnswerResponse(
             answer=result["answer"],
             tools_used=[ToolUsed(**t) for t in result.get("tools_used", [])],
+            route=result.get("route", ""),
         )
 
     except Exception as e:

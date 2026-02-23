@@ -270,6 +270,53 @@ def _apply_unicode_symbolics(text: str) -> str:
     return s.strip()
 
 
+def normalize_latex(expr: str) -> str:
+    r"""Normalize OCR-produced LaTeX by removing spurious spaces.
+
+    OCR engines commonly introduce spaces in wrong positions:
+    - Around subscript/superscript operators:  ``E _ {d}``  →  ``E_{d}``
+    - Between command name and brace:  ``\mathrm {Sd}``  →  ``\mathrm{Sd}``
+    - Between individual chars inside text commands (OCR splits words):
+      ``\text{r e p}`` → ``\text{rep}``,  ``\mathrm{S d}`` → ``\mathrm{Sd}``
+
+    Returns the cleaned expression; the input is never mutated.
+    """
+    if not expr or not expr.strip():
+        return expr
+
+    s = expr.strip()
+
+    # 1. Remove spaces around _ and ^ (subscript / superscript operators)
+    #    "E _ {d}"  →  "E_{d}"
+    s = re.sub(r"\s*([_^])\s*", r"\1", s)
+
+    # 2. Remove the space between a LaTeX command name and its opening brace
+    #    "\mathrm {d}"  →  "\mathrm{d}"
+    #    "\tag {6.2}"   →  "\tag{6.2}"
+    s = re.sub(r"(\\[a-zA-Z]+)\s+\{", r"\1{", s)
+
+    # 3. Collapse OCR-inserted spaces between individual characters inside
+    #    text-mode commands (\mathrm, \text, \mathbf, …).
+    #    Rule: remove a *single* space that sits between two adjacent
+    #    alphanumeric characters (digits or ASCII letters).
+    #    "S d" → "Sd",  "r e p" → "rep",  but "f, i" is left untouched.
+    _TEXT_CMDS = re.compile(
+        r"(\\(?:mathrm|text|mathbf|mathit|mathsf|mathtt|operatorname))\{([^}]+)\}"
+    )
+
+    def _collapse_chars(m: re.Match) -> str:
+        cmd, content = m.group(1), m.group(2)
+        content = re.sub(r"(?<=[A-Za-z0-9]) (?=[A-Za-z0-9])", "", content)
+        return f"{cmd}{{{content}}}"
+
+    s = _TEXT_CMDS.sub(_collapse_chars, s)
+
+    # 4. Collapse runs of multiple spaces down to a single space
+    s = re.sub(r"  +", " ", s)
+
+    return s
+
+
 def _fallback_convert(s: str) -> str:
     """Minimal LaTeX→Unicode without flatlatex (used as fallback)."""
     # Greek letters

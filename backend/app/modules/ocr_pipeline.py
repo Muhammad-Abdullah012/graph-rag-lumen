@@ -29,7 +29,7 @@ from mistralai.extra import response_format_from_pydantic_model
 from enum import Enum
 from pypdf import PdfReader, PdfWriter
 
-from backend.app.modules.latex_utils import latex_to_unicode
+from backend.app.modules.latex_utils import latex_to_unicode, normalize_latex
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +205,11 @@ def _make_md_parser():
         import mistune.plugins.math  # noqa: F401
         plugins.append("math")
     except ImportError:
-        pass
+        logger.error(
+            "mistune math plugin unavailable — formula blocks ($$...$$, $...$) "
+            "will NOT be parsed as math tokens and formulas will be lost. "
+            "Install mistune >= 3.0.2 to fix this."
+        )
 
     # renderer=None → returns token list instead of rendered HTML
     return mistune.create_markdown(renderer=None, plugins=plugins)
@@ -285,6 +289,20 @@ def _estimate_page(text: str, page_data: List[Dict[str, Any]]) -> int:
     return best
 
 
+# ---- annotation overlap helper -------------------------------------------
+
+def _overlaps(a: str, b: str) -> bool:
+    """Two-directional substring check for annotation deduplication.
+
+    Handles paraphrased or abbreviated OCR descriptions (e.g. bbox label vs.
+    in-text caption).  Returns True when either string is a substring of the
+    other, or when their first 20 chars match (prefix heuristic for long
+    strings).
+    """
+    d, c = a.lower().strip(), b.lower().strip()
+    return bool(d and c and (d in c or c in d or (len(d) > 20 and d[:20] in c)))
+
+
 # ---- main parser ---------------------------------------------------------
 
 def _parse_markdown_to_structured(
@@ -334,7 +352,7 @@ def _parse_markdown_to_structured(
         if current is None:
             return
         for p in pend_paras:
-            if len(p) > 20:
+            if len(p) >= 5:
                 current["paragraphs"].append(
                     {"text": p, "page": _estimate_page(p, page_data)}
                 )
@@ -389,7 +407,7 @@ def _parse_markdown_to_structured(
 
         # -- block math ( $$...$$ ) -------------------------------------------
         elif kind in ("block_math", "math_block"):
-            raw = token.get("raw", "").strip()
+            raw = normalize_latex(token.get("raw", "").strip())
             if raw:
                 pend_formulas.append({
                     "expression": raw,
@@ -400,8 +418,8 @@ def _parse_markdown_to_structured(
 
         # -- inline math (standalone token) -----------------------------------
         elif kind == "inline_math":
-            raw = token.get("raw", "").strip()
-            if raw and len(raw) > 3:
+            raw = normalize_latex(token.get("raw", "").strip())
+            if raw and len(raw) >= 1:
                 pend_formulas.append({
                     "expression": raw,
                     "unicode": latex_to_unicode(raw),
@@ -414,6 +432,7 @@ def _parse_markdown_to_structured(
             raw = token.get("raw", "").strip()
             info = (token.get("attrs") or {}).get("info", "")
             if info in ("math", "latex", "tex") and raw:
+                raw = normalize_latex(raw)
                 pend_formulas.append({
                     "expression": raw,
                     "unicode": latex_to_unicode(raw),
@@ -453,7 +472,7 @@ def _parse_markdown_to_structured(
     _flush()
     if current is not None:
         sections.append(current)
-    elif pend_paras or pend_tables:
+    elif pend_paras or pend_tables or pend_images or pend_formulas:
         # no headings at all
         fallback = _new_section("Inhalt", 1)
         current = fallback
@@ -488,8 +507,12 @@ def _parse_markdown_to_structured(
                 if not desc:
                     continue
                 atype = (ann.get("type") or ann.get("image_type") or "").lower()
+
                 if "table" in atype:
-                    if not any(desc == t.get("caption") or desc == t.get("text") for t in sec.get("tables", [])):
+                    if not any(
+                        _overlaps(desc, t.get("caption", "") or t.get("text", ""))
+                        for t in sec.get("tables", [])
+                    ):
                         sec.setdefault("tables", []).append({
                             "id": f"bbox_table_{len(sec.get('tables', []))+1}",
                             "text": desc,
@@ -499,7 +522,10 @@ def _parse_markdown_to_structured(
                             "type": atype or "table",
                         })
                 else:
-                    if not any(desc == i.get("description") for i in sec.get("images", [])):
+                    if not any(
+                        _overlaps(desc, i.get("description", ""))
+                        for i in sec.get("images", [])
+                    ):
                         sec.setdefault("images", []).append({
                             "id": f"bbox_img_{len(sec.get('images', []))+1}",
                             "description": desc,
@@ -512,7 +538,7 @@ def _parse_markdown_to_structured(
     all_formulas: List[Dict] = [
         {
             "name": f.get("context") or f["expression"][:80],
-            "formula": f["expression"],
+            "formula": normalize_latex(f["expression"]),
             "unicode": f.get("unicode", latex_to_unicode(f["expression"])),
             "variables": {},
         }
@@ -528,7 +554,7 @@ def _parse_markdown_to_structured(
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "chapters": chapters,
         "sections": sections,
-        "key_formulas": all_formulas[:50],
+        "key_formulas": all_formulas,
         "references": [],
         "full_markdown": full_markdown,
     }
