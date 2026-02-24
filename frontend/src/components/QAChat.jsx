@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -7,6 +7,23 @@ import 'katex/dist/katex.min.css';
 import './QAChat.css';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+/**
+ * Decode HTML entities that OCR/PDF extraction embeds inside LaTeX formulas.
+ * Without this, KaTeX throws "Expected '}', got '&'" on strings like
+ * \sum_{\mathrm{i} &gt; 1}  (should be >).
+ */
+function decodeLatexEntities(content) {
+  return content
+    .replace(/&gt;/g, '>')
+    .replace(/&lt;/g, '<')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&le;/g, '\\leq')
+    .replace(/&ge;/g, '\\geq')
+    .replace(/&ne;/g, '\\neq');
+}
 
 /**
  * Custom image renderer — resolves relative /api/images/... paths to the
@@ -28,10 +45,62 @@ function CustomImage({ src, alt, ...props }) {
   );
 }
 
+const MARKDOWN_PROPS = {
+  remarkPlugins: [remarkMath],
+  rehypePlugins: [[rehypeKatex, { throwOnError: false, strict: false }], rehypeRaw],
+  components: { img: CustomImage },
+};
+
+function AssistantMessage({ msg, streamStatus }) {
+  const isStreaming = msg.streaming;
+  const hasContent = Boolean(msg.content);
+
+  return (
+    <div className={`message assistant${isStreaming ? ' streaming' : ''}`}>
+      <div className="message-content">
+        {/* Show status pill while we have no tokens yet */}
+        {isStreaming && !hasContent && (
+          <div className="stream-status">
+            <span className="stream-status-dot" />
+            {streamStatus || 'Verbinde…'}
+          </div>
+        )}
+
+        {/* Render accumulated / final content */}
+        {hasContent && (
+          <ReactMarkdown {...MARKDOWN_PROPS}>
+            {decodeLatexEntities(msg.content)}
+          </ReactMarkdown>
+        )}
+
+        {/* Blinking cursor while tokens are still arriving */}
+        {isStreaming && hasContent && <span className="typing-cursor" />}
+      </div>
+
+      {/* Tool metadata — only after the response is complete */}
+      {!isStreaming && msg.tools_used && msg.tools_used.length > 0 && (
+        <div className="tools-info">
+          <details>
+            <summary>Agent used {msg.tools_used.length} tool(s)</summary>
+            <ul>
+              {msg.tools_used.map((tool, tidx) => (
+                <li key={tidx}>
+                  <strong>{tool.tool}</strong>({JSON.stringify(tool.arguments)})
+                </li>
+              ))}
+            </ul>
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function QAChat() {
   const [messages, setMessages] = useState([]);
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(false);
+  const [streamStatus, setStreamStatus] = useState('');
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -40,42 +109,110 @@ function QAChat() {
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages, streamStatus]);
+
+  /** Handle a single parsed SSE event from the stream. */
+  const handleStreamEvent = useCallback((event) => {
+    if (event.type === 'status') {
+      setStreamStatus(event.message);
+    } else if (event.type === 'token') {
+      // Append the token to the last (streaming) assistant message
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.streaming) {
+          return [
+            ...prev.slice(0, -1),
+            { ...last, content: last.content + event.content },
+          ];
+        }
+        return prev;
+      });
+    } else if (event.type === 'done') {
+      // Replace the streaming placeholder with the finalised, post-processed answer
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.streaming) {
+          return [
+            ...prev.slice(0, -1),
+            {
+              role: 'assistant',
+              content: event.answer,
+              tools_used: event.tools_used || [],
+              streaming: false,
+            },
+          ];
+        }
+        return prev;
+      });
+      setStreamStatus('');
+    }
+  }, []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!question.trim()) return;
+    if (!question.trim() || loading) return;
 
-    const userMessage = { role: 'user', content: question };
-    setMessages(prev => [...prev, userMessage]);
+    const currentQuestion = question;
+
+    // Immediately show user message + empty streaming placeholder
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', content: currentQuestion },
+      { role: 'assistant', content: '', streaming: true, tools_used: [] },
+    ]);
     setQuestion('');
     setLoading(true);
+    setStreamStatus('Verbinde…');
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/qa/ask`, {
+      const response = await fetch(`${API_BASE_URL}/api/qa/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question: currentQuestion }),
       });
 
-      if (!response.ok) throw new Error('Failed to get answer');
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
 
-      const data = await response.json();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      const assistantMessage = {
-        role: 'assistant',
-        content: data.answer,
-        tools_used: data.tools_used || [],
-      };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      setMessages(prev => [...prev, assistantMessage]);
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by \n\n; keep any incomplete trailing chunk
+        const blocks = buffer.split('\n\n');
+        buffer = blocks.pop() ?? '';
+
+        for (const block of blocks) {
+          for (const line of block.split('\n')) {
+            if (line.startsWith('data: ')) {
+              try {
+                handleStreamEvent(JSON.parse(line.slice(6)));
+              } catch {
+                // malformed JSON — skip
+              }
+            }
+          }
+        }
+      }
     } catch (error) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: `Fehler: ${error.message}`,
-      }]);
+      // Replace streaming placeholder with error message
+      setMessages((prev) => {
+        const msgs = [...prev];
+        const last = msgs[msgs.length - 1];
+        const errMsg = { role: 'assistant', content: `Fehler: ${error.message}`, streaming: false, tools_used: [] };
+        if (last?.streaming) {
+          return [...msgs.slice(0, -1), errMsg];
+        }
+        return [...msgs, errMsg];
+      });
     } finally {
       setLoading(false);
+      setStreamStatus('');
     }
   };
 
@@ -111,52 +248,15 @@ function QAChat() {
             </div>
           </div>
         ) : (
-          messages.map((msg, idx) => (
-            <div key={idx} className={`message ${msg.role}`}>
-              <div className="message-content">
-                {msg.role === 'assistant' ? (
-                  <ReactMarkdown
-                    remarkPlugins={[remarkMath]}
-                    rehypePlugins={[
-                      [rehypeKatex, { throwOnError: false, strict: false }],
-                      rehypeRaw,
-                    ]}
-                    components={{
-                      img: CustomImage,
-                    }}
-                  >
-                    {msg.content}
-                  </ReactMarkdown>
-                ) : (
-                  msg.content
-                )}
+          messages.map((msg, idx) =>
+            msg.role === 'assistant' ? (
+              <AssistantMessage key={idx} msg={msg} streamStatus={streamStatus} />
+            ) : (
+              <div key={idx} className="message user">
+                <div className="message-content">{msg.content}</div>
               </div>
-
-              {msg.role === 'assistant' && msg.tools_used && msg.tools_used.length > 0 && (
-                <div className="tools-info">
-                  <details>
-                    <summary>
-                      Agent used {msg.tools_used.length} tool(s)
-                    </summary>
-                    <ul>
-                      {msg.tools_used.map((tool, tidx) => (
-                        <li key={tidx}>
-                          <strong>{tool.tool}</strong>({JSON.stringify(tool.arguments)})
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                </div>
-              )}
-            </div>
-          ))
-        )}
-        {loading && (
-          <div className="message assistant">
-            <div className="typing-indicator">
-              <span></span><span></span><span></span>
-            </div>
-          </div>
+            )
+          )
         )}
         <div ref={messagesEndRef} />
       </div>
@@ -175,7 +275,7 @@ function QAChat() {
           disabled={loading || !question.trim()}
           className="chat-send-btn"
         >
-          {loading ? '...' : '➤'}
+          {loading ? '…' : '➤'}
         </button>
       </form>
     </div>

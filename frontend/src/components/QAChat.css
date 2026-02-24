@@ -303,6 +303,43 @@
   cursor: not-allowed;
 }
 
+/* ── Streaming state ─────────────────────────────────────────── */
+
+/* Status pill shown before tokens arrive */
+.stream-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #777;
+  font-size: 0.85rem;
+  padding: 0.4rem 0;
+}
+
+.stream-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #999;
+  flex-shrink: 0;
+  animation: typing 1.4s infinite;
+}
+
+/* Blinking cursor appended while tokens are streaming */
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: #555;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 0.8s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
 .tools-info {
   background: #f5f5f5;
   border-left: 3px solid #888;

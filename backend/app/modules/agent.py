@@ -604,6 +604,119 @@ class EurocodeAgent:
             settings.ollama_llm_model,
         )
 
+    async def astream_answer(self, question: str):
+        """Stream the agent's answer as an async generator of SSE-ready dicts.
+
+        Yields dicts with one of three shapes:
+          {"type": "status",  "step": str, "message": str}
+          {"type": "token",   "content": str}
+          {"type": "done",    "answer": str, "tools_used": list, "route": str}
+
+        The non-LLM steps (routing, graph search, ranking) emit status events
+        so the user sees progress instead of a blank loading screen.  The final
+        LLM call streams tokens directly, giving word-by-word output.
+        """
+        # ── Step 1: classify / route ─────────────────────────────────
+        yield {"type": "status", "step": "routing", "message": "Klassifiziere Anfrage…"}
+
+        route = "eurocode"
+        try:
+            resp = await self.llm.ainvoke([
+                SystemMessage(content=_ROUTER_SYSTEM),
+                HumanMessage(content=question.strip()),
+            ])
+            label = (resp.content if hasattr(resp, "content") else str(resp)).strip().lower()
+            if label.startswith("greeting"):
+                route = "greeting"
+        except Exception as e:
+            logger.warning("Router call failed in stream, defaulting to eurocode: %s", e)
+
+        # ── Greeting path ─────────────────────────────────────────────
+        if route == "greeting":
+            yield {"type": "status", "step": "greeting", "message": "Bereite Antwort vor…"}
+            full_answer = ""
+            try:
+                async for chunk in self.llm.astream([
+                    SystemMessage(content=GREETING_SYSTEM),
+                    HumanMessage(content=question),
+                ]):
+                    token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                    if token:
+                        full_answer += token
+                        yield {"type": "token", "content": token}
+            except Exception as e:
+                logger.error("Greeting stream failed: %s", e)
+                fallback = "Hallo! Wie kann ich Ihnen helfen?"
+                yield {"type": "token", "content": fallback}
+                full_answer = fallback
+            yield {"type": "done", "answer": full_answer, "tools_used": [], "route": "greeting"}
+            return
+
+        # ── Eurocode path ─────────────────────────────────────────────
+        # Step 2: graph search
+        yield {"type": "status", "step": "searching", "message": "Suche im Wissensgraphen…"}
+        tools_used: List[Dict[str, Any]] = []
+        raw: Dict[str, Any] = {}
+        try:
+            raw = self.querier.general_search(question)
+            tools_used.append({"tool": "graph_search", "arguments": {"query": question}})
+        except Exception as e:
+            logger.error("Graph search failed in stream: %s", e)
+            tools_used.append({"tool": "graph_search", "arguments": {"query": question}, "error": str(e)})
+
+        # Step 3: rank context
+        yield {"type": "status", "step": "ranking", "message": "Bewertet Suchergebnisse…"}
+        query_embedding: Optional[List[float]] = None
+        try:
+            query_embedding = get_ollama_client().generate_embedding(question)
+        except Exception:
+            pass
+
+        context = _rank_results(
+            query=question,
+            raw=raw,
+            query_embedding=query_embedding,
+            max_context_chars=20000,
+        )
+        tools_used.append({
+            "tool": "rank_context",
+            "arguments": {"top_items": context.count("["), "chars": len(context)},
+        })
+
+        # Step 4: stream LLM answer
+        yield {"type": "status", "step": "answering", "message": "Generiere Antwort…"}
+
+        user_prompt = (
+            f"KONTEXT AUS DEM WISSENSGRAPHEN:\n"
+            f"{'=' * 60}\n"
+            f"{context}\n"
+            f"{'=' * 60}\n\n"
+            f"WICHTIG: Deine Antwort MUSS ausschließlich auf dem obigen KONTEXT basieren.\n"
+            f"Kopiere alle relevanten Formeln GENAU wie im KONTEXT angegeben (in $$...$$).\n"
+            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n\n"
+            f"FRAGE: {question}"
+        )
+
+        full_answer = ""
+        try:
+            async for chunk in self.llm.astream([
+                SystemMessage(content=ANSWER_SYSTEM),
+                HumanMessage(content=user_prompt),
+            ]):
+                token = chunk.content if hasattr(chunk, "content") else str(chunk)
+                if token:
+                    full_answer += token
+                    yield {"type": "token", "content": token}
+        except Exception as e:
+            logger.error("Answer LLM stream failed: %s", e)
+            err = "Die Anfrage konnte aufgrund eines technischen Fehlers nicht verarbeitet werden."
+            yield {"type": "token", "content": err}
+            full_answer = err
+
+        # Step 5: post-process assembled answer and emit done
+        full_answer = _postprocess_latex(full_answer)
+        yield {"type": "done", "answer": full_answer, "tools_used": tools_used, "route": "eurocode"}
+
     async def aanswer(self, question: str) -> Dict[str, Any]:
         """Run the graph and return the final answer + metadata."""
         initial_state: AgentState = {
