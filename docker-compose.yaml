@@ -81,6 +81,8 @@ services:
       - ./documents:/documents
       - ./uploads:/app/uploads
       - ./logs:/app/logs
+      - ./backend/json:/app/backend/json
+      - ./backend/images:/app/backend/images
       - ./:/app
     ports:
       - "9000:8000"

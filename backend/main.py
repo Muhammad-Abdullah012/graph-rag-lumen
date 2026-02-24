@@ -1,6 +1,8 @@
 """Main FastAPI Application"""
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +13,10 @@ from backend.app.modules.database import get_neo4j_connection
 from backend.app.modules.graph_builder import get_graph_builder
 from config.settings import settings
 from config.logging_config import logger
+
+# Directory for OCR-extracted images
+IMAGES_DIR = str(Path(__file__).parent / "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 
 @asynccontextmanager
@@ -64,6 +70,13 @@ app.mount(
     "/documents",
     StaticFiles(directory=documents.DOCUMENTS_DIR),
     name="documents",
+)
+
+# Serve OCR-extracted images as static files
+app.mount(
+    "/api/images",
+    StaticFiles(directory=IMAGES_DIR),
+    name="images",
 )
 
 

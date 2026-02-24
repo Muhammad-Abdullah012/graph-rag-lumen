@@ -77,24 +77,44 @@ GREETING_SYSTEM = (
     "English → English). If the user writes in German, respond in German."
 )
 
-ANSWER_SYSTEM = (
-    "You are a Eurocode structural engineering expert. "
-    "Below is relevant context retrieved from a Graph-RAG knowledge graph "
-    "containing Documents, Chapters, Sections, Tables, Figures, Formulas, "
-    "and Concepts from Eurocode standards.\n\n"
-    "RULES:\n"
-    "1. Answer ONLY from the provided context. Do not invent information.\n"
-    "2. Match the user's language (German → German, English → English).\n"
-    "3. Cite the document name, section number, and page when possible.\n"
-    "4. All mathematical formulas MUST use LaTeX dollar-sign delimiters:\n"
-    "   - Inline: $...$\n"
-    "   - Display / standalone: $$...$$\n"
-    "   - NEVER use \\[...\\], \\(...\\), or bare LaTeX.\n"
-    "   - Greek letters and variables must also be wrapped: "
-    "$\\gamma_f$, $E_{\\mathrm{Ed}}$.\n"
-    "5. Synthesize a clear, direct answer — do NOT dump raw search results.\n"
-    "6. If the context does not contain the answer, say so honestly.\n"
-)
+ANSWER_SYSTEM = """You are a Eurocode structural engineering expert assistant.
+You have been given CONTEXT retrieved directly from official Eurocode documents.
+
+═══════════════════════════════════════════════════════════════
+CRITICAL RULES — YOU MUST FOLLOW THESE WITHOUT EXCEPTION:
+═══════════════════════════════════════════════════════════════
+
+RULE 1 — USE ONLY THE CONTEXT:
+  • Your answer MUST come EXCLUSIVELY from the provided CONTEXT.
+  • DO NOT use any knowledge from your training data.
+  • DO NOT invent, assume, or extrapolate ANY information.
+  • If the exact answer is in the CONTEXT, use it. If not, say "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+
+RULE 2 — COPY FORMULAS EXACTLY:
+  • Every formula in the CONTEXT appears as LaTeX (e.g. R_{\\mathrm{d}} = ...).
+  • Copy ALL relevant formulas VERBATIM from the CONTEXT — do NOT rewrite or simplify them.
+  • Wrap every formula with $$ for display: $$R_{\\mathrm{d}} = \\frac{1}{\\gamma_{\\mathrm{Rd}}} R\\left\\{...\\right\\}$$
+  • Wrap inline variables with $: the symbol $\\gamma_{\\mathrm{Rd}}$ represents...
+  • NEVER write a formula that does not appear in the CONTEXT.
+
+RULE 3 — INCLUDE ALL RELEVANT CONTENT:
+  • Include ALL formulas from the CONTEXT that are relevant to the question.
+  • Include table content if relevant.
+  • Include figure descriptions if relevant.
+  • Mention equation numbers like (6.6), (6.6a) etc. when present.
+
+RULE 4 — LANGUAGE:
+  • Match the user's language exactly (German question → German answer).
+  • Technical terms from the CONTEXT should be quoted verbatim.
+
+RULE 5 — CITATIONS:
+  • Always cite: document name, section number (e.g. Abschnitt 6.3.5), page number.
+
+RULE 6 — FORMAT:
+  • Structure the answer clearly with the main formula first, then variable definitions.
+  • Use numbered lists for multiple formulas or conditions.
+  • For variable definitions, use bullet points: $\\gamma_{\\mathrm{Rd}}$ — Teilsicherheitsbeiwert für...
+"""
 
 
 # ================================================================== #
@@ -155,40 +175,55 @@ def _format_item(category: str, item: Dict, rank: int) -> str:
     """Format a single result item for the LLM context."""
     doc = item.get("document", "")
     page = item.get("page", "")
-    ref = f" (Document: {doc}, Page: {page})" if doc else ""
+    ref = f" (Dokument: {doc}, Seite: {page})" if doc else ""
 
     if category in ("sections", "semantic"):
         title = item.get("title", "Unknown")
         content = item.get("content", item.get("preview", ""))
-        return f"[{rank}] Section: {title}{ref}\n{content}"
+        # Include formula LaTeX embedded in section (from enriched search)
+        formula_latex = item.get("formula_latex", [])
+        block = f"[{rank}] Abschnitt: {title}{ref}\n{content}"
+        if formula_latex:
+            formulas_str = "\n".join(
+                f"  $$  {lat}  $$"
+                for lat in formula_latex
+                if lat and lat.strip()
+            )
+            if formulas_str:
+                block += f"\n\nFormeln in diesem Abschnitt:\n{formulas_str}"
+        return block
 
     if category == "formulas":
         latex = item.get("latex", "")
         section = item.get("section", "")
-        return f"[{rank}] Formula in '{section}'{ref}\nLaTeX: $${latex}$$"
+        return f"[{rank}] Formel in Abschnitt '{section}'{ref}\nLaTeX: $${latex}$$"
 
     if category == "tables":
         caption = item.get("caption", "")
-        content = item.get("content", "")[:800]
-        return f"[{rank}] Table: {caption}{ref}\n{content}"
+        content = item.get("content", "")[:1200]
+        return f"[{rank}] Tabelle: {caption}{ref}\n{content}"
 
     if category == "concepts":
         name = item.get("concept", "")
         desc = item.get("description", "")
-        return f"[{rank}] Concept: {name} — {desc}"
+        return f"[{rank}] Konzept: {name} — {desc}"
 
     if category == "figures":
         caption    = item.get("caption", "")
         desc       = item.get("description", "")
         annotation = item.get("annotation", "")
+        image_path = item.get("image_path", "")
         body = desc
         if annotation and annotation.strip() and annotation.strip() != desc.strip():
             body = f"{desc}\nAnnotation: {annotation}".strip()
-        return f"[{rank}] Figure: {caption}{ref}\n{body}"
+        block = f"[{rank}] Abbildung: {caption}{ref}\n{body}"
+        if image_path:
+            block += f"\n![{caption}]({image_path})"
+        return block
 
     if category == "chapters":
         title = item.get("title", "")
-        return f"[{rank}] Chapter: {title}{ref}"
+        return f"[{rank}] Kapitel: {title}{ref}"
 
     # Fallback
     return f"[{rank}] {category}: {json.dumps(item, ensure_ascii=False, default=str)[:400]}"
@@ -198,7 +233,7 @@ def _rank_results(
     query: str,
     raw: Dict[str, List[Dict[str, Any]]],
     query_embedding: Optional[List[float]] = None,
-    max_context_chars: int = 12000,
+    max_context_chars: int = 20000,
 ) -> str:
     """Rank all search results by relevance and build a context string.
 
@@ -213,12 +248,11 @@ def _rank_results(
     *max_context_chars*.
     """
     # Detect query intent to rebalance category bonuses dynamically.
-    # This prevents sections from monopolising the context window when the
-    # user is specifically asking about a formula, figure, or table.
     q_lower = query.lower()
     is_formula = any(w in q_lower for w in (
         "formel", "formula", "gleichung", "berechnung", "berechnen",
         "equation", "calculate", r"\frac", r"\gamma", "latex",
+        "ausgedrückt", "ausdruck", "berechnet", "ermittelt",
     ))
     is_figure = any(w in q_lower for w in (
         "abbildung", "bild", "figure", "diagram", "grafik",
@@ -228,12 +262,13 @@ def _rank_results(
         "tabelle", "table", "wert", "werte", "values", "parameter",
     ))
 
+    # For formula-rich queries, heavily boost formulas and sections containing formulas
     CATEGORY_BONUS = {
-        "sections":  2.0,
-        "semantic":  1.8,
-        "formulas":  2.5 if is_formula else 1.5,
-        "tables":    2.0 if is_table   else 1.3,
-        "figures":   2.0 if is_figure  else 0.8,
+        "sections":  2.5,
+        "semantic":  2.0,
+        "formulas":  3.0 if is_formula else 2.0,
+        "tables":    2.5 if is_table   else 1.3,
+        "figures":   2.5 if is_figure  else 0.8,
         "concepts":  1.0,
         "chapters":  0.5,
     }
@@ -270,8 +305,11 @@ def _rank_results(
             if item_emb and isinstance(item_emb, list):
                 emb_score = _cosine_sim(query_embedding, item_emb)
 
+        # Extra boost for sections that have embedded formulas
+        formula_boost = 0.5 if (cat in ("sections", "semantic") and item.get("formula_latex")) else 0.0
+
         bonus = CATEGORY_BONUS.get(cat, 0.5)
-        combined = (bm * 1.0) + (neo_score * 1.5) + (emb_score * 2.0) + bonus
+        combined = (bm * 1.0) + (neo_score * 1.5) + (emb_score * 2.0) + bonus + formula_boost
         scored.append((combined, cat, item))
 
     # Sort descending by combined score
@@ -303,7 +341,7 @@ def _rank_results(
         parts.append(block)
         total_len += len(block)
 
-    return "\n\n".join(parts) if parts else "(No relevant results found in the knowledge graph.)"
+    return "\n\n".join(parts) if parts else "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
 
 
 # ================================================================== #
@@ -465,7 +503,7 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
             query=question,
             raw=raw,
             query_embedding=query_embedding,
-            max_context_chars=12000,
+            max_context_chars=20000,
         )
 
         tools_used = list(state.get("tools_used", []))
@@ -479,14 +517,17 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
     # ── Node: answer LLM ────────────────────────────────────────────
     def answer_llm(state: AgentState) -> AgentState:
         question = state["question"]
-        context = state.get("ranked_context", "") or "(No relevant results found in the knowledge graph.)"
+        context = state.get("ranked_context", "") or "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
 
         user_prompt = (
-            f"CONTEXT FROM KNOWLEDGE GRAPH:\n"
+            f"KONTEXT AUS DEM WISSENSGRAPHEN:\n"
             f"{'=' * 60}\n"
             f"{context}\n"
             f"{'=' * 60}\n\n"
-            f"USER QUESTION: {question}"
+            f"WICHTIG: Deine Antwort MUSS ausschließlich auf dem obigen KONTEXT basieren.\n"
+            f"Kopiere alle relevanten Formeln GENAU wie im KONTEXT angegeben (in $$...$$).\n"
+            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n\n"
+            f"FRAGE: {question}"
         )
 
         try:

@@ -8,9 +8,12 @@ pydantic-settings
 neo4j==5.14.0
 
 # LangChain + LangGraph (agent with native tool calling)
-langchain>=0.3.0
+langchain
 langchain-ollama>=0.2.0
-langgraph>=0.2.0
+langgraph
+
+# Async file I/O (streaming uploads)
+aiofiles>=23.0.0
 
 # HTTP Client
 requests==2.31.0
@@ -20,3 +23,27 @@ python-json-logger==2.0.7
 
 # Utilities
 python-dotenv==1.0.0
+python-multipart
+
+# Markdown parsing (OCR pipeline)
+mistune>=3.0.0
+
+# LaTeX to Unicode (formula conversion)
+flatlatex>=0.15
+pylatexenc>=2.10
+
+# PostgreSQL (processing status tracking)
+psycopg2-binary>=2.9.0
+
+# PDF chunking (OCR pipeline)
+pypdf>=3.0.0
+
+# Mistral OCR
+mistralai>=1.0.0
+
+# Mistral OCR
+mistralai
+
+# PDF Processing
+pypdf
+

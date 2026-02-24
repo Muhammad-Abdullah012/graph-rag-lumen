@@ -116,6 +116,41 @@ def _encode_pdf_base64(pdf_path: str) -> str:
 #  Mistral OCR
 # ---------------------------------------------------------------------------
 
+def _save_image_to_disk(
+    image_b64: str,
+    doc_stem: str,
+    page_num: int,
+    img_id: str,
+) -> Optional[str]:
+    """Save a base64-encoded image to backend/images/ and return the URL path.
+
+    Returns None if saving fails.
+    """
+    if not image_b64:
+        return None
+    try:
+        import re as _re
+        # Strip data URI prefix if present: "data:image/png;base64,..."
+        b64_data = _re.sub(r"^data:[^;]+;base64,", "", image_b64)
+        img_bytes = base64.b64decode(b64_data)
+
+        images_dir = Path(__file__).parent.parent.parent / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        # Sanitize img_id for use in filename
+        safe_id = _re.sub(r"[^a-zA-Z0-9_\-]", "_", img_id)[:40]
+        safe_doc = _re.sub(r"[^a-zA-Z0-9_\-]", "_", doc_stem)[:30]
+        filename = f"{safe_doc}_p{page_num}_{safe_id}.png"
+        file_path = images_dir / filename
+
+        file_path.write_bytes(img_bytes)
+        logger.debug("Saved image: %s (%d bytes)", file_path, len(img_bytes))
+        return f"/api/images/{filename}"
+    except Exception as e:
+        logger.warning("Failed to save image %s: %s", img_id, e)
+        return None
+
+
 def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, Any]]]:
     """Return *(combined_markdown, page_data_list)* for the PDF at *pdf_path*.
 
@@ -126,6 +161,9 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
 
     client = Mistral(api_key=api_key)
     chunk_paths = _split_pdf_into_chunks(pdf_path, chunk_size=80)
+
+    # Use the PDF stem for image filenames
+    doc_stem = Path(pdf_path).stem[:30]
 
     all_md: List[str] = []
     all_pages: List[Dict[str, Any]] = []
@@ -150,6 +188,7 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
             )
 
             for idx, page in enumerate(resp.pages):
+                page_num = global_offset + idx + 1
                 page_md = page.markdown
                 images_info: List[Dict[str, Any]] = []
                 annotations: List[Dict[str, Any]] = []
@@ -165,16 +204,37 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
 
                 if hasattr(page, "images") and page.images:
                     for img in page.images:
-                        desc = getattr(img, "description", "") or img.id
-                        images_info.append({"id": img.id, "description": desc})
-                        # Replace Markdown image syntax with a readable placeholder
-                        page_md = page_md.replace(
-                            f"![{img.id}]({img.id})",
-                            f"[Image: {desc}]",
+                        img_id = getattr(img, "id", f"img_{len(images_info)}")
+                        desc = getattr(img, "description", "") or img_id
+
+                        # Save base64 image to disk if available
+                        img_b64 = (
+                            getattr(img, "image_base64", None)
+                            or getattr(img, "base64", None)
+                            or getattr(img, "data", None)
                         )
+                        image_url = _save_image_to_disk(img_b64, doc_stem, page_num, img_id)
+
+                        images_info.append({
+                            "id": img_id,
+                            "description": desc,
+                            "image_url": image_url,
+                        })
+
+                        # Replace Markdown image syntax: embed URL if saved, else text
+                        if image_url:
+                            page_md = page_md.replace(
+                                f"![{img_id}]({img_id})",
+                                f"![{desc}]({image_url})",
+                            )
+                        else:
+                            page_md = page_md.replace(
+                                f"![{img_id}]({img_id})",
+                                f"[Abbildung: {desc}]",
+                            )
 
                 all_pages.append({
-                    "page_num": global_offset + idx + 1,
+                    "page_num": page_num,
                     "markdown": page_md,
                     "images": images_info,
                     "annotations": annotations,

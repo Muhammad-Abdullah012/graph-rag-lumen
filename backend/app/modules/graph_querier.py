@@ -143,16 +143,22 @@ class GraphQuerier:
     # ================================================================== #
 
     def search_sections(self, keyword: str, limit: int = 15) -> List[Dict[str, Any]]:
-        """Search sections by title / content via full-text index, fallback CONTAINS."""
+        """Search sections by title / content via full-text index, fallback CONTAINS.
+
+        Returns section content (4000 chars) plus all associated formula LaTeX
+        so the LLM sees the exact formulas belonging to each section.
+        """
         try:
             results = self.db.execute_query(
                 """CALL db.index.fulltext.queryNodes('section_fulltext', $query)
                    YIELD node, score
                    OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(node)
+                   OPTIONAL MATCH (node)-[:HAS_FORMULA]->(frm:Formula)
                    RETURN node.id AS id, node.title AS title,
-                          substring(node.full_text, 0, 1500) AS content,
+                          substring(node.full_text, 0, 4000) AS content,
                           node.start_page AS page,
-                          d.filename AS document, score
+                          d.filename AS document, score,
+                          collect(DISTINCT frm.latex) AS formula_latex
                    ORDER BY score DESC
                    LIMIT $limit""",
                 {"query": keyword, "limit": limit},
@@ -167,10 +173,12 @@ class GraphQuerier:
                WHERE toLower(s.title) CONTAINS toLower($kw)
                   OR toLower(s.full_text) CONTAINS toLower($kw)
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               OPTIONAL MATCH (s)-[:HAS_FORMULA]->(frm:Formula)
                RETURN s.id AS id, s.title AS title,
-                      substring(s.full_text, 0, 1500) AS content,
+                      substring(s.full_text, 0, 4000) AS content,
                       s.start_page AS page,
-                      d.filename AS document, 0.5 AS score
+                      d.filename AS document, 0.5 AS score,
+                      collect(DISTINCT frm.latex) AS formula_latex
                LIMIT $limit""",
             {"kw": keyword, "limit": limit},
         )
@@ -253,9 +261,14 @@ class GraphQuerier:
             """MATCH (c:Concept)<-[m:MENTIONS]-(s:Section)
                WHERE c.normalized_name = toLower($name) OR c.name = $name
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
-               RETURN s.title AS section, s.content_preview AS preview,
+               OPTIONAL MATCH (s)-[:HAS_FORMULA]->(frm:Formula)
+               RETURN s.title AS title,
+                      s.title AS section,
+                      substring(s.full_text, 0, 4000) AS content,
+                      s.content_preview AS preview,
                       m.confidence AS confidence, d.filename AS document,
-                      s.start_page AS page
+                      s.start_page AS page,
+                      collect(DISTINCT frm.latex) AS formula_latex
                ORDER BY m.confidence DESC""",
             {"name": concept_name},
         )
@@ -331,7 +344,7 @@ class GraphQuerier:
         )
 
     def search_figures(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search figures by caption / description."""
+        """Search figures by caption / description. Returns image_path for rendering."""
         try:
             from backend.app.modules.ollama_client import get_ollama_client
 
@@ -345,6 +358,7 @@ class GraphQuerier:
                        RETURN node.caption AS caption, node.description AS description,
                               node.annotation AS annotation, node.number AS number,
                               node.image_type AS image_type, node.embedding AS embedding,
+                              coalesce(node.image_path, '') AS image_path,
                               s.title AS section, d.filename AS document, score
                        ORDER BY score DESC
                        LIMIT $limit""",
@@ -365,6 +379,7 @@ class GraphQuerier:
                    RETURN node.caption AS caption, node.description AS description,
                           node.annotation AS annotation, node.number AS number,
                           node.image_type AS image_type,
+                          coalesce(node.image_path, '') AS image_path,
                           s.title AS section, d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
@@ -383,6 +398,7 @@ class GraphQuerier:
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                RETURN f.caption AS caption, f.description AS description,
                       f.number AS number, f.image_type AS image_type,
+                      coalesce(f.image_path, '') AS image_path,
                       s.title AS section, d.filename AS document
                LIMIT $limit""",
             {"kw": keyword, "limit": limit},
@@ -474,7 +490,9 @@ class GraphQuerier:
 
     def semantic_search(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
         """Semantic search over Section embeddings using the vector index.
-        Falls back to full-text search if vector index unavailable."""
+        Falls back to full-text search if vector index unavailable.
+        Includes associated formula LaTeX for each section.
+        """
         try:
             from backend.app.modules.ollama_client import get_ollama_client
             embedding = get_ollama_client().generate_embedding(query)
@@ -485,11 +503,13 @@ class GraphQuerier:
                            'section_embedding_index', $top_k, $embedding
                        ) YIELD node, score
                        OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(node)
+                       OPTIONAL MATCH (node)-[:HAS_FORMULA]->(frm:Formula)
                        RETURN node.title AS title,
-                              substring(node.full_text, 0, 1500) AS content,
+                              substring(node.full_text, 0, 4000) AS content,
                               node.start_page AS page,
                               d.filename AS document,
-                              score
+                              score,
+                              collect(DISTINCT frm.latex) AS formula_latex
                        ORDER BY score DESC""",
                     {"top_k": top_k, "embedding": embedding},
                 )
@@ -588,7 +608,7 @@ class GraphQuerier:
             results["figures"] = figures
 
         # ── Formulas ────────────────────────────────────────────────────
-        formulas = self.search_formulas(query, limit=5)
+        formulas = self.search_formulas(query, limit=10)
         if formulas:
             results["formulas"] = formulas
 

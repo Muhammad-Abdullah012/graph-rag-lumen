@@ -2,16 +2,37 @@ import React, { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import rehypeRaw from 'rehype-raw';
 import 'katex/dist/katex.min.css';
 import './QAChat.css';
+
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+/**
+ * Custom image renderer — resolves relative /api/images/... paths to the
+ * backend base URL so images load correctly regardless of where the frontend
+ * is hosted.
+ */
+function CustomImage({ src, alt, ...props }) {
+  const resolvedSrc =
+    src && src.startsWith('/api/')
+      ? `${API_BASE_URL}${src}`
+      : src;
+  return (
+    <img
+      src={resolvedSrc}
+      alt={alt || ''}
+      style={{ maxWidth: '100%', height: 'auto', margin: '8px 0', borderRadius: '4px' }}
+      {...props}
+    />
+  );
+}
 
 function QAChat() {
   const [messages, setMessages] = useState([]);
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(false);
   const messagesEndRef = useRef(null);
-
-  const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -51,7 +72,7 @@ function QAChat() {
     } catch (error) {
       setMessages(prev => [...prev, {
         role: 'assistant',
-        content: `Error: ${error.message}`,
+        content: `Fehler: ${error.message}`,
       }]);
     } finally {
       setLoading(false);
@@ -68,6 +89,9 @@ function QAChat() {
             <div className="example-questions">
               <h3>Beispielfragen:</h3>
               <ul>
+                <li onClick={() => setQuestion("Wie kann der Bemessungswert der Tragfähigkeit ausgedrückt werden?")}>
+                  "Wie kann der Bemessungswert der Tragfähigkeit ausgedrückt werden?"
+                </li>
                 <li onClick={() => setQuestion("Was bedeutet das Symbol γf?")}>
                   "Was bedeutet das Symbol γf?"
                 </li>
@@ -93,7 +117,13 @@ function QAChat() {
                 {msg.role === 'assistant' ? (
                   <ReactMarkdown
                     remarkPlugins={[remarkMath]}
-                    rehypePlugins={[rehypeKatex]}
+                    rehypePlugins={[
+                      [rehypeKatex, { throwOnError: false, strict: false }],
+                      rehypeRaw,
+                    ]}
+                    components={{
+                      img: CustomImage,
+                    }}
                   >
                     {msg.content}
                   </ReactMarkdown>

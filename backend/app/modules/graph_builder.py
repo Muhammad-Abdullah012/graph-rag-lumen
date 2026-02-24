@@ -328,11 +328,23 @@ class GraphBuilder:
             sec_number = _extract_section_number(sec_title) or sec_title[:30]
             sec_id = _make_uuid("section", doc_name, sec_title)
 
-            # Build full_text from paragraphs
+            # Build full_text from paragraphs + embedded formula LaTeX
+            # Formulas are appended verbatim so they are searchable and
+            # returned to the LLM as part of the section content.
             paragraphs = sec_data.get("paragraphs", [])
             full_text = " ".join(p.get("text", "") for p in paragraphs).strip()
             if not full_text:
                 full_text = sec_data.get("content", "")
+
+            # Append formula expressions so the LLM sees exact LaTeX in context
+            formula_parts: List[str] = []
+            for frm in sec_data.get("formulas", []):
+                expr = frm.get("expression", "") or frm.get("formula", "")
+                if expr and expr.strip():
+                    formula_parts.append(f"[Formel: {expr.strip()}]")
+            if formula_parts:
+                full_text = full_text + "\n" + "\n".join(formula_parts)
+
             content_preview = full_text[:500]
 
             # Skip heading-only stubs with no meaningful content or child elements
@@ -468,7 +480,8 @@ class GraphBuilder:
                            f.caption     = $caption,
                            f.description = $description,
                            f.image_type  = $image_type,
-                           f.annotation  = $annotation
+                           f.annotation  = $annotation,
+                           f.image_path  = $image_path
                        WITH f
                        MATCH (s:Section {id: $sid})
                        MERGE (s)-[:HAS_FIGURE]->(f)""",
@@ -479,6 +492,7 @@ class GraphBuilder:
                         "description": fig.get("description", ""),
                         "image_type": fig.get("type", "image"),
                         "annotation": fig.get("annotation", ""),
+                        "image_path": fig.get("image_url", ""),
                         "sid": sec_id,
                     },
                 )

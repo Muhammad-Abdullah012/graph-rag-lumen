@@ -5,10 +5,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+import aiofiles
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from config.settings import settings
+
+_CHUNK_SIZE = 1024 * 64  # 64 KB per read chunk
 
 logger = logging.getLogger(__name__)
 
@@ -54,28 +57,48 @@ class ProcessingStatusResponse(BaseModel):
 
 @router.post("/upload", response_model=DocumentUploadResponse)
 async def upload_document(file: UploadFile = File(...)) -> DocumentUploadResponse:
-    """Accept a PDF upload, store it, and start OCR pipeline in background."""
+    """Accept a PDF upload, store it, and start OCR pipeline in background.
+
+    The file is streamed directly to disk in 64 KB chunks — no full-file
+    buffering in RAM — so large PDFs upload quickly without blocking the
+    event loop.
+    """
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty")
-
-    if len(content) > settings.max_upload_size:
-        max_mb = round(settings.max_upload_size / (1024 * 1024))
-        raise HTTPException(status_code=413, detail=f"File too large. Maximum size: {max_mb} MB")
-
     safe_name = Path(file.filename).name
     stored_filename = f"{uuid.uuid4().hex}_{safe_name}"
     file_path = DOCUMENTS_DIR / stored_filename
-    file_path.write_bytes(content)
+
+    total_bytes = 0
+    max_bytes = settings.max_upload_size
+    max_mb = round(max_bytes / (1024 * 1024))
+
+    # Stream upload: write chunks directly to disk without loading into RAM
+    async with aiofiles.open(file_path, "wb") as out:
+        while True:
+            chunk = await file.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                await out.close()
+                file_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Maximum size: {max_mb} MB",
+                )
+            await out.write(chunk)
+
+    if total_bytes == 0:
+        file_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="The uploaded file is empty")
 
     uploaded_at = datetime.utcnow().isoformat() + "Z"
     url = f"/documents/{stored_filename}"
 
-    logger.info("Stored PDF upload at %s", file_path)
+    logger.info("Stored PDF upload at %s (%d bytes)", file_path, total_bytes)
 
     # Start OCR pipeline in background
     processing_started = False
@@ -91,7 +114,7 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentUploadRespons
         filename=safe_name,
         stored_filename=stored_filename,
         url=url,
-        size_bytes=len(content),
+        size_bytes=total_bytes,
         uploaded_at=uploaded_at,
         message="Document uploaded successfully"
         + (" — OCR processing started in background." if processing_started else ""),
