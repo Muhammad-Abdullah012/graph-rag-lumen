@@ -365,33 +365,44 @@ def _postprocess_latex(text: str) -> str:
     if not text:
         return text
 
-    # Convert \[...\] → $$...$$
-    text = re.sub(
-        r"\\\[\s*(.+?)\s*\\\]",
-        lambda m: f"$${m.group(1).strip()}$$",
-        text,
-        flags=re.S,
-    )
-    # Convert \(...\) → $...$
-    text = re.sub(
-        r"\\\(\s*(.+?)\s*\\\)",
-        lambda m: f"${m.group(1).strip()}$",
-        text,
-        flags=re.S,
-    )
+    # Don't touch anything already wrapped in $$...$$
+    # Split on existing $$-blocks, only process the non-math parts
+    parts = re.split(r'(\$\$[\s\S]*?\$\$)', text)
+    
+    processed = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            # This is already a $$...$$ block — leave it alone
+            processed.append(part)
+            continue
 
-    # Wrap lines that have LaTeX tokens but no dollar signs
-    lines = text.split("\n")
-    out: List[str] = []
-    for ln in lines:
-        stripped = ln.strip()
-        if stripped and "$" not in ln and _LATEX_MARKERS.search(ln):
-            out.append(f"$${stripped}$$")
-        else:
-            out.append(ln)
+        # Convert \[...\] → $$...$$
+        part = re.sub(
+            r"\\\[\s*(.+?)\s*\\\]",
+            lambda m: f"\n$${m.group(1).strip()}$$\n",
+            part,
+            flags=re.S,
+        )
+        # Convert \(...\) → $$...$$
+        part = re.sub(
+            r"\\\(\s*(.+?)\s*\\\)",
+            lambda m: f"\n$${m.group(1).strip()}$$\n",
+            part,
+            flags=re.S,
+        )
 
-    return "\n".join(out)
+        # Wrap lines that have LaTeX tokens but no dollar signs
+        lines = part.split("\n")
+        out: List[str] = []
+        for ln in lines:
+            stripped = ln.strip()
+            if stripped and "$" not in ln and _LATEX_MARKERS.search(ln):
+                out.append(f"$${stripped}$$")
+            else:
+                out.append(ln)
+        processed.append("\n".join(out))
 
+    return "".join(processed)
 
 # ================================================================== #
 #  Router classifier (fast, no LLM — keyword-based)
