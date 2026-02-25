@@ -44,6 +44,41 @@ def _make_uuid(*parts: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
 
 
+def _figure_fields(fig: dict) -> dict:
+    """Derive clean caption, description, and image_path from a raw figure dict.
+
+    The OCR pipeline sometimes stores the image URL in the `description` field
+    (when alt text is absent) and leaves `image_url` empty.  This helper
+    normalises the data so that:
+      • image_path  = actual /api/images/... URL
+      • caption     = human-readable text (annotation preferred)
+      • description = human-readable text (annotation preferred)
+    """
+    raw_desc = fig.get("description", "")
+    img_url  = fig.get("image_url", "")
+
+    # If description looks like a saved image URL, treat it as the image_path
+    if not img_url and raw_desc.startswith("/api/images/"):
+        img_url = raw_desc
+
+    annotation = fig.get("annotation", "")
+
+    # Human-readable text: prefer annotation, fall back to description
+    # (but never use a URL string as caption/description)
+    if raw_desc.startswith("/api/images/"):
+        human_text = annotation
+    else:
+        human_text = raw_desc
+
+    return {
+        "caption":     (human_text or annotation)[:200],
+        "description": human_text,
+        "image_type":  fig.get("type", "image"),
+        "annotation":  annotation,
+        "image_path":  img_url,
+    }
+
+
 def _detect_document_type(filename: str) -> str:
     lower = filename.lower()
     if "bem" in lower and "ing" in lower:
@@ -372,7 +407,8 @@ class GraphBuilder:
                        s.start_page      = $start_page,
                        s.end_page        = $end_page,
                        s.content_preview = $preview,
-                       s.full_text       = $full_text""",
+                       s.full_text       = $full_text,
+                       s.embedding       = null""",
                 {
                     "id": sec_id, "number": sec_number, "title": sec_title,
                     "level": sec_level, "start_page": start_page,
@@ -451,10 +487,12 @@ class GraphBuilder:
                 tbl_id = _make_uuid("table", doc_name, sec_title, str(i))
                 self.db.execute_query(
                     """MERGE (t:Table {id: $id})
-                       SET t.number  = $number,
-                           t.caption = $caption,
-                           t.content = $content,
-                           t.annotation = $annotation
+                       SET t.number        = $number,
+                           t.caption       = $caption,
+                           t.content       = $content,
+                           t.annotation    = $annotation,
+                           t.section_title = $section_title,
+                           t.embedding     = null
                        WITH t
                        MATCH (s:Section {id: $sid})
                        MERGE (s)-[:HAS_TABLE]->(t)""",
@@ -465,7 +503,8 @@ class GraphBuilder:
                         "content": (
                             tbl.get("text", "") or tbl.get("html", "")
                         )[:10000],
-                        "annotation": tbl.get("annotation", ""),
+                        "annotation":    tbl.get("annotation", ""),
+                        "section_title": sec_title,
                         "sid": sec_id,
                     },
                 )
@@ -481,18 +520,15 @@ class GraphBuilder:
                            f.description = $description,
                            f.image_type  = $image_type,
                            f.annotation  = $annotation,
-                           f.image_path  = $image_path
+                           f.image_path  = $image_path,
+                           f.embedding   = null
                        WITH f
                        MATCH (s:Section {id: $sid})
                        MERGE (s)-[:HAS_FIGURE]->(f)""",
                     {
                         "id": fig_id,
                         "number": fig.get("number", str(i + 1)),
-                        "caption": fig.get("description", "")[:200],
-                        "description": fig.get("description", ""),
-                        "image_type": fig.get("type", "image"),
-                        "annotation": fig.get("annotation", ""),
-                        "image_path": fig.get("image_url", ""),
+                        **_figure_fields(fig),
                         "sid": sec_id,
                     },
                 )
@@ -506,8 +542,10 @@ class GraphBuilder:
                 unicode_formula = frm.get("unicode") or latex_to_unicode(raw_latex)
                 self.db.execute_query(
                     """MERGE (f:Formula {id: $id})
-                       SET f.latex   = $latex,
-                           f.unicode = $unicode
+                       SET f.latex         = $latex,
+                           f.unicode       = $unicode,
+                           f.section_title = $section_title,
+                           f.embedding     = null
                        WITH f
                        MATCH (s:Section {id: $sid})
                        MERGE (s)-[:HAS_FORMULA]->(f)""",
@@ -515,6 +553,7 @@ class GraphBuilder:
                         "id": frm_id,
                         "latex": raw_latex,
                         "unicode": unicode_formula,
+                        "section_title": sec_title,
                         "sid": sec_id,
                     },
                 )
@@ -537,11 +576,14 @@ class GraphBuilder:
             if target_sec is None and section_map:
                 target_sec = next(iter(section_map))
 
+            key_sec_title = section_map.get(target_sec or "", {}).get("title", "") if section_map else ""
             self.db.execute_query(
                 """MERGE (f:Formula {id: $id})
-                   SET f.latex   = $latex,
-                       f.unicode = $unicode""",
-                {"id": frm_id, "latex": latex, "unicode": unicode_formula},
+                   SET f.latex         = $latex,
+                       f.unicode       = $unicode,
+                       f.section_title = $section_title,
+                       f.embedding     = null""",
+                {"id": frm_id, "latex": latex, "unicode": unicode_formula, "section_title": key_sec_title},
             )
             if target_sec:
                 self.db.execute_query(
@@ -644,9 +686,9 @@ class GraphBuilder:
             """CREATE FULLTEXT INDEX concept_fulltext IF NOT EXISTS
                FOR (c:Concept) ON EACH [c.name, c.description]""",
             """CREATE FULLTEXT INDEX table_fulltext IF NOT EXISTS
-               FOR (t:Table) ON EACH [t.caption, t.content]""",
+               FOR (t:Table) ON EACH [t.caption, t.content, t.section_title]""",
             """CREATE FULLTEXT INDEX formula_fulltext IF NOT EXISTS
-               FOR (f:Formula) ON EACH [f.latex, f.unicode]""",
+               FOR (f:Formula) ON EACH [f.latex, f.unicode, f.section_title]""",
             """CREATE FULLTEXT INDEX figure_fulltext IF NOT EXISTS
                FOR (f:Figure) ON EACH [f.caption, f.description, f.annotation]""",
         ]
@@ -822,11 +864,16 @@ class GraphBuilder:
 
         logger.info("Embedding %d sections …", len(sections))
         for sec in sections:
-            text = sec.get("text") or sec.get("title", "")
+            title = sec.get("title", "")
+            body  = sec.get("text", "") or ""
+            # Embed title prominently so short/long sections are found equally well.
+            # 8000 chars covers the vast majority of section content without
+            # hitting the embedding model's token limit (~8192 tokens).
+            text = f"{title}\n\n{body}".strip()
             if not text or len(text.strip()) < 10:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:2000])
+                emb = ollama.generate_embedding(text[:8000])
                 if emb:
                     self.db.execute_query(
                         """MATCH (s:Section {id: $id}) SET s.embedding = $emb""",
@@ -862,19 +909,26 @@ class GraphBuilder:
 
         # ── Embed Formulas ─────────────────────────────────────────────
         formulas = self.db.execute_query(
-            """MATCH (f:Formula)
+            """MATCH (s:Section)-[:HAS_FORMULA]->(f:Formula)
                WHERE f.embedding IS NULL
-               RETURN f.id AS id, coalesce(f.unicode, f.latex) AS text
+               RETURN f.id AS id,
+                      coalesce(f.unicode, f.latex) AS expr,
+                      coalesce(f.latex, '')         AS latex,
+                      s.title                       AS section_title
                LIMIT 2000""",
         )
 
         logger.info("Embedding %d formulas …", len(formulas))
         for frm in formulas:
-            text = frm.get("text", "")
+            # Embed section title + expression so the formula is findable by topic.
+            # Using unicode where available makes it more semantically readable.
+            sec_title = frm.get("section_title", "")
+            expr      = frm.get("expr", "") or frm.get("latex", "")
+            text = f"{sec_title}\n{expr}".strip() if sec_title else expr
             if len(text.strip()) < 3:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:2000])
+                emb = ollama.generate_embedding(text[:1000])
                 if emb:
                     self.db.execute_query(
                         """MATCH (f:Formula {id: $id}) SET f.embedding = $emb""",
@@ -886,23 +940,29 @@ class GraphBuilder:
 
         # ── Embed Tables ─────────────────────────────────────────────
         tables = self.db.execute_query(
-            """MATCH (t:Table)
+            """MATCH (s:Section)-[:HAS_TABLE]->(t:Table)
                WHERE t.embedding IS NULL
                RETURN t.id AS id,
                       t.caption AS caption,
                       t.content AS content,
-                      coalesce(t.annotation, "") AS annotation
+                      coalesce(t.annotation, "") AS annotation,
+                      s.title AS section_title
                LIMIT 2000""",
         )
 
         logger.info("Embedding %d tables …", len(tables))
         for tbl in tables:
-            text_parts = [tbl.get("caption", ""), tbl.get("content", ""), tbl.get("annotation", "")]
+            text_parts = [
+                tbl.get("section_title", ""),
+                tbl.get("caption", ""),
+                tbl.get("content", ""),
+                tbl.get("annotation", ""),
+            ]
             text = "\n".join(part for part in text_parts if part)
             if len(text.strip()) < 5:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:2000])
+                emb = ollama.generate_embedding(text[:4000])
                 if emb:
                     self.db.execute_query(
                         """MATCH (t:Table {id: $id}) SET t.embedding = $emb""",
@@ -914,23 +974,29 @@ class GraphBuilder:
 
         # ── Embed Figures ─────────────────────────────────────────---
         figures = self.db.execute_query(
-            """MATCH (f:Figure)
+            """MATCH (s:Section)-[:HAS_FIGURE]->(f:Figure)
                WHERE f.embedding IS NULL
                RETURN f.id AS id,
-                      f.caption AS caption,
+                      f.caption     AS caption,
                       f.description AS description,
-                      coalesce(f.annotation, "") AS annotation
+                      coalesce(f.annotation, "") AS annotation,
+                      s.title AS section_title
                LIMIT 2000""",
         )
 
         logger.info("Embedding %d figures …", len(figures))
         for fig in figures:
-            text_parts = [fig.get("caption", ""), fig.get("description", ""), fig.get("annotation", "")]
+            text_parts = [
+                fig.get("section_title", ""),
+                fig.get("caption", ""),
+                fig.get("description", ""),
+                fig.get("annotation", ""),
+            ]
             text = "\n".join(part for part in text_parts if part)
             if len(text.strip()) < 5:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:2000])
+                emb = ollama.generate_embedding(text[:1000])
                 if emb:
                     self.db.execute_query(
                         """MATCH (f:Figure {id: $id}) SET f.embedding = $emb""",

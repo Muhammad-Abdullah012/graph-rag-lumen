@@ -262,14 +262,15 @@ class GraphQuerier:
                WHERE c.normalized_name = toLower($name) OR c.name = $name
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                OPTIONAL MATCH (s)-[:HAS_FORMULA]->(frm:Formula)
-               RETURN s.title AS title,
+               RETURN s.id AS id, s.title AS title,
                       s.title AS section,
                       substring(s.full_text, 0, 4000) AS content,
                       s.content_preview AS preview,
                       m.confidence AS confidence, d.filename AS document,
                       s.start_page AS page,
                       collect(DISTINCT frm.latex) AS formula_latex
-               ORDER BY m.confidence DESC""",
+               ORDER BY m.confidence DESC
+               LIMIT 20""",
             {"name": concept_name},
         )
 
@@ -335,6 +336,7 @@ class GraphQuerier:
             """MATCH (s:Section)-[:HAS_TABLE]->(t:Table)
                WHERE toLower(t.caption) CONTAINS toLower($kw)
                   OR toLower(t.content) CONTAINS toLower($kw)
+                  OR toLower(coalesce(t.section_title, '')) CONTAINS toLower($kw)
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                RETURN t.caption AS caption, t.content AS content,
                       t.number AS number, s.title AS section,
@@ -420,6 +422,7 @@ class GraphQuerier:
                 results = self.db.execute_query(
                     """CALL db.index.vector.queryNodes('formula_embedding_index', $limit, $embedding)
                        YIELD node, score
+                       WITH node, max(score) AS score
                        MATCH (s:Section)-[:HAS_FORMULA]->(node)
                        OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                        RETURN node.latex AS latex,
@@ -441,6 +444,7 @@ class GraphQuerier:
             results = self.db.execute_query(
                 """CALL db.index.fulltext.queryNodes('formula_fulltext', $query)
                    YIELD node, score
+                   WITH node, max(score) AS score
                    MATCH (s:Section)-[:HAS_FORMULA]->(node)
                    OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                    RETURN node.latex AS latex,
@@ -461,7 +465,10 @@ class GraphQuerier:
             """MATCH (s:Section)-[:HAS_FORMULA]->(f:Formula)
                WHERE toLower(f.latex) CONTAINS toLower($kw)
                   OR toLower(f.unicode) CONTAINS toLower($kw)
+                  OR toLower(coalesce(f.section_title, '')) CONTAINS toLower($kw)
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               WITH f, s, d
+               ORDER BY f.id
                RETURN f.latex AS latex,
                       coalesce(f.unicode, f.latex) AS formula,
                       f.embedding AS embedding,
@@ -504,7 +511,7 @@ class GraphQuerier:
                        ) YIELD node, score
                        OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(node)
                        OPTIONAL MATCH (node)-[:HAS_FORMULA]->(frm:Formula)
-                       RETURN node.title AS title,
+                       RETURN node.id AS id, node.title AS title,
                               substring(node.full_text, 0, 4000) AS content,
                               node.start_page AS page,
                               d.filename AS document,
@@ -564,6 +571,32 @@ class GraphQuerier:
             {"id": section_id, "limit": limit},
         )
 
+    def get_figures_for_sections(
+        self, section_ids: List[str], limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Get Figure nodes linked to the given sections via HAS_FIGURE.
+
+        This is the primary figure retrieval path: find relevant sections
+        first (semantic/fulltext), then pull their attached images.
+        """
+        if not section_ids:
+            return []
+        return self.db.execute_query(
+            """UNWIND $ids AS sid
+               MATCH (s:Section {id: sid})-[:HAS_FIGURE]->(f:Figure)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               RETURN f.caption     AS caption,
+                      f.description AS description,
+                      f.annotation  AS annotation,
+                      f.number      AS number,
+                      f.image_type  AS image_type,
+                      coalesce(f.image_path, '') AS image_path,
+                      s.title       AS section,
+                      d.filename    AS document
+               LIMIT $limit""",
+            {"ids": section_ids, "limit": limit},
+        )
+
     # ================================================================== #
     #  7. GENERAL / BROAD SEARCH (combines everything)
     # ================================================================== #
@@ -602,11 +635,6 @@ class GraphQuerier:
         if tables:
             results["tables"] = tables
 
-        # ── Figures ─────────────────────────────────────────────────────
-        figures = self.search_figures(query, limit=5)
-        if figures:
-            results["figures"] = figures
-
         # ── Formulas ────────────────────────────────────────────────────
         formulas = self.search_formulas(query, limit=10)
         if formulas:
@@ -624,6 +652,16 @@ class GraphQuerier:
                     results["semantic"] = unique
         except Exception as e:
             logger.debug("Semantic search skipped in general_search: %s", e)
+
+        # ── Figures (via sections) ───────────────────────────────────────
+        # Collect IDs from the best-scoring sections (semantic first, then BM25).
+        # Images are retrieved by graph traversal (Section)-[:HAS_FIGURE]->(Figure)
+        # so accuracy depends only on section relevance, not on broken figure embeddings.
+        all_secs = results.get("semantic", []) + results.get("sections", [])
+        top_sec_ids = [s["id"] for s in all_secs if s.get("id")][:10]
+        figures = self.get_figures_for_sections(top_sec_ids, limit=10)
+        if figures:
+            results["figures"] = figures
 
         # ── Chapters ────────────────────────────────────────────────────
         chapters = self.list_chapters(query)

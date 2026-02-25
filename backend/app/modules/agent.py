@@ -37,8 +37,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 from collections import Counter
+from datetime import datetime
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -50,6 +52,26 @@ from backend.app.modules.ollama_client import get_ollama_client
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_LOG = os.path.join(os.path.dirname(__file__), "..", "..", "..", "debug_raw.jsonl")
+
+
+def _strip_embeddings(obj: Any) -> Any:
+    """Recursively remove 'embedding' keys (768-dim float lists) from search results."""
+    if isinstance(obj, dict):
+        return {k: _strip_embeddings(v) for k, v in obj.items() if k != "embedding"}
+    if isinstance(obj, list):
+        return [_strip_embeddings(v) for v in obj]
+    return obj
+
+
+def _write_debug(entry: Dict[str, Any]) -> None:
+    """Append one JSON line to the debug log file (best-effort, never raises)."""
+    try:
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        logger.debug("Debug log write failed: %s", exc)
 
 
 # ================================================================== #
@@ -114,6 +136,14 @@ RULE 6 — FORMAT:
   • Structure the answer clearly with the main formula first, then variable definitions.
   • Use numbered lists for multiple formulas or conditions.
   • For variable definitions, use bullet points: $\\gamma_{\\mathrm{Rd}}$ — Teilsicherheitsbeiwert für...
+
+RULE 7 — IMAGES (CRITICAL):
+  • NEVER invent, generate, or guess image URLs.
+  • Images are ONLY available if the CONTEXT contains a line like: ![caption](url)
+  • If the CONTEXT contains such image lines, copy them VERBATIM — do NOT change the URL.
+  • If the CONTEXT contains NO images (no `![...](...)`), respond: "Im bereitgestellten Kontext sind keine Abbildungen für dieses Thema verfügbar."
+  • DO NOT describe hypothetical images or suggest what an image "would look like".
+  • DO NOT use placeholder URLs like placehold.co, example.com, or any invented URL.
 """
 
 
@@ -229,6 +259,22 @@ def _format_item(category: str, item: Dict, rank: int) -> str:
     return f"[{rank}] {category}: {json.dumps(item, ensure_ascii=False, default=str)[:400]}"
 
 
+def _normalize_neo_score(score: float) -> float:
+    """Normalise a Neo4j-returned score to [0, 1].
+
+    Neo4j returns two very different score ranges depending on the search type:
+      • Vector similarity  (semantic_search)  → already in [0, 1]
+      • BM25 fulltext      (search_sections)  → can be 0 – 15+
+
+    Scores ≤ 1.0 are treated as already normalised.  Scores above 1 are BM25
+    and are normalised with a soft cap so a score of ~15 maps close to 1.0.
+    """
+    if score <= 1.0:
+        return score
+    # tanh-like soft normalisation: score=5 → 0.63, score=10 → 0.87, score=15 → 0.95
+    return 1.0 - math.exp(-score / 8.0)
+
+
 def _rank_results(
     query: str,
     raw: Dict[str, List[Dict[str, Any]]],
@@ -237,15 +283,14 @@ def _rank_results(
 ) -> str:
     """Rank all search results by relevance and build a context string.
 
-    Scoring strategy (per item):
-      • BM25 over the item's text   (lexical match)
-      • Cosine similarity if embeddings are available   (semantic match)
-      • Original score returned by Neo4j full-text index
-      • Category bonus  (query-aware: formula/figure/table queries boost their
-        respective categories so they are not crowded out by sections)
+    Scoring priority (highest → lowest):
+      1. Cosine similarity  (query embedding vs stored item embedding)
+      2. Neo4j score        (vector cosine for semantic results; normalised BM25 for fulltext)
+      3. Local BM25         (lexical match, normalised within the result set)
+      4. Category bonus     (query-aware: semantic > BM25 sections; formula/figure boosts)
 
-    Returns a formatted context string of the top items, truncated to
-    *max_context_chars*.
+    BM25 scores from Neo4j fulltext can be 0–15+, while cosine scores are 0–1.
+    All scores are normalised to [0, 1] before weighting so they are comparable.
     """
     # Detect query intent to rebalance category bonuses dynamically.
     q_lower = query.lower()
@@ -262,13 +307,14 @@ def _rank_results(
         "tabelle", "table", "wert", "werte", "values", "parameter",
     ))
 
-    # For formula-rich queries, heavily boost formulas and sections containing formulas
+    # Semantic results rank above BM25 sections — they are more reliable,
+    # especially for cross-language queries (English query, German documents).
     CATEGORY_BONUS = {
-        "sections":  2.5,
-        "semantic":  2.0,
-        "formulas":  3.0 if is_formula else 2.0,
+        "semantic":  3.0,                        # vector search — highest trust
+        "sections":  1.5,                        # BM25 fulltext — lower trust
+        "formulas":  3.5 if is_formula else 2.0,
         "tables":    2.5 if is_table   else 1.3,
-        "figures":   2.5 if is_figure  else 0.8,
+        "figures":   2.5 if is_figure  else 1.0,
         "concepts":  1.0,
         "chapters":  0.5,
     }
@@ -287,29 +333,41 @@ def _rank_results(
             all_texts.append(text)
             items_with_text.append((cat, item, text))
 
-    avg_dl = (sum(len(_tokenize(t)) for t in all_texts) / len(all_texts)) if all_texts else 100.0
+    if not items_with_text:
+        return "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
+
+    avg_dl = sum(len(_tokenize(t)) for t in all_texts) / len(all_texts)
+
+    # First pass: compute raw BM25 so we can normalise within the result set
+    raw_bm: List[float] = [
+        _bm25_score(query_tokens, text, avg_dl) for _, _, text in items_with_text
+    ]
+    max_bm = max(raw_bm) if raw_bm else 1.0
 
     scored: List[tuple] = []  # (score, category, item)
 
-    for cat, item, text in items_with_text:
-        # BM25
-        bm = _bm25_score(query_tokens, text, avg_dl)
+    for i, (cat, item, text) in enumerate(items_with_text):
+        # 1. Local BM25 (normalised to [0, 1])
+        bm_norm = raw_bm[i] / max(max_bm, 1e-9)
 
-        # Neo4j score (full-text or vector score already returned)
+        # 2. Neo4j score normalised to [0, 1]
         neo_score = float(item.get("score", 0) or 0)
+        neo_norm = _normalize_neo_score(neo_score)
 
-        # Embedding similarity (if available)
+        # 3. Cosine similarity against query embedding (stored embeddings on formulas/figures)
         emb_score = 0.0
         if query_embedding:
             item_emb = item.get("embedding")
             if item_emb and isinstance(item_emb, list):
                 emb_score = _cosine_sim(query_embedding, item_emb)
 
-        # Extra boost for sections that have embedded formulas
+        # Extra boost for sections that contain formula LaTeX
         formula_boost = 0.5 if (cat in ("sections", "semantic") and item.get("formula_latex")) else 0.0
 
         bonus = CATEGORY_BONUS.get(cat, 0.5)
-        combined = (bm * 1.0) + (neo_score * 1.5) + (emb_score * 2.0) + bonus + formula_boost
+
+        # Priority: cosine (4×) > neo normalised (2×) > local BM25 (0.5×)
+        combined = (emb_score * 4.0) + (neo_norm * 2.0) + (bm_norm * 0.5) + bonus + formula_boost
         scored.append((combined, cat, item))
 
     # Sort descending by combined score
@@ -537,7 +595,9 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
             f"{'=' * 60}\n\n"
             f"WICHTIG: Deine Antwort MUSS ausschließlich auf dem obigen KONTEXT basieren.\n"
             f"Kopiere alle relevanten Formeln GENAU wie im KONTEXT angegeben (in $$...$$).\n"
-            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n\n"
+            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n"
+            f"Zeige NUR Bilder, die im KONTEXT als ![...](url) erscheinen — erfinde KEINE Bild-URLs.\n"
+            f"Wenn keine Bilder im KONTEXT vorhanden sind, schreibe: 'Im bereitgestellten Kontext sind keine Abbildungen verfügbar.'\n\n"
             f"FRAGE: {question}"
         )
 
@@ -694,6 +754,14 @@ class EurocodeAgent:
             "arguments": {"top_items": context.count("["), "chars": len(context)},
         })
 
+        # ── Debug log: raw search results + ranked context ────────────
+        _write_debug({
+            "ts": datetime.utcnow().isoformat(),
+            "question": question,
+            "raw_results": _strip_embeddings(raw),
+            "ranked_context": context,
+        })
+
         # Step 4: stream LLM answer
         yield {"type": "status", "step": "answering", "message": "Generiere Antwort…"}
 
@@ -704,7 +772,9 @@ class EurocodeAgent:
             f"{'=' * 60}\n\n"
             f"WICHTIG: Deine Antwort MUSS ausschließlich auf dem obigen KONTEXT basieren.\n"
             f"Kopiere alle relevanten Formeln GENAU wie im KONTEXT angegeben (in $$...$$).\n"
-            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n\n"
+            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n"
+            f"Zeige NUR Bilder, die im KONTEXT als ![...](url) erscheinen — erfinde KEINE Bild-URLs.\n"
+            f"Wenn keine Bilder im KONTEXT vorhanden sind, schreibe: 'Im bereitgestellten Kontext sind keine Abbildungen verfügbar.'\n\n"
             f"FRAGE: {question}"
         )
 
@@ -726,6 +796,14 @@ class EurocodeAgent:
 
         # Step 5: post-process assembled answer and emit done
         full_answer = _postprocess_latex(full_answer)
+
+        # ── Debug log: final answer (for hallucination checking) ──────
+        _write_debug({
+            "ts": datetime.utcnow().isoformat(),
+            "question": question,
+            "final_answer": full_answer,
+        })
+
         yield {"type": "done", "answer": full_answer, "tools_used": tools_used, "route": "eurocode"}
 
     async def aanswer(self, question: str) -> Dict[str, Any]:
