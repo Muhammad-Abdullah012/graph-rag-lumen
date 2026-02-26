@@ -79,6 +79,73 @@ def _figure_fields(fig: dict) -> dict:
     }
 
 
+def _detect_chapter_type(ch: dict) -> str:
+    """Classify a chapter as table_of_contents, introductory, appendix, main_chapter, or other."""
+    title_lower = ch.get("title", "").lower()
+    number = ch.get("number", "")
+
+    toc_kws = ["inhaltsverzeichnis", "table of contents", "inhalt", "contents"]
+    intro_kws = [
+        "vorwort", "einleitung", "einführung", "vorbemerkung", "danksagung",
+        "preface", "foreword", "introduction", "acknowledgement", "abstract",
+        "zusammenfassung", "anmerkung",
+    ]
+    appendix_kws = ["anhang", "appendix", "anlage", "annex"]
+
+    if any(k in title_lower for k in toc_kws):
+        return "table_of_contents"
+    if any(k in title_lower for k in intro_kws):
+        return "introductory"
+    if any(k in title_lower for k in appendix_kws):
+        return "appendix"
+    if number and (
+        number.upper().startswith(("A.", "B.", "C.", "D.", "E.", "NA.", "NDP", "NCI"))
+        or (len(number) > 0 and not number[0].isdigit())
+    ):
+        return "appendix"
+    if number and number[0].isdigit():
+        return "main_chapter"
+    return "other"
+
+
+def _detect_volumes(chapters: List[Dict]) -> List[Dict]:
+    """Group chapters into volumes by scanning for volume-keyword headings.
+
+    If no volume headings are found, all chapters go into one default volume.
+    """
+    vol_kws = ["band ", "volume ", "teil ", "part ", "abschnitt ", "vol."]
+
+    volumes: List[Dict] = []
+    current_vol: Optional[Dict] = None
+
+    for ch in chapters:
+        title_lower = ch.get("title", "").lower()
+        is_vol_heading = any(kw in title_lower for kw in vol_kws)
+
+        if is_vol_heading:
+            if current_vol and current_vol["chapters"]:
+                volumes.append(current_vol)
+            current_vol = {
+                "title": ch["title"],
+                "number": str(len(volumes) + 1),
+                "chapters": [],
+            }
+        else:
+            if current_vol is None:
+                current_vol = {"title": "Inhalt", "number": "1", "chapters": []}
+            current_vol["chapters"].append(ch)
+
+    if current_vol and current_vol["chapters"]:
+        volumes.append(current_vol)
+
+    # Fallback: if nothing grouped, single default volume
+    if not volumes:
+        volumes = [{"title": "Inhalt", "number": "1", "chapters": chapters}]
+
+    return volumes
+
+
+
 def _detect_document_type(filename: str) -> str:
     lower = filename.lower()
     if "bem" in lower and "ing" in lower:
@@ -298,10 +365,22 @@ class GraphBuilder:
         )
         stats["documents"] = 1
 
-        # ── Page nodes (from OCR page_data) ─────────────────────────────
+        # ── Page nodes ───────────────────────────────────────────────────
+        # Use JSON "pages" field (set by OCR pipeline); fall back to raw page_data arg
         page_id_map: Dict[int, str] = {}
-        if page_data:
-            page_id_map = self._create_pages(doc_name, page_data)
+        pages_list = data.get("pages")
+        if not pages_list and page_data:
+            pages_list = [
+                {
+                    "page_num": pd["page_num"],
+                    "content": pd.get("markdown", ""),
+                    "header": pd.get("header", ""),
+                    "footer": pd.get("footer", ""),
+                }
+                for pd in page_data
+            ]
+        if pages_list:
+            page_id_map = self._create_pages(doc_name, pages_list)
             stats["pages"] = len(page_id_map)
 
         # ── Chapters ────────────────────────────────────────────────────
@@ -318,39 +397,42 @@ class GraphBuilder:
                 ],
             }]
 
-        for ch in raw_chapters:
-            ch_title = ch.get("title", "")
-            ch_number = ch.get("number", str(len(chapter_id_map) + 1))
-            ch_id = _make_uuid("chapter", doc_name, ch_number)
-            chapter_id_map[ch_number] = ch_id
+        volumes = _detect_volumes(raw_chapters)
+        for vol_data in volumes:
+            vol_id = self._create_volume(doc_id, vol_data)
+            stats["volumes"] += 1
 
-            ch_type = "chapter"
-            if re.match(r"^[A-Z]$", ch_number.strip()):
-                ch_type = "appendix"
-            elif ch_title.lower().startswith(("anhang", "annex", "appendix")):
-                ch_type = "appendix"
-            elif ch_title.lower().startswith(("vorwort", "foreword", "einleitung")):
-                ch_type = "front_matter"
+            for ch in vol_data["chapters"]:
+                ch_title = ch.get("title", "")
+                ch_number = ch.get("number", str(len(chapter_id_map) + 1))
+                ch_id = _make_uuid("chapter", doc_name, ch_number)
+                chapter_id_map[ch_number] = ch_id
 
-            self.db.execute_query(
-                """MERGE (ch:Chapter {id: $id})
-                   SET ch.number       = $number,
-                       ch.title        = $title,
-                       ch.chapter_type = $ch_type,
-                       ch.start_page   = $start_page,
-                       ch.end_page     = $end_page
-                   WITH ch
-                   MATCH (d:Document {id: $doc_id})
-                   MERGE (d)-[:HAS_CHAPTER]->(ch)""",
-                {
-                    "id": ch_id, "number": ch_number, "title": ch_title,
-                    "ch_type": ch_type,
-                    "start_page": ch.get("start_page", 0),
-                    "end_page": ch.get("end_page", 0),
-                    "doc_id": doc_id,
-                },
-            )
-            stats["chapters"] += 1
+                ch_type = _detect_chapter_type(ch)
+
+                self.db.execute_query(
+                    """MERGE (ch:Chapter {id: $id})
+                       SET ch.number       = $number,
+                           ch.title        = $title,
+                           ch.chapter_type = $ch_type,
+                           ch.start_page   = $start_page,
+                           ch.end_page     = $end_page
+                       WITH ch
+                       MATCH (d:Document {id: $doc_id})
+                       MERGE (d)-[:HAS_CHAPTER]->(ch)
+                       WITH ch
+                       MATCH (v:Volume {id: $vol_id})
+                       MERGE (v)-[:HAS_CHAPTER]->(ch)""",
+                    {
+                        "id": ch_id, "number": ch_number, "title": ch_title,
+                        "ch_type": ch_type,
+                        "start_page": ch.get("start_page", 0),
+                        "end_page": ch.get("end_page", 0),
+                        "doc_id": doc_id,
+                        "vol_id": vol_id,
+                    },
+                )
+                stats["chapters"] += 1
 
         # ── Sections ────────────────────────────────────────────────────
         section_map: Dict[str, Dict] = {}
@@ -607,6 +689,20 @@ class GraphBuilder:
     #  Page creation
     # ----------------------------------------------------------------- #
 
+    def _create_volume(self, doc_id: str, vol: dict) -> str:
+        """Create or update a Volume node and link it to the Document."""
+        vid = _make_uuid("volume", doc_id, vol["title"])
+        self.db.execute_query(
+            """MERGE (v:Volume {id: $id})
+               SET v.title  = $title,
+                   v.number = $number
+               WITH v
+               MATCH (d:Document {id: $doc_id})
+               MERGE (d)-[:HAS_VOLUME]->(v)""",
+            {"id": vid, "title": vol["title"], "number": vol["number"], "doc_id": doc_id},
+        )
+        return vid
+
     def _create_pages(
         self, doc_name: str, page_data: List[Dict[str, Any]],
     ) -> Dict[int, str]:
@@ -617,16 +713,28 @@ class GraphBuilder:
             pid = _make_uuid("page", doc_name, str(pnum))
             page_id_map[pnum] = pid
 
-            md_lines = pd.get("markdown", "").split("\n")
-            header = md_lines[0].strip()[:200] if md_lines else ""
-            footer = md_lines[-1].strip()[:200] if len(md_lines) > 1 else ""
+            # Support both "content" (new) and "markdown" (legacy OCR) keys
+            content = pd.get("content") or pd.get("markdown", "")
+            header = pd.get("header", "")
+            footer = pd.get("footer", "")
+            if not header and content:
+                header = content.split("\n")[0].strip()[:200]
+            if not footer and content:
+                lines = content.split("\n")
+                footer = lines[-1].strip()[:200] if len(lines) > 1 else ""
 
             self.db.execute_query(
                 """MERGE (p:Page {id: $id})
                    SET p.page_number = $pnum,
                        p.header      = $header,
-                       p.footer      = $footer""",
-                {"id": pid, "pnum": pnum, "header": header, "footer": footer},
+                       p.footer      = $footer,
+                       p.content     = $content,
+                       p.embedding   = null""",
+                {
+                    "id": pid, "pnum": pnum,
+                    "header": header, "footer": footer,
+                    "content": content[:50000],
+                },
             )
 
         # NEXT_PAGE chain
@@ -680,6 +788,12 @@ class GraphBuilder:
             except Exception as e:
                 logger.debug("Index may already exist: %s", e)
 
+        # Drop page_fulltext before recreating so the new 'content' field is indexed
+        try:
+            self.db.execute_query("DROP INDEX page_fulltext IF EXISTS")
+        except Exception:
+            pass
+
         fulltext_indexes = [
             """CREATE FULLTEXT INDEX section_fulltext IF NOT EXISTS
                FOR (s:Section) ON EACH [s.title, s.full_text, s.content_preview]""",
@@ -691,6 +805,8 @@ class GraphBuilder:
                FOR (f:Formula) ON EACH [f.latex, f.unicode, f.section_title]""",
             """CREATE FULLTEXT INDEX figure_fulltext IF NOT EXISTS
                FOR (f:Figure) ON EACH [f.caption, f.description, f.annotation]""",
+            """CREATE FULLTEXT INDEX page_fulltext IF NOT EXISTS
+               FOR (p:Page) ON EACH [p.content, p.header]""",
         ]
         for q in fulltext_indexes:
             try:
@@ -844,6 +960,12 @@ class GraphBuilder:
                }}""",
             """CREATE VECTOR INDEX figure_embedding_index IF NOT EXISTS
                FOR (f:Figure) ON (f.embedding)
+               OPTIONS {indexConfig: {
+                   `vector.dimensions`: 768,
+                   `vector.similarity_function`: 'cosine'
+               }}""",
+            """CREATE VECTOR INDEX page_embedding_index IF NOT EXISTS
+               FOR (p:Page) ON (p.embedding)
                OPTIONS {indexConfig: {
                    `vector.dimensions`: 768,
                    `vector.similarity_function`: 'cosine'
@@ -1006,7 +1128,42 @@ class GraphBuilder:
             except Exception as e:
                 logger.warning("Figure embedding failed %s: %s", fig["id"], e)
 
+        # ── Embed Pages ──────────────────────────────────────────────────
+        embedded += self._generate_page_embeddings(ollama)
+
         logger.info("Stored %d embeddings", embedded)
+        return embedded
+
+    def _generate_page_embeddings(self, ollama=None) -> int:
+        """Generate embeddings for Page nodes that have content but no embedding."""
+        if ollama is None:
+            from backend.app.modules.ollama_client import get_ollama_client
+            ollama = get_ollama_client()
+
+        pages = self.db.execute_query(
+            """MATCH (p:Page)
+               WHERE p.embedding IS NULL AND p.content IS NOT NULL AND p.content <> ''
+               RETURN p.id AS id, p.content AS content
+               LIMIT 2000""",
+        )
+
+        logger.info("Embedding %d pages …", len(pages))
+        embedded = 0
+        for pg in pages:
+            text = pg["content"][:8000]
+            if len(text.strip()) < 10:
+                continue
+            try:
+                emb = ollama.generate_embedding(text)
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (p:Page {id: $id}) SET p.embedding = $emb""",
+                        {"id": pg["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Page embedding failed %s: %s", pg["id"], e)
+
         return embedded
 
     # ----------------------------------------------------------------- #

@@ -598,6 +598,60 @@ class GraphQuerier:
         )
 
     # ================================================================== #
+    #  6b. PAGE SEARCH
+    # ================================================================== #
+
+    def search_pages(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Search pages by content via vector index, then fulltext fallback.
+
+        Returns page_number, content (4000 chars), chapter, document, score.
+        """
+        # Strategy 1: vector search
+        try:
+            from backend.app.modules.ollama_client import get_ollama_client
+            embedding = get_ollama_client().generate_embedding(query)
+            if embedding:
+                results = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes('page_embedding_index', $limit, $embedding)
+                       YIELD node, score
+                       OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
+                       OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+                       OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
+                       RETURN node.page_number AS page_number,
+                              substring(node.content, 0, 4000) AS content,
+                              node.header AS header,
+                              ch.title AS chapter, d.filename AS document, score,
+                              collect(DISTINCT s.title) AS section_titles
+                       ORDER BY score DESC""",
+                    {"limit": limit, "embedding": embedding},
+                )
+                if results:
+                    return results
+        except Exception as e:
+            logger.debug("Page vector search failed: %s", e)
+
+        # Strategy 2: fulltext search
+        try:
+            results = self.db.execute_query(
+                """CALL db.index.fulltext.queryNodes('page_fulltext', $query)
+                   YIELD node, score
+                   OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
+                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+                   RETURN node.page_number AS page_number,
+                          substring(node.content, 0, 4000) AS content,
+                          node.header AS header,
+                          ch.title AS chapter, d.filename AS document, score
+                   ORDER BY score DESC LIMIT $limit""",
+                {"query": query, "limit": limit},
+            )
+            if results:
+                return results
+        except Exception:
+            pass
+
+        return []
+
+    # ================================================================== #
     #  7. GENERAL / BROAD SEARCH (combines everything)
     # ================================================================== #
 
@@ -662,6 +716,11 @@ class GraphQuerier:
         figures = self.get_figures_for_sections(top_sec_ids, limit=10)
         if figures:
             results["figures"] = figures
+
+        # ── Pages (full-page semantic/fulltext search) ───────────────────
+        pages = self.search_pages(query, limit=5)
+        if pages:
+            results["pages"] = pages
 
         # ── Chapters ────────────────────────────────────────────────────
         chapters = self.list_chapters(query)

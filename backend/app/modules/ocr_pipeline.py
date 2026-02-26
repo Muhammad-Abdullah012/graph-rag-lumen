@@ -403,7 +403,6 @@ def _parse_markdown_to_structured(
         return {
             "section": title, "level": level, "content": "",
             "paragraphs": [], "tables": [], "images": [], "formulas": [],
-            "symbols": [], "definitions": [], "abbreviations": [], "units": [],
         }
 
     def _flush() -> None:
@@ -657,6 +656,17 @@ def process_document(pdf_path: str, filename: str) -> Dict[str, Any]:
         stem = Path(filename).stem
         json_path = json_dir / f"{stem}.json"
         md_path   = json_dir / f"{stem}.md"
+
+        # Add per-page OCR content for graph builder (page-level embeddings)
+        structured["pages"] = [
+            {
+                "page_num": pd["page_num"],
+                "content": pd.get("markdown", ""),
+                "header": pd.get("header", ""),
+                "footer": pd.get("footer", ""),
+            }
+            for pd in page_data
+        ]
 
         # Omit full_markdown from the JSON file (too large); save as .md separately
         json_data = {k: v for k, v in structured.items() if k != "full_markdown"}

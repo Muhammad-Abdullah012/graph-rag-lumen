@@ -251,6 +251,13 @@ def _format_item(category: str, item: Dict, rank: int) -> str:
             block += f"\n![{caption}]({image_path})"
         return block
 
+    if category == "pages":
+        page_num = item.get("page_number", "?")
+        content  = item.get("content", "")[:3000]
+        chapter  = item.get("chapter", "")
+        chapter_str = f" | Kapitel: {chapter}" if chapter else ""
+        return f"[{rank}] Seite {page_num}{chapter_str}{ref}\n{content}"
+
     if category == "chapters":
         title = item.get("title", "")
         return f"[{rank}] Kapitel: {title}{ref}"
@@ -311,6 +318,7 @@ def _rank_results(
     # especially for cross-language queries (English query, German documents).
     CATEGORY_BONUS = {
         "semantic":  3.0,                        # vector search — highest trust
+        "pages":     2.8,                        # page-level vector search — broad context
         "sections":  1.5,                        # BM25 fulltext — lower trust
         "formulas":  3.5 if is_formula else 2.0,
         "tables":    2.5 if is_table   else 1.3,
