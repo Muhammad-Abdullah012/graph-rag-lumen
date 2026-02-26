@@ -12,6 +12,7 @@ Supports
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from backend.app.modules.database import get_neo4j_connection
@@ -24,6 +25,18 @@ class GraphQuerier:
 
     def __init__(self):
         self.db = get_neo4j_connection()
+
+    @staticmethod
+    def _sanitize_lucene(query: str) -> str:
+        """Strip Lucene fulltext query special characters.
+
+        Characters like + - & | ! ( ) { } [ ] ^ " ~ * ? : \\ / are Lucene
+        operators that cause ParseException when present in natural-language
+        queries (e.g. "Gewölbe- und Betonbrücken" or "Φ2 und Φ3:").
+        We simply remove them so the index receives plain word tokens.
+        """
+        cleaned = re.sub(r'[+\-&|!(){}\[\]^"~*?:\\/]', ' ', query)
+        return ' '.join(cleaned.split()) or '*'
 
     # ================================================================== #
     #  1. STRUCTURAL NAVIGATION
@@ -161,7 +174,7 @@ class GraphQuerier:
                           collect(DISTINCT frm.latex) AS formula_latex
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": keyword, "limit": limit},
+                {"query": self._sanitize_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -237,7 +250,7 @@ class GraphQuerier:
                           node.normalized_name AS normalized_name, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": keyword, "limit": limit},
+                {"query": self._sanitize_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -303,7 +316,6 @@ class GraphQuerier:
                        OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                        RETURN node.caption AS caption, node.content AS content,
                               node.annotation AS annotation, node.number AS number,
-                              node.embedding AS embedding,
                               s.title AS section, d.filename AS document, score
                        ORDER BY score DESC
                        LIMIT $limit""",
@@ -325,7 +337,7 @@ class GraphQuerier:
                           d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": keyword, "limit": limit},
+                {"query": self._sanitize_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -359,7 +371,7 @@ class GraphQuerier:
                        OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                        RETURN node.caption AS caption, node.description AS description,
                               node.annotation AS annotation, node.number AS number,
-                              node.image_type AS image_type, node.embedding AS embedding,
+                              node.image_type AS image_type,
                               coalesce(node.image_path, '') AS image_path,
                               s.title AS section, d.filename AS document, score
                        ORDER BY score DESC
@@ -385,7 +397,7 @@ class GraphQuerier:
                           s.title AS section, d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": keyword, "limit": limit},
+                {"query": self._sanitize_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -427,7 +439,6 @@ class GraphQuerier:
                        OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                        RETURN node.latex AS latex,
                               coalesce(node.unicode, node.latex) AS formula,
-                              node.embedding AS embedding,
                               node.id AS id,
                               s.title AS section, d.filename AS document, score
                        ORDER BY score DESC
@@ -449,12 +460,11 @@ class GraphQuerier:
                    OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                    RETURN node.latex AS latex,
                           coalesce(node.unicode, node.latex) AS formula,
-                          node.embedding AS embedding,
                           node.id AS id,
                           s.title AS section, d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": keyword, "limit": limit},
+                {"query": self._sanitize_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -471,7 +481,6 @@ class GraphQuerier:
                ORDER BY f.id
                RETURN f.latex AS latex,
                       coalesce(f.unicode, f.latex) AS formula,
-                      f.embedding AS embedding,
                       f.id AS id,
                       s.title AS section, d.filename AS document
                LIMIT $limit""",
@@ -621,7 +630,8 @@ class GraphQuerier:
                               substring(node.content, 0, 4000) AS content,
                               node.header AS header,
                               ch.title AS chapter, d.filename AS document, score,
-                              collect(DISTINCT s.title) AS section_titles
+                              collect(DISTINCT s.title) AS section_titles,
+                              collect(DISTINCT s.id) AS section_ids
                        ORDER BY score DESC""",
                     {"limit": limit, "embedding": embedding},
                 )
@@ -637,12 +647,15 @@ class GraphQuerier:
                    YIELD node, score
                    OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
                    OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+                   OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
                    RETURN node.page_number AS page_number,
                           substring(node.content, 0, 4000) AS content,
                           node.header AS header,
-                          ch.title AS chapter, d.filename AS document, score
+                          ch.title AS chapter, d.filename AS document, score,
+                          collect(DISTINCT s.title) AS section_titles,
+                          collect(DISTINCT s.id) AS section_ids
                    ORDER BY score DESC LIMIT $limit""",
-                {"query": query, "limit": limit},
+                {"query": self._sanitize_lucene(query), "limit": limit},
             )
             if results:
                 return results
@@ -651,6 +664,71 @@ class GraphQuerier:
 
         return []
 
+    def get_sections_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
+        """Fetch full section content for a list of section IDs.
+
+        Used to materialise the sections that belong to the top-scoring pages
+        found during the page-first semantic search phase.
+        """
+        if not ids:
+            return []
+        return self.db.execute_query(
+            """UNWIND $ids AS sid
+               MATCH (s:Section {id: sid})
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               OPTIONAL MATCH (s)-[:HAS_FORMULA]->(frm:Formula)
+               RETURN s.id AS id, s.title AS title,
+                      substring(s.full_text, 0, 4000) AS content,
+                      s.start_page AS page,
+                      d.filename AS document,
+                      1.0 AS score,
+                      collect(DISTINCT frm.latex) AS formula_latex""",
+            {"ids": ids},
+        )
+
+    def get_tables_for_sections(
+        self, section_ids: List[str], limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """Get Table nodes attached to the given sections.
+
+        Used after page-first retrieval to narrow tables to only those that
+        belong to the already-identified relevant sections.
+        """
+        if not section_ids:
+            return []
+        return self.db.execute_query(
+            """UNWIND $ids AS sid
+               MATCH (s:Section {id: sid})-[:HAS_TABLE]->(t:Table)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               RETURN t.caption AS caption, t.content AS content,
+                      t.number AS number, s.title AS section,
+                      d.filename AS document, 1.0 AS score
+               LIMIT $limit""",
+            {"ids": section_ids, "limit": limit},
+        )
+
+    def get_formulas_for_sections(
+        self, section_ids: List[str], limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Get Formula nodes attached to the given sections.
+
+        Used after page-first retrieval to narrow formulas to only those that
+        belong to the already-identified relevant sections.
+        """
+        if not section_ids:
+            return []
+        return self.db.execute_query(
+            """UNWIND $ids AS sid
+               MATCH (s:Section {id: sid})-[:HAS_FORMULA]->(f:Formula)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
+               RETURN f.latex AS latex,
+                      coalesce(f.unicode, f.latex) AS formula,
+                      f.id AS id,
+                      s.title AS section, d.filename AS document, 1.0 AS score
+               LIMIT $limit""",
+            {"ids": section_ids, "limit": limit},
+        )
+
     # ================================================================== #
     #  7. GENERAL / BROAD SEARCH (combines everything)
     # ================================================================== #
@@ -658,71 +736,87 @@ class GraphQuerier:
     def general_search(self, query: str) -> Dict[str, List[Dict[str, Any]]]:
         """Broad search across every node type in the graph.
 
-        Returns a dict keyed by category: sections, concepts, tables,
-        figures, formulas, semantic, similar, chapters.
+        Search order (page-first narrowing strategy):
+          1. Semantic search on Pages  → identifies the most relevant pages
+          2. Extract section IDs from those pages
+          3. Fetch full Section content for those IDs  (high-quality, grounded)
+          4. Fetch Tables / Formulas / Figures from the same section IDs
+          5. Concept search + expansion (adds any concept-mentioned sections)
+          6. Chapter matching
+          Fallback: if no sections surface from pages, falls back to a direct
+          semantic section search so the system is never empty-handed.
+
+        Returns a dict keyed by category: pages, semantic, tables, formulas,
+        figures, concepts, chapters.
         """
         results: Dict[str, List] = {}
 
-        # ── Sections (full-text) ────────────────────────────────────────
-        secs = self.search_sections(query, limit=10)
-        if secs:
-            results["sections"] = secs
-
-        # ── Concepts ────────────────────────────────────────────────────
-        concepts = self.search_concepts(query, limit=10)
-        if concepts:
-            results["concepts"] = concepts
-
-        # Concept → Section expansion (full-text concepts)
-        for c in (concepts or [])[:3]:
-            cname = c.get("concept", "")
-            if cname:
-                csecs = self.get_concept_sections(cname)
-                if csecs:
-                    existing = {r.get("section", "") for r in results.get("sections", [])}
-                    for cs in csecs:
-                        if cs.get("section", "") not in existing:
-                            results.setdefault("sections", []).append(cs)
-
-        # ── Tables ──────────────────────────────────────────────────────
-        tables = self.search_tables(query, limit=5)
-        if tables:
-            results["tables"] = tables
-
-        # ── Formulas ────────────────────────────────────────────────────
-        formulas = self.search_formulas(query, limit=10)
-        if formulas:
-            results["formulas"] = formulas
-
-        # ── Semantic (vector) search ────────────────────────────────────
-        try:
-            semantic = self.semantic_search(query, top_k=8)
-            if semantic:
-                existing_titles = {
-                    r.get("title", "") for r in results.get("sections", [])
-                }
-                unique = [r for r in semantic if r.get("title", "") not in existing_titles]
-                if unique:
-                    results["semantic"] = unique
-        except Exception as e:
-            logger.debug("Semantic search skipped in general_search: %s", e)
-
-        # ── Figures (via sections) ───────────────────────────────────────
-        # Collect IDs from the best-scoring sections (semantic first, then BM25).
-        # Images are retrieved by graph traversal (Section)-[:HAS_FIGURE]->(Figure)
-        # so accuracy depends only on section relevance, not on broken figure embeddings.
-        all_secs = results.get("semantic", []) + results.get("sections", [])
-        top_sec_ids = [s["id"] for s in all_secs if s.get("id")][:10]
-        figures = self.get_figures_for_sections(top_sec_ids, limit=10)
-        if figures:
-            results["figures"] = figures
-
-        # ── Pages (full-page semantic/fulltext search) ───────────────────
-        pages = self.search_pages(query, limit=5)
+        # ── Step 1: Semantic page search ─────────────────────────────────
+        # Pages are the entry point — they carry full-page context and link
+        # directly to their child sections via HAS_SECTION.
+        pages = self.search_pages(query, limit=8)
         if pages:
             results["pages"] = pages
 
-        # ── Chapters ────────────────────────────────────────────────────
+        # ── Step 2: Collect section IDs from top pages ───────────────────
+        section_ids: List[str] = []
+        seen_ids: set = set()
+        for p in pages:
+            for sid in (p.get("section_ids") or []):
+                if sid and sid not in seen_ids:
+                    section_ids.append(sid)
+                    seen_ids.add(sid)
+
+        # ── Step 3: Fetch sections linked to those pages ─────────────────
+        if section_ids:
+            sections = self.get_sections_by_ids(section_ids)
+            if sections:
+                # Store under "semantic" key so the ranker awards the high
+                # semantic bonus (3.0) — these are page-grounded, high quality.
+                results["semantic"] = sections
+
+        # Fallback: if pages yielded no section links, do a direct vector
+        # search on sections so context is never empty.
+        if not results.get("semantic"):
+            try:
+                fallback_secs = self.semantic_search(query, top_k=8)
+                if fallback_secs:
+                    results["semantic"] = fallback_secs
+                    section_ids = [s["id"] for s in fallback_secs if s.get("id")]
+            except Exception as e:
+                logger.debug("Fallback semantic section search failed: %s", e)
+
+        # ── Step 4: Tables, Formulas, Figures — narrowed to page sections ─
+        if section_ids:
+            tables = self.get_tables_for_sections(section_ids, limit=5)
+            if tables:
+                results["tables"] = tables
+
+            formulas = self.get_formulas_for_sections(section_ids, limit=10)
+            if formulas:
+                results["formulas"] = formulas
+
+            figures = self.get_figures_for_sections(section_ids[:10], limit=10)
+            if figures:
+                results["figures"] = figures
+
+        # ── Step 5: Concept search + section expansion ───────────────────
+        concepts = self.search_concepts(query, limit=10)
+        if concepts:
+            results["concepts"] = concepts
+            existing_ids = set(section_ids)
+            for c in concepts[:3]:
+                cname = c.get("concept", "")
+                if cname:
+                    csecs = self.get_concept_sections(cname)
+                    if csecs:
+                        for cs in csecs:
+                            cid = cs.get("id", "")
+                            if cid and cid not in existing_ids:
+                                results.setdefault("semantic", []).append(cs)
+                                existing_ids.add(cid)
+
+        # ── Step 6: Chapters ─────────────────────────────────────────────
         chapters = self.list_chapters(query)
         if chapters:
             results["chapters"] = chapters[:10]
