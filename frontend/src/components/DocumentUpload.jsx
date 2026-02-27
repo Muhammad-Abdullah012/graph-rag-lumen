@@ -2,45 +2,45 @@ import React, { useState } from 'react';
 import './DocumentUpload.css';
 
 function DocumentUpload({ onUploadComplete }) {
-  const [file, setFile] = useState(null);
+  const [files, setFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
-  const [status, setStatus] = useState('');
-  const [uploadedDoc, setUploadedDoc] = useState(null);
+  const [fileStatuses, setFileStatuses] = useState({}); // filename → status string
 
   const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
   const handleFileSelect = (e) => {
-    const selectedFile = e.target.files?.[0];
-    if (!selectedFile) return;
+    const selected = Array.from(e.target.files || []);
+    const valid = [];
+    const errors = {};
 
-    if (!selectedFile.name.toLowerCase().endsWith('.pdf')) {
-      setStatus('Please select a PDF file');
-      return;
+    for (const f of selected) {
+      if (!f.name.toLowerCase().endsWith('.pdf')) {
+        errors[f.name] = 'Not a PDF';
+      } else if (f.size > 50 * 1024 * 1024) {
+        errors[f.name] = 'Too large (max 50 MB)';
+      } else {
+        valid.push(f);
+      }
     }
 
-    if (selectedFile.size > 50 * 1024 * 1024) {
-      setStatus('File too large (max 50MB)');
-      return;
-    }
-
-    setFile(selectedFile);
-    setStatus('');
-    setUploadedDoc(null);
+    setFiles(valid);
+    setFileStatuses(errors);
   };
 
   const handleUpload = async (e) => {
     e.preventDefault();
-    if (!file) {
-      setStatus('Please select a file first');
-      return;
-    }
+    if (files.length === 0) return;
 
     setUploading(true);
-    setStatus('Uploading...');
+
+    // Mark all valid files as pending
+    const pending = {};
+    files.forEach(f => { pending[f.name] = 'Uploading…'; });
+    setFileStatuses(pending);
 
     try {
       const formData = new FormData();
-      formData.append('file', file);
+      files.forEach(f => formData.append('files', f));
 
       const response = await fetch(`${API_BASE_URL}/api/documents/upload`, {
         method: 'POST',
@@ -49,34 +49,37 @@ function DocumentUpload({ onUploadComplete }) {
 
       if (!response.ok) {
         let detail = 'Upload failed';
-        try {
-          const errorBody = await response.json();
-          detail = errorBody.detail || detail;
-        } catch (err) {
-          // Ignore JSON parse errors, fall back to default message
-        }
+        try { detail = (await response.json()).detail || detail; } catch (_) {}
         throw new Error(detail);
       }
 
-      const data = await response.json();
-      setStatus('Upload complete');
-      setUploadedDoc(data);
-      setFile(null);
+      const results = await response.json(); // List[DocumentUploadResponse]
+      const statuses = {};
+      results.forEach(doc => {
+        statuses[doc.filename] = doc.message || 'Uploaded';
+      });
+      setFileStatuses(statuses);
+      setFiles([]);
 
       if (typeof onUploadComplete === 'function') {
         onUploadComplete();
       }
     } catch (error) {
-      setStatus(error.message || 'Upload failed');
+      const errStatuses = {};
+      files.forEach(f => { errStatuses[f.name] = error.message || 'Upload failed'; });
+      setFileStatuses(errStatuses);
     } finally {
       setUploading(false);
     }
   };
 
+  const hasFiles = files.length > 0;
+  const statusEntries = Object.entries(fileStatuses);
+
   return (
     <div className="document-upload">
       <h2>Upload PDF</h2>
-      <p className="description">Store your PDF so it can be used later.</p>
+      <p className="description">Select one or more PDF files to process and add to the knowledge graph.</p>
 
       <form onSubmit={handleUpload} className="upload-form">
         <div className="file-input-wrapper">
@@ -84,35 +87,31 @@ function DocumentUpload({ onUploadComplete }) {
             type="file"
             id="file-input"
             accept=".pdf"
+            multiple
             onChange={handleFileSelect}
             disabled={uploading}
           />
           <label htmlFor="file-input" className="file-label">
-            {file ? file.name : 'Choose a PDF file'}
+            {hasFiles
+              ? `${files.length} file${files.length > 1 ? 's' : ''} selected`
+              : 'Choose PDF file(s)'}
           </label>
         </div>
 
-        <button type="submit" className="btn-upload" disabled={!file || uploading}>
-          {uploading ? 'Uploading...' : 'Upload'}
+        <button type="submit" className="btn-upload" disabled={!hasFiles || uploading}>
+          {uploading ? 'Uploading…' : `Upload${files.length > 1 ? ` (${files.length})` : ''}`}
         </button>
       </form>
 
-      {status && <div className="status-message">{status}</div>}
-
-      {uploadedDoc && (
-        <div className="upload-info">
-          <h3>Stored file</h3>
-          <ul>
-            <li>Name: {uploadedDoc.filename}</li>
-            <li>Size: {(uploadedDoc.size_bytes / (1024 * 1024)).toFixed(2)} MB</li>
-            <li>
-              Link:{' '}
-              <a href={`${API_BASE_URL}${uploadedDoc.url}`} target="_blank" rel="noreferrer">
-                {uploadedDoc.url}
-              </a>
+      {statusEntries.length > 0 && (
+        <ul className="file-status-list">
+          {statusEntries.map(([name, msg]) => (
+            <li key={name}>
+              <span className="file-status-name">{name}</span>
+              <span className="file-status-msg">{msg}</span>
             </li>
-          </ul>
-        </div>
+          ))}
+        </ul>
       )}
     </div>
   );

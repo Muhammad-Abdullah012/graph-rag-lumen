@@ -36,10 +36,8 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import re
-from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -99,325 +97,57 @@ GREETING_SYSTEM = (
     "English → English). If the user writes in German, respond in German."
 )
 
-ANSWER_SYSTEM = """You are a Eurocode structural engineering expert assistant.
-You have been given CONTEXT retrieved directly from official Eurocode documents.
+ANSWER_SYSTEM = """You are a Eurocode structural engineering assistant.
+You are given CONTEXT pages retrieved from official Eurocode documents.
+Answer the user's question using ONLY what is in the CONTEXT.
 
-═══════════════════════════════════════════════════════════════
-CRITICAL RULES — YOU MUST FOLLOW THESE WITHOUT EXCEPTION:
-═══════════════════════════════════════════════════════════════
+FORMULAS:
+- In the CONTEXT, block formulas are wrapped in $$...$$ and inline variables in $...$.
+- When the user asks for a formula, find the relevant $$...$$ block(s) and copy the EXACT characters between and including the $$ markers — letter for letter, symbol for symbol.
+- The formula in your answer MUST be identical to the formula in the CONTEXT. Do not change notation, subscripts, operators, or structure in any way.
+- Do NOT rewrite, simplify, rearrange, or paraphrase any formula — not even slightly.
+- Do NOT write a formula that is not present in the CONTEXT.
 
-RULE 1 — USE ONLY THE CONTEXT:
-  • Your answer MUST come EXCLUSIVELY from the provided CONTEXT.
-  • DO NOT use any knowledge from your training data.
-  • DO NOT invent, assume, or extrapolate ANY information.
-  • If the exact answer is in the CONTEXT, use it. If not, say "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+IMAGES:
+- Images appear in the CONTEXT as ![caption](url). Copy them VERBATIM if relevant.
+- Do NOT invent image URLs.
 
-RULE 2 — COPY FORMULAS EXACTLY:
-  • Every formula in the CONTEXT appears as LaTeX (e.g. R_{\\mathrm{d}} = ...).
-  • Copy ALL relevant formulas VERBATIM from the CONTEXT — do NOT rewrite or simplify them.
-  • Wrap every formula with $$ for display: $$R_{\\mathrm{d}} = \\frac{1}{\\gamma_{\\mathrm{Rd}}} R\\left\\{...\\right\\}$$
-  • Wrap inline variables with $: the symbol $\\gamma_{\\mathrm{Rd}}$ represents...
-  • NEVER write a formula that does not appear in the CONTEXT.
+LANGUAGE:
+- Reply in the same language as the user's question.
 
-RULE 3 — INCLUDE ALL RELEVANT CONTENT:
-  • Include ALL formulas from the CONTEXT that are relevant to the question.
-  • Include table content if relevant.
-  • Include figure descriptions if relevant.
-  • Mention equation numbers like (6.6), (6.6a) etc. when present.
-
-RULE 4 — LANGUAGE:
-  • Match the user's language exactly (German question → German answer).
-  • Technical terms from the CONTEXT should be quoted verbatim.
-
-RULE 5 — CITATIONS:
-  • Always cite: document name, section number (e.g. Abschnitt 6.3.5), page number.
-
-RULE 6 — FORMAT:
-  • Structure the answer clearly with the main formula first, then variable definitions.
-  • Use numbered lists for multiple formulas or conditions.
-  • For variable definitions, use bullet points: $\\gamma_{\\mathrm{Rd}}$ — Teilsicherheitsbeiwert für...
-
-RULE 7 — IMAGES (CRITICAL):
-  • NEVER invent, generate, or guess image URLs.
-  • Images are ONLY available if the CONTEXT contains a line like: ![caption](url)
-  • If the CONTEXT contains such image lines, copy them VERBATIM — do NOT change the URL.
-  • If the CONTEXT contains NO images (no `![...](...)`), respond: "Im bereitgestellten Kontext sind keine Abbildungen für dieses Thema verfügbar."
-  • DO NOT describe hypothetical images or suggest what an image "would look like".
-  • DO NOT use placeholder URLs like placehold.co, example.com, or any invented URL.
-
-RULE 8 — SYMBOL AND FORMULA MATCHING:
-  • All mathematical symbols in the CONTEXT are written in LaTeX notation.
-  • Greek letters and their LaTeX equivalents:
-      Φ = \\Phi or \\varPhi,  φ = \\varphi,  γ = \\gamma,  α = \\alpha,  β = \\beta,
-      σ = \\sigma,  δ = \\delta,  ε = \\varepsilon,  ψ = \\psi,  ω = \\omega,
-      λ = \\lambda,  μ = \\mu,  ρ = \\rho,  η = \\eta,  τ = \\tau,  ξ = \\xi,
-      Δ = \\Delta,  Σ = \\Sigma,  Ω = \\Omega,  Γ = \\Gamma,  Θ = \\Theta.
-  • When the user writes a symbol like Φ2, γ_M, σ_R, match it against its LaTeX
-    form in the CONTEXT (\\varPhi_{2}, \\gamma_{\\mathrm{M}}, \\sigma_{\\mathrm{R}}).
-  • Identify formulas PRIMARILY by their equation label: \\tag{6.8} means "(6.8)".
-    Use the label AND the section title to confirm the match — do NOT reject a
-    formula just because the symbol notation differs between the question and context.
-  • Each formula item in the CONTEXT also shows "Symbol:" with a readable version.
-    Use this readable version to match user questions that contain Greek letters.
-  • NEVER declare information unavailable solely because of symbol notation differences.
+IF NOT IN CONTEXT:
+- If the answer is not in the CONTEXT, write only: "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+- Do NOT add values or explanations from your training data.
 """
 
 
 # ================================================================== #
-#  Result ranking helpers
+#  Context formatting
 # ================================================================== #
 
 
-def _tokenize(text: str) -> List[str]:
-    """Simple lowercased word tokenizer."""
-    return re.findall(r"[a-zäöüß0-9_\\]+", text.lower())
+def _format_pages_as_context(pages: List[Dict[str, Any]]) -> str:
+    """Format a list of pages as context for the LLM.
 
-
-def _bm25_score(
-    query_tokens: List[str],
-    doc_text: str,
-    avg_dl: float,
-    k1: float = 1.5,
-    b: float = 0.75,
-) -> float:
-    """Simplified single-document BM25 score (no IDF — we don't have the
-    full corpus stats, but query-term frequency in the doc is enough for
-    ranking a small candidate set)."""
-    doc_tokens = _tokenize(doc_text)
-    dl = len(doc_tokens)
-    if dl == 0:
-        return 0.0
-    tf = Counter(doc_tokens)
-    score = 0.0
-    for qt in query_tokens:
-        f = tf.get(qt, 0)
-        numerator = f * (k1 + 1)
-        denominator = f + k1 * (1 - b + b * dl / max(avg_dl, 1))
-        score += numerator / denominator if denominator else 0.0
-    return score
-
-
-def _item_text(item: Dict, category: str) -> str:
-    """Extract the main searchable text from an item."""
-    parts = []
-    for key in ("title", "content", "preview", "section", "caption",
-                "description", "concept", "latex", "formula"):
-        v = item.get(key)
-        if v and isinstance(v, str):
-            parts.append(v)
-    return " ".join(parts)
-
-
-def _format_item(category: str, item: Dict, rank: int) -> str:
-    """Format a single result item for the LLM context."""
-    doc = item.get("document", "")
-    page = item.get("page", "")
-    ref = f" (Dokument: {doc}, Seite: {page})" if doc else ""
-
-    if category in ("sections", "semantic"):
-        title = item.get("title", "Unknown")
-        content = item.get("content", item.get("preview", ""))
-        formula_latex = item.get("formula_latex", [])
-        block = f"[{rank}] Abschnitt: {title}{ref}\n{content}"
-        if formula_latex:
-            formula_lines = []
-            for lat in formula_latex:
-                if not lat or not lat.strip():
-                    continue
-                # Extract \tag{6.8} → visible label "Formel (6.8):" so the LLM
-                # can find formulas by equation number as well as by symbol.
-                tag_m = re.search(r'\\tag\{([^}]+)\}', lat)
-                label = f"Formel ({tag_m.group(1)}): " if tag_m else ""
-                formula_lines.append(f"  {label}$$  {lat}  $$")
-            if formula_lines:
-                block += "\n\nFormeln in diesem Abschnitt:\n" + "\n".join(formula_lines)
-        return block
-
-    if category == "formulas":
-        latex = item.get("latex", "")
-        # "formula" holds the unicode/readable version generated by latex_utils
-        formula = item.get("formula", "")
-        section = item.get("section", "")
-        tag_m = re.search(r'\\tag\{([^}]+)\}', latex)
-        tag_str = f" (Gleichung {tag_m.group(1)})" if tag_m else ""
-        block = f"[{rank}] Formel{tag_str} in Abschnitt '{section}'{ref}"
-        # Show readable unicode form so the LLM can match Greek letters from the question
-        if formula and formula.strip() and formula.strip() != latex.strip():
-            block += f"\nSymbol: {formula}"
-        block += f"\nLaTeX: $${latex}$$"
-        return block
-
-    if category == "tables":
-        caption = item.get("caption", "")
-        content = item.get("content", "")[:1200]
-        return f"[{rank}] Tabelle: {caption}{ref}\n{content}"
-
-    if category == "concepts":
-        name = item.get("concept", "")
-        desc = item.get("description", "")
-        return f"[{rank}] Konzept: {name} — {desc}"
-
-    if category == "figures":
-        caption    = item.get("caption", "")
-        desc       = item.get("description", "")
-        annotation = item.get("annotation", "")
-        image_path = item.get("image_path", "")
-        body = desc
-        if annotation and annotation.strip() and annotation.strip() != desc.strip():
-            body = f"{desc}\nAnnotation: {annotation}".strip()
-        block = f"[{rank}] Abbildung: {caption}{ref}\n{body}"
-        if image_path:
-            block += f"\n![{caption}]({image_path})"
-        return block
-
-    if category == "pages":
-        page_num = item.get("page_number", "?")
-        content  = item.get("content", "")[:3000]
-        chapter  = item.get("chapter", "")
-        chapter_str = f" | Kapitel: {chapter}" if chapter else ""
-        return f"[{rank}] Seite {page_num}{chapter_str}{ref}\n{content}"
-
-    if category == "chapters":
-        title = item.get("title", "")
-        return f"[{rank}] Kapitel: {title}{ref}"
-
-    # Fallback
-    return f"[{rank}] {category}: {json.dumps(item, ensure_ascii=False, default=str)[:400]}"
-
-
-def _normalize_neo_score(score: float) -> float:
-    """Normalise a Neo4j-returned score to [0, 1].
-
-    Neo4j returns two very different score ranges depending on the search type:
-      • Vector similarity  (semantic_search)  → already in [0, 1]
-      • BM25 fulltext      (search_sections)  → can be 0 – 15+
-
-    Scores ≤ 1.0 are treated as already normalised.  Scores above 1 are BM25
-    and are normalised with a soft cap so a score of ~15 maps close to 1.0.
+    Each page entry already contains the full OCR text of that page —
+    formulas, tables, and figures are all inline in the page content.
+    No separate lookup is needed.
     """
-    if score <= 1.0:
-        return score
-    # tanh-like soft normalisation: score=5 → 0.63, score=10 → 0.87, score=15 → 0.95
-    return 1.0 - math.exp(-score / 8.0)
+    if not pages:
+        return "(Keine relevanten Seiten im Wissensgraphen gefunden.)"
 
-
-def _rank_results(
-    query: str,
-    raw: Dict[str, List[Dict[str, Any]]],
-    max_context_chars: int = 20000,
-) -> str:
-    """Rank all search results by relevance and build a context string.
-
-    Scoring priority (highest → lowest):
-      1. Neo4j score   (vector cosine for semantic results; normalised BM25 for fulltext)
-      2. Local BM25    (lexical match, normalised within the result set)
-      3. Category bonus (query-aware: semantic > BM25 sections; formula/figure boosts)
-
-    BM25 scores from Neo4j fulltext can be 0–15+, while cosine scores are 0–1.
-    All scores are normalised to [0, 1] before weighting so they are comparable.
-    """
-    # Detect query intent to rebalance category bonuses dynamically.
-    q_lower = query.lower()
-    is_formula = any(w in q_lower for w in (
-        "formel", "formula", "gleichung", "berechnung", "berechnen",
-        "equation", "calculate", r"\frac", r"\gamma", "latex",
-        "ausgedrückt", "ausdruck", "berechnet", "ermittelt",
-    ))
-    is_figure = any(w in q_lower for w in (
-        "abbildung", "bild", "figure", "diagram", "grafik",
-        "diagramm", "querschnitt", "skizze", "chart",
-    ))
-    is_table = any(w in q_lower for w in (
-        "tabelle", "table", "wert", "werte", "values", "parameter",
-    ))
-
-    # Semantic results rank above BM25 sections — they are more reliable,
-    # especially for cross-language queries (English query, German documents).
-    CATEGORY_BONUS = {
-        "semantic":  3.0,                        # vector search — highest trust
-        "pages":     2.8,                        # page-level vector search — broad context
-        "sections":  1.5,                        # BM25 fulltext — lower trust
-        "formulas":  3.5 if is_formula else 2.0,
-        "tables":    2.5 if is_table   else 1.3,
-        "figures":   2.5 if is_figure  else 1.0,
-        "concepts":  1.0,
-        "chapters":  0.5,
-    }
-
-    query_tokens = _tokenize(query)
-
-    # Flatten every result category into a unified scored list
-    all_texts: List[str] = []
-    items_with_text: List[tuple] = []
-
-    for cat, items in raw.items():
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            text = _item_text(item, cat)
-            all_texts.append(text)
-            items_with_text.append((cat, item, text))
-
-    if not items_with_text:
-        return "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
-
-    avg_dl = sum(len(_tokenize(t)) for t in all_texts) / len(all_texts)
-
-    # First pass: compute raw BM25 so we can normalise within the result set
-    raw_bm: List[float] = [
-        _bm25_score(query_tokens, text, avg_dl) for _, _, text in items_with_text
-    ]
-    max_bm = max(raw_bm) if raw_bm else 1.0
-
-    scored: List[tuple] = []  # (score, category, item)
-
-    for i, (cat, item, text) in enumerate(items_with_text):
-        # 1. Local BM25 (normalised to [0, 1])
-        bm_norm = raw_bm[i] / max(max_bm, 1e-9)
-
-        # 2. Neo4j score normalised to [0, 1]
-        neo_score = float(item.get("score", 0) or 0)
-        neo_norm = _normalize_neo_score(neo_score)
-
-        # Extra boost for sections that contain formula LaTeX
-        formula_boost = 0.5 if (cat in ("sections", "semantic") and item.get("formula_latex")) else 0.0
-
-        bonus = CATEGORY_BONUS.get(cat, 0.5)
-
-        # Priority: neo normalised (2×) > local BM25 (0.5×) + category bonus
-        combined = (neo_norm * 2.0) + (bm_norm * 0.5) + bonus + formula_boost
-        scored.append((combined, cat, item))
-
-    # Sort descending by combined score
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # Deduplicate by title/section/caption
-    seen_keys: set = set()
-    unique: List[tuple] = []
-    for s, cat, item in scored:
-        key = (
-            item.get("title")
-            or item.get("section")
-            or item.get("caption")
-            or item.get("concept")
-            or item.get("latex", "")[:80]
-            or str(item)[:60]
-        )
-        if key not in seen_keys:
-            seen_keys.add(key)
-            unique.append((s, cat, item))
-
-    # Build context string
     parts: List[str] = []
-    total_len = 0
-    for rank, (score, cat, item) in enumerate(unique, 1):
-        block = _format_item(cat, item, rank)
-        if total_len + len(block) > max_context_chars:
-            break
-        parts.append(block)
-        total_len += len(block)
+    for i, page in enumerate(pages, 1):
+        page_num = page.get("page_number", "?")
+        chapter  = page.get("chapter", "")
+        doc      = page.get("document", "")
+        content  = page.get("content", "")
 
-    return "\n\n".join(parts) if parts else "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
+        ref      = f" (Dokument: {doc})" if doc else ""
+        chap_str = f" | {chapter}" if chapter else ""
+        parts.append(f"[{i}] Seite {page_num}{chap_str}{ref}\n{content}")
+
+    return "\n\n".join(parts)
 
 
 # ================================================================== #
@@ -499,9 +229,27 @@ _ROUTER_SYSTEM = (
 
 
 _TRANSLATE_SYSTEM = (
-    "You are a translator. Translate the following query into German. "
-    "If it is already in German, return it exactly as-is. "
-    "Return ONLY the German text — no explanation, no quotes, no labels."
+    "You are a technical translator specializing in structural engineering and Eurocodes. "
+    "Translate the following query into German using standard Eurocode terminology. "
+    "If the query is already in German, return it exactly as-is. "
+    "Return ONLY the German text — no explanation, no quotes, no labels.\n\n"
+    "Key Eurocode term mappings:\n"
+    "  design value → Bemessungswert\n"
+    "  characteristic value → charakteristischer Wert\n"
+    "  shear modulus → Schubmodul\n"
+    "  elastic modulus / modulus of elasticity → Elastizitätsmodul\n"
+    "  yield strength → Streckgrenze\n"
+    "  partial factor / partial safety factor → Teilsicherheitsbeiwert\n"
+    "  load combination → Lastkombination\n"
+    "  dynamic amplification factor → Schwingbeiwert\n"
+    "  steel → Stahl\n"
+    "  concrete → Beton\n"
+    "  bridge → Brücke\n"
+    "  material constant → Materialkonstante\n"
+    "  Poisson's ratio → Querdehnzahl\n"
+    "  coefficient of thermal expansion → Wärmeausdehnungskoeffizient\n"
+    "  density → Wichte / Rohdichte\n"
+    "  section → Abschnitt"
 )
 
 
@@ -597,13 +345,13 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         tools_used: List[Dict[str, Any]] = []
 
         try:
-            raw = querier.general_search(search_query)
-            tools_used.append({"tool": "graph_search", "arguments": {"query": search_query}})
+            pages = querier.search_pages(search_query, limit=8)
+            tools_used.append({"tool": "search_pages", "arguments": {"query": search_query}})
         except Exception as e:
-            logger.error("Graph search failed for '%s': %s", search_query[:80], e)
-            raw = {}
+            logger.error("Page search failed for '%s': %s", search_query[:80], e)
+            pages = []
             tools_used.append({
-                "tool": "graph_search",
+                "tool": "search_pages",
                 "arguments": {"query": search_query},
                 "error": str(e),
             })
@@ -611,21 +359,14 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         return {
             **state,
             "search_query": search_query,
-            "search_results": raw,
+            "search_results": pages,
             "tools_used": tools_used,
         }
 
-    # ── Node: rank & build context ───────────────────────────────────
+    # ── Node: build context ──────────────────────────────────────────
     def rank_context(state: AgentState) -> AgentState:
-        # Use the German search_query for BM25 token matching against German docs
-        search_query = state.get("search_query") or state["question"]
-        raw = state.get("search_results", {})
-
-        context = _rank_results(
-            query=search_query,
-            raw=raw,
-            max_context_chars=20000,
-        )
+        pages = state.get("search_results", [])
+        context = _format_pages_as_context(pages)
 
         tools_used = list(state.get("tools_used", []))
         tools_used.append({
@@ -640,18 +381,7 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         question = state["question"]
         context = state.get("ranked_context", "") or "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
 
-        user_prompt = (
-            f"KONTEXT AUS DEM WISSENSGRAPHEN:\n"
-            f"{'=' * 60}\n"
-            f"{context}\n"
-            f"{'=' * 60}\n\n"
-            f"WICHTIG: Deine Antwort MUSS ausschließlich auf dem obigen KONTEXT basieren.\n"
-            f"Kopiere alle relevanten Formeln GENAU wie im KONTEXT angegeben (in $$...$$).\n"
-            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n"
-            f"Zeige NUR Bilder, die im KONTEXT als ![...](url) erscheinen — erfinde KEINE Bild-URLs.\n"
-            f"Wenn keine Bilder im KONTEXT vorhanden sind, schreibe: 'Im bereitgestellten Kontext sind keine Abbildungen verfügbar.'\n\n"
-            f"FRAGE: {question}"
-        )
+        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION: {question}"
 
         try:
             messages = [
@@ -776,55 +506,41 @@ class EurocodeAgent:
             return
 
         # ── Eurocode path ─────────────────────────────────────────────
-        # Step 2: graph search
+        # Step 2: translate + search top 8 pages
         yield {"type": "status", "step": "searching", "message": "Suche im Wissensgraphen…"}
         search_query = await _atranslate_to_german(question, self.llm)
 
         tools_used: List[Dict[str, Any]] = []
-        raw: Dict[str, Any] = {}
+        pages: List[Dict[str, Any]] = []
         try:
-            raw = self.querier.general_search(search_query)
-            tools_used.append({"tool": "graph_search", "arguments": {"query": search_query}})
+            pages = self.querier.search_pages(search_query, limit=8)
+            tools_used.append({"tool": "search_pages", "arguments": {"query": search_query, "pages": len(pages)}})
         except Exception as e:
-            logger.error("Graph search failed in stream: %s", e)
-            tools_used.append({"tool": "graph_search", "arguments": {"query": search_query}, "error": str(e)})
+            logger.error("Page search failed in stream: %s", e)
+            tools_used.append({"tool": "search_pages", "arguments": {"query": search_query}, "error": str(e)})
 
-        # Step 3: rank context (use German search_query for BM25 token matching)
-        yield {"type": "status", "step": "ranking", "message": "Bewertet Suchergebnisse…"}
-        context = _rank_results(
-            query=search_query,
-            raw=raw,
-            max_context_chars=20000,
-        )
+        # Step 3: format pages as context
+        yield {"type": "status", "step": "ranking", "message": "Bereite Kontext vor…"}
+        context = _format_pages_as_context(pages)
         tools_used.append({
-            "tool": "rank_context",
-            "arguments": {"top_items": context.count("["), "chars": len(context)},
+            "tool": "build_context",
+            "arguments": {"pages": len(pages), "chars": len(context)},
         })
 
-        # ── Debug log: raw search results + ranked context ────────────
+        # ── Debug log ─────────────────────────────────────────────────
         _write_debug({
             "ts": datetime.utcnow().isoformat(),
             "question": question,
             "search_query": search_query,
-            "raw_results": _strip_embeddings(raw),
-            "ranked_context": context,
+            "pages_found": len(pages),
+            "page_titles": [f"p{p.get('page_number','?')} {p.get('chapter','')}" for p in pages],
+            "context": context,
         })
 
         # Step 4: stream LLM answer
         yield {"type": "status", "step": "answering", "message": "Generiere Antwort…"}
 
-        user_prompt = (
-            f"KONTEXT AUS DEM WISSENSGRAPHEN:\n"
-            f"{'=' * 60}\n"
-            f"{context}\n"
-            f"{'=' * 60}\n\n"
-            f"WICHTIG: Deine Antwort MUSS ausschließlich auf dem obigen KONTEXT basieren.\n"
-            f"Kopiere alle relevanten Formeln GENAU wie im KONTEXT angegeben (in $$...$$).\n"
-            f"Erfinde KEINE Formeln, die nicht im KONTEXT stehen.\n"
-            f"Zeige NUR Bilder, die im KONTEXT als ![...](url) erscheinen — erfinde KEINE Bild-URLs.\n"
-            f"Wenn keine Bilder im KONTEXT vorhanden sind, schreibe: 'Im bereitgestellten Kontext sind keine Abbildungen verfügbar.'\n\n"
-            f"FRAGE: {question}"
-        )
+        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION: {question}"
 
         full_answer = ""
         try:

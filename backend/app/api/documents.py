@@ -55,71 +55,81 @@ class ProcessingStatusResponse(BaseModel):
     stats: Optional[Dict[str, Any]] = None
 
 
-@router.post("/upload", response_model=DocumentUploadResponse)
-async def upload_document(file: UploadFile = File(...)) -> DocumentUploadResponse:
-    """Accept a PDF upload, store it, and start OCR pipeline in background.
+@router.post("/upload", response_model=List[DocumentUploadResponse])
+async def upload_document(files: List[UploadFile] = File(...)) -> List[DocumentUploadResponse]:
+    """Accept one or more PDF uploads, store them, and start OCR pipeline for each.
 
-    The file is streamed directly to disk in 64 KB chunks — no full-file
-    buffering in RAM — so large PDFs upload quickly without blocking the
-    event loop.
+    Files are streamed directly to disk in 64 KB chunks — no full-file
+    buffering in RAM.  All files in the batch are processed in order.
     """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
 
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-
-    safe_name = Path(file.filename).name
-    stored_filename = f"{uuid.uuid4().hex}_{safe_name}"
-    file_path = DOCUMENTS_DIR / stored_filename
-
-    total_bytes = 0
     max_bytes = settings.max_upload_size
     max_mb = round(max_bytes / (1024 * 1024))
+    results: List[DocumentUploadResponse] = []
 
-    # Stream upload: write chunks directly to disk without loading into RAM
-    async with aiofiles.open(file_path, "wb") as out:
-        while True:
-            chunk = await file.read(_CHUNK_SIZE)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            if total_bytes > max_bytes:
-                await out.close()
-                file_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large. Maximum size: {max_mb} MB",
-                )
-            await out.write(chunk)
-
-    if total_bytes == 0:
-        file_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="The uploaded file is empty")
-
-    uploaded_at = datetime.utcnow().isoformat() + "Z"
-    url = f"/documents/{stored_filename}"
-
-    logger.info("Stored PDF upload at %s (%d bytes)", file_path, total_bytes)
-
-    # Start OCR pipeline in background
-    processing_started = False
     try:
         from backend.app.modules.ocr_pipeline import process_document_background
-        process_document_background(str(file_path), stored_filename)
-        processing_started = True
-        logger.info("Started background OCR pipeline for %s", stored_filename)
     except Exception as e:
-        logger.warning("Could not start OCR pipeline: %s", e)
+        logger.warning("Could not import OCR pipeline: %s", e)
+        process_document_background = None
 
-    return DocumentUploadResponse(
-        filename=safe_name,
-        stored_filename=stored_filename,
-        url=url,
-        size_bytes=total_bytes,
-        uploaded_at=uploaded_at,
-        message="Document uploaded successfully"
-        + (" — OCR processing started in background." if processing_started else ""),
-        processing_started=processing_started,
-    )
+    for file in files:
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{file.filename}' is not a PDF file. Only PDF files are allowed.",
+            )
+
+        safe_name = Path(file.filename).name
+        stored_filename = f"{uuid.uuid4().hex}_{safe_name}"
+        file_path = DOCUMENTS_DIR / stored_filename
+
+        total_bytes = 0
+        async with aiofiles.open(file_path, "wb") as out:
+            while True:
+                chunk = await file.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    await out.close()
+                    file_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"'{safe_name}' is too large. Maximum size: {max_mb} MB",
+                    )
+                await out.write(chunk)
+
+        if total_bytes == 0:
+            file_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"'{safe_name}' is empty")
+
+        uploaded_at = datetime.utcnow().isoformat() + "Z"
+        url = f"/documents/{stored_filename}"
+        logger.info("Stored PDF upload at %s (%d bytes)", file_path, total_bytes)
+
+        processing_started = False
+        if process_document_background is not None:
+            try:
+                process_document_background(str(file_path), stored_filename)
+                processing_started = True
+                logger.info("Started background OCR pipeline for %s", stored_filename)
+            except Exception as e:
+                logger.warning("Could not start OCR pipeline for %s: %s", stored_filename, e)
+
+        results.append(DocumentUploadResponse(
+            filename=safe_name,
+            stored_filename=stored_filename,
+            url=url,
+            size_bytes=total_bytes,
+            uploaded_at=uploaded_at,
+            message="Uploaded" + (" — OCR processing started." if processing_started else ""),
+            processing_started=processing_started,
+        ))
+
+    return results
 
 
 @router.get("/processing-status", response_model=List[ProcessingStatusResponse])

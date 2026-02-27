@@ -142,3 +142,36 @@
   color: #666;
   font-size: 0.95rem;
 }
+
+.file-status-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 1rem;
+}
+
+.file-status-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  background: #f9f9f9;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  gap: 1rem;
+}
+
+.file-status-name {
+  color: #333;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60%;
+}
+
+.file-status-msg {
+  color: #666;
+  white-space: nowrap;
+}

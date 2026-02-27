@@ -610,59 +610,196 @@ class GraphQuerier:
     #  6b. PAGE SEARCH
     # ================================================================== #
 
-    def search_pages(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """Search pages by content via vector index, then fulltext fallback.
+    def _vector_search_pages(
+        self, embedding: list, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Vector similarity search on page embeddings.
 
-        Returns page_number, content (4000 chars), chapter, document, score.
+        Uses a WITH aggregation step to collapse the OPTIONAL MATCH fan-out
+        (a page linked to multiple chapters produces multiple rows without it).
+        Only returns pages with cosine similarity >= 0.4 to filter low-relevance noise.
+        Fetches limit*2 candidates so the RRF merge has enough to work with.
         """
-        # Strategy 1: vector search
+        return self.db.execute_query(
+            """CALL db.index.vector.queryNodes('page_embedding_index', $limit, $embedding)
+               YIELD node, score
+               WHERE node.content IS NOT NULL AND trim(node.content) <> ''
+                 AND score >= 0.4
+               OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+               OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
+               WITH node, score,
+                    collect(DISTINCT ch.title)[0]    AS chapter,
+                    collect(DISTINCT d.filename)[0]  AS document,
+                    collect(DISTINCT s.title)         AS section_titles,
+                    collect(DISTINCT s.id)            AS section_ids
+               RETURN node.id         AS page_id,
+                      node.page_number AS page_number,
+                      substring(node.content, 0, 8000) AS content,
+                      node.header      AS header,
+                      chapter, document, score,
+                      section_titles, section_ids
+               ORDER BY score DESC""",
+            {"limit": limit * 2, "embedding": embedding},
+        ) or []
+
+    def _fulltext_search_pages(
+        self, query: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        """BM25 fulltext search on page content.
+
+        Same WITH-aggregation fix as _vector_search_pages to prevent duplicate
+        rows for pages that belong to multiple chapters.
+        """
+        return self.db.execute_query(
+            """CALL db.index.fulltext.queryNodes('page_fulltext', $query)
+               YIELD node, score
+               WHERE node.content IS NOT NULL AND trim(node.content) <> ''
+               OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+               OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
+               WITH node, score,
+                    collect(DISTINCT ch.title)[0]    AS chapter,
+                    collect(DISTINCT d.filename)[0]  AS document,
+                    collect(DISTINCT s.title)         AS section_titles,
+                    collect(DISTINCT s.id)            AS section_ids
+               RETURN node.id         AS page_id,
+                      node.page_number AS page_number,
+                      substring(node.content, 0, 8000) AS content,
+                      node.header      AS header,
+                      chapter, document, score,
+                      section_titles, section_ids
+               ORDER BY score DESC LIMIT $limit""",
+            {"query": self._sanitize_lucene(query), "limit": limit * 2},
+        ) or []
+
+    @staticmethod
+    def _rrf_merge(
+        list_a: List[Dict[str, Any]],
+        list_b: List[Dict[str, Any]],
+        limit: int,
+        k: int = 60,
+    ) -> List[Dict[str, Any]]:
+        """Reciprocal Rank Fusion: merge two ranked page lists into one.
+
+        Pages that appear in both vector and fulltext results receive a higher
+        combined RRF score, naturally surfacing the most relevant pages.
+        Deduplication is by (page_number, document) key.
+        """
+        scores: Dict[tuple, Dict[str, Any]] = {}
+        for rank, page in enumerate(list_a):
+            key = (page.get("page_number"), page.get("document", ""))
+            scores[key] = {"page": page, "rrf": 1.0 / (k + rank + 1)}
+        for rank, page in enumerate(list_b):
+            key = (page.get("page_number"), page.get("document", ""))
+            if key in scores:
+                scores[key]["rrf"] += 1.0 / (k + rank + 1)
+            else:
+                scores[key] = {"page": page, "rrf": 1.0 / (k + rank + 1)}
+        sorted_items = sorted(scores.values(), key=lambda x: x["rrf"], reverse=True)
+        return [item["page"] for item in sorted_items[:limit]]
+
+    def _fetch_adjacent_pages(
+        self,
+        top_pages: List[Dict[str, Any]],
+        existing_keys: set,
+        max_extra: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Fetch the NEXT_PAGE neighbour for the top 3 results.
+
+        Tables extracted with table_format='markdown' often land on the page
+        immediately after the text that references them.  Fetching the next
+        page ensures those table pages are included even when their embedding
+        score is lower than the referencing page.
+
+        Uses the NEXT_PAGE relationship (built per-document during ingestion)
+        so adjacency is always within the same document.
+        """
+        if not top_pages:
+            return []
+        page_ids = [p["page_id"] for p in top_pages[:3] if p.get("page_id")]
+        if not page_ids:
+            return []
+
+        results = self.db.execute_query(
+            """UNWIND $ids AS pid
+               MATCH (p:Page {id: pid})-[:NEXT_PAGE]->(nxt:Page)
+               WHERE nxt.content IS NOT NULL AND trim(nxt.content) <> ''
+               OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(nxt)
+               OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+               WITH nxt,
+                    collect(DISTINCT ch.title)[0]   AS chapter,
+                    collect(DISTINCT d.filename)[0] AS document
+               RETURN nxt.id          AS page_id,
+                      nxt.page_number  AS page_number,
+                      substring(nxt.content, 0, 8000) AS content,
+                      nxt.header       AS header,
+                      chapter, document,
+                      0.0              AS score,
+                      []               AS section_titles,
+                      []               AS section_ids""",
+            {"ids": page_ids},
+        ) or []
+
+        unique: List[Dict[str, Any]] = []
+        for page in results:
+            key = (page.get("page_number"), page.get("document", ""))
+            if key not in existing_keys:
+                existing_keys.add(key)
+                unique.append(page)
+            if len(unique) >= max_extra:
+                break
+        return unique
+
+    def search_pages(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Hybrid page search: vector + fulltext merged with RRF, with adjacent pages.
+
+        Strategy:
+        1. Run vector similarity search (score >= 0.4 threshold).
+        2. Run BM25 fulltext search in parallel.
+        3. Merge both with Reciprocal Rank Fusion — pages in both lists score
+           higher; deduplication by (page_number, document) eliminates the
+           fan-out bug where one page appeared multiple times via different
+           chapter matches.
+        4. Fetch the NEXT_PAGE neighbour for the top-3 results (up to 2 extra)
+           to catch table pages that follow the referencing text page.
+        """
+        # Step 1: embed query
+        embedding = None
         try:
             from backend.app.modules.ollama_client import get_ollama_client
             embedding = get_ollama_client().generate_embedding(query)
-            if embedding:
-                results = self.db.execute_query(
-                    """CALL db.index.vector.queryNodes('page_embedding_index', $limit, $embedding)
-                       YIELD node, score
-                       OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
-                       OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
-                       OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
-                       RETURN node.page_number AS page_number,
-                              substring(node.content, 0, 4000) AS content,
-                              node.header AS header,
-                              ch.title AS chapter, d.filename AS document, score,
-                              collect(DISTINCT s.title) AS section_titles,
-                              collect(DISTINCT s.id) AS section_ids
-                       ORDER BY score DESC""",
-                    {"limit": limit, "embedding": embedding},
-                )
-                if results:
-                    return results
         except Exception as e:
-            logger.debug("Page vector search failed: %s", e)
+            logger.debug("Embedding failed: %s", e)
 
-        # Strategy 2: fulltext search
+        # Step 2: run both searches
+        vector_results: List[Dict[str, Any]] = []
+        if embedding:
+            try:
+                vector_results = self._vector_search_pages(embedding, limit)
+            except Exception as e:
+                logger.debug("Vector page search failed: %s", e)
+
+        fulltext_results: List[Dict[str, Any]] = []
         try:
-            results = self.db.execute_query(
-                """CALL db.index.fulltext.queryNodes('page_fulltext', $query)
-                   YIELD node, score
-                   OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
-                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
-                   OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
-                   RETURN node.page_number AS page_number,
-                          substring(node.content, 0, 4000) AS content,
-                          node.header AS header,
-                          ch.title AS chapter, d.filename AS document, score,
-                          collect(DISTINCT s.title) AS section_titles,
-                          collect(DISTINCT s.id) AS section_ids
-                   ORDER BY score DESC LIMIT $limit""",
-                {"query": self._sanitize_lucene(query), "limit": limit},
-            )
-            if results:
-                return results
-        except Exception:
-            pass
+            fulltext_results = self._fulltext_search_pages(query, limit)
+        except Exception as e:
+            logger.debug("Fulltext page search failed: %s", e)
 
-        return []
+        # Step 3: merge with RRF (handles deduplication)
+        merged = self._rrf_merge(vector_results, fulltext_results, limit)
+        if not merged:
+            return []
+
+        # Step 4: fetch adjacent pages for top 3 results
+        existing_keys = {
+            (p.get("page_number"), p.get("document", "")) for p in merged
+        }
+        adjacent = self._fetch_adjacent_pages(merged, existing_keys)
+        if adjacent:
+            merged.extend(adjacent)
+
+        return merged
 
     def get_sections_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         """Fetch full section content for a list of section IDs.
@@ -760,19 +897,27 @@ class GraphQuerier:
 
         # ── Step 2: Collect section IDs from top pages ───────────────────
         section_ids: List[str] = []
+        section_page_scores: Dict[str, float] = {}   # sid → real page score
         seen_ids: set = set()
         for p in pages:
+            page_score = float(p.get("score") or 0.5)
             for sid in (p.get("section_ids") or []):
                 if sid and sid not in seen_ids:
                     section_ids.append(sid)
+                    section_page_scores[sid] = page_score
                     seen_ids.add(sid)
 
         # ── Step 3: Fetch sections linked to those pages ─────────────────
         if section_ids:
             sections = self.get_sections_by_ids(section_ids)
             if sections:
-                # Store under "semantic" key so the ranker awards the high
-                # semantic bonus (3.0) — these are page-grounded, high quality.
+                # Replace the hardcoded 1.0 score with the actual page vector
+                # score so sections from highly-relevant pages rank higher than
+                # sections from tangentially-matching pages.
+                for s in sections:
+                    sid = s.get("id", "")
+                    if sid in section_page_scores:
+                        s["score"] = section_page_scores[sid]
                 results["semantic"] = sections
 
         # Fallback: if pages yielded no section links, do a direct vector

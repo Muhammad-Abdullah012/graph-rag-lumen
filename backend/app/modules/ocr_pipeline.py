@@ -184,7 +184,7 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
                 include_image_base64=True,
                 extract_header=True,
                 extract_footer=True,
-                table_format="html",
+                table_format="markdown",
             )
 
             for idx, page in enumerate(resp.pages):
