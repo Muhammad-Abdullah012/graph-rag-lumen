@@ -160,7 +160,7 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
     from mistralai import Mistral
 
     client = Mistral(api_key=api_key)
-    chunk_paths = _split_pdf_into_chunks(pdf_path, chunk_size=80)
+    chunk_paths = _split_pdf_into_chunks(pdf_path, chunk_size=40)
 
     # Use the PDF stem for image filenames
     doc_stem = Path(pdf_path).stem[:30]
