@@ -184,7 +184,7 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
                 include_image_base64=True,
                 extract_header=True,
                 extract_footer=True,
-                table_format="markdown",
+                table_format="html",
             )
 
             for idx, page in enumerate(resp.pages):
@@ -235,20 +235,14 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
 
                 # Inline table content — Mistral puts actual table data in
                 # page.tables and only emits [tbl-N.md](tbl-N.md) placeholders
-                # in page.markdown.  Replace each placeholder with the real content.
+                # in page.markdown.  The id field already includes the extension
+                # (e.g. "tbl-11.md"), so the placeholder is literally [{id}]({id}).
                 for tbl in getattr(page, "tables", []) or []:
                     tbl_id = getattr(tbl, "id", None)
-                    tbl_content = (
-                        getattr(tbl, "markdown", None)
-                        or getattr(tbl, "html", None)
-                        or ""
-                    )
+                    tbl_content = getattr(tbl, "content", None) or ""
                     if tbl_id and tbl_content:
                         page_md = page_md.replace(
-                            f"[{tbl_id}.md]({tbl_id}.md)", tbl_content
-                        )
-                        page_md = page_md.replace(
-                            f"[{tbl_id}.html]({tbl_id}.html)", tbl_content
+                            f"[{tbl_id}]({tbl_id})", tbl_content
                         )
 
                 all_pages.append({
