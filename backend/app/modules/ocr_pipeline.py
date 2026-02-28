@@ -233,6 +233,24 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
                                 f"[Abbildung: {desc}]",
                             )
 
+                # Inline table content — Mistral puts actual table data in
+                # page.tables and only emits [tbl-N.md](tbl-N.md) placeholders
+                # in page.markdown.  Replace each placeholder with the real content.
+                for tbl in getattr(page, "tables", []) or []:
+                    tbl_id = getattr(tbl, "id", None)
+                    tbl_content = (
+                        getattr(tbl, "markdown", None)
+                        or getattr(tbl, "html", None)
+                        or ""
+                    )
+                    if tbl_id and tbl_content:
+                        page_md = page_md.replace(
+                            f"[{tbl_id}.md]({tbl_id}.md)", tbl_content
+                        )
+                        page_md = page_md.replace(
+                            f"[{tbl_id}.html]({tbl_id}.html)", tbl_content
+                        )
+
                 all_pages.append({
                     "page_num": page_num,
                     "markdown": page_md,
