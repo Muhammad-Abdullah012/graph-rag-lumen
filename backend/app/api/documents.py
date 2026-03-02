@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 
 import aiofiles
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from config.settings import settings
@@ -189,3 +190,23 @@ async def list_documents() -> DocumentListResponse:
         )
 
     return DocumentListResponse(documents=documents)
+
+
+@router.get("/view/{filename}")
+async def view_document(filename: str) -> FileResponse:
+    """Serve a stored PDF with Content-Disposition: inline so the browser
+    opens it directly instead of downloading it.  Supports #page=N anchors
+    via the browser's native PDF viewer.
+    """
+    # Basic path traversal guard
+    file_path = (DOCUMENTS_DIR / filename).resolve()
+    if not str(file_path).startswith(str(DOCUMENTS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename=\"{filename}\""},
+    )

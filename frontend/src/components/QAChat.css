@@ -185,7 +185,7 @@
 
 .sources {
   background: #f9f9f9;
-  border-left: 4px solid #999;
+  border-left: 4px solid #bbb;
   padding: 0.75rem 1rem;
   border-radius: 4px;
   margin-top: 0.5rem;
@@ -193,35 +193,87 @@
 }
 
 .sources h4 {
-  margin-bottom: 0.5rem;
-  color: #333;
-  font-size: 0.9rem;
+  margin: 0 0 0.5rem;
+  color: #555;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
 }
 
 .sources ul {
   list-style: none;
-  gap: 0.5rem;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
 }
 
 .sources li {
-  padding: 0.25rem 0;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
+  line-height: 1.4;
 }
 
 .sources a {
-  color: #666;
+  color: #444;
   text-decoration: none;
+  border-bottom: 1px dotted #aaa;
 }
 
 .sources a:hover {
-  text-decoration: underline;
+  color: #111;
+  border-bottom-color: #555;
+}
+
+.source-name {
+  font-weight: 500;
+  color: #333;
 }
 
 .sources small {
   display: block;
   color: #999;
-  font-size: 0.8rem;
-  margin-top: 0.25rem;
+  font-size: 0.78rem;
+  margin-top: 0.1rem;
+  padding-left: 0.5rem;
+}
+
+.source-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.source-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.78rem;
+  color: #888;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.source-toggle:hover {
+  color: #444;
+}
+
+.source-preview {
+  margin: 0.4rem 0 0.2rem;
+  padding: 0.6rem 0.75rem;
+  background: #f0f0f0;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-family: monospace;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  color: #333;
 }
 
 .confidence {

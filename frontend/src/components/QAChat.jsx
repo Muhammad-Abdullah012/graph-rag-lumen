@@ -52,6 +52,60 @@ const MARKDOWN_PROPS = {
   components: { img: CustomImage },
 };
 
+/**
+ * Strip the MD5 hash prefix and .pdf extension from a stored filename.
+ * "47d7bca9_normen handbuch eurocode 8.pdf"  →  "normen handbuch eurocode 8"
+ */
+function cleanDocName(filename) {
+  return filename
+    .replace(/^[0-9a-f]{32}_/i, '')
+    .replace(/\.pdf$/i, '');
+}
+
+function SourceItem({ src, index }) {
+  const [open, setOpen] = useState(false);
+  const displayName = cleanDocName(src.document);
+  const href = `${API_BASE_URL}/api/documents/view/${encodeURIComponent(src.document)}#page=${src.page_number}`;
+
+  return (
+    <li>
+      <div className="source-header">
+        <a href={href} target="_blank" rel="noreferrer">
+          <span className="source-name">{displayName}</span>
+          {' '}— Seite {src.page_number}
+        </a>
+        {src.preview && (
+          <button
+            className="source-toggle"
+            onClick={() => setOpen((v) => !v)}
+            aria-label={open ? 'Vorschau schließen' : 'Vorschau öffnen'}
+          >
+            {open ? '▼' : '▶'} Vorschau
+          </button>
+        )}
+      </div>
+      {src.chapter && <small>{src.chapter}</small>}
+      {open && src.preview && (
+        <pre className="source-preview">{src.preview}</pre>
+      )}
+    </li>
+  );
+}
+
+function SourcesPanel({ sources }) {
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="sources">
+      <h4>Quellen / Sources</h4>
+      <ul>
+        {sources.map((src, i) => (
+          <SourceItem key={i} src={src} index={i} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function AssistantMessage({ msg, streamStatus }) {
   const isStreaming = msg.streaming;
   const hasContent = Boolean(msg.content);
@@ -77,6 +131,9 @@ function AssistantMessage({ msg, streamStatus }) {
         {/* Blinking cursor while tokens are still arriving */}
         {isStreaming && hasContent && <span className="typing-cursor" />}
       </div>
+
+      {/* Sources panel — only after the response is complete */}
+      {!isStreaming && <SourcesPanel sources={msg.sources} />}
 
       {/* Tool metadata — only after the response is complete */}
       {!isStreaming && msg.tools_used && msg.tools_used.length > 0 && (
@@ -139,6 +196,7 @@ function QAChat() {
               role: 'assistant',
               content: event.answer,
               tools_used: event.tools_used || [],
+              sources: event.sources || [],
               streaming: false,
             },
           ];

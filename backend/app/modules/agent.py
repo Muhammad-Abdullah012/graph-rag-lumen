@@ -638,6 +638,18 @@ class EurocodeAgent:
         # Step 5: post-process assembled answer and emit done
         full_answer = _postprocess_latex(full_answer)
 
+        # Build source list from retrieved pages (page_number + document + chapter)
+        sources = [
+            {
+                "page_number": p.get("page_number"),
+                "document":    p.get("document", ""),
+                "chapter":     p.get("chapter", ""),
+                "preview":     (p.get("content") or "")[:600].strip(),
+            }
+            for p in pages
+            if p.get("page_number") and p.get("document")
+        ]
+
         # ── Debug log: final answer (for hallucination checking) ──────
         _write_debug({
             "ts": datetime.utcnow().isoformat(),
@@ -645,7 +657,7 @@ class EurocodeAgent:
             "final_answer": full_answer,
         })
 
-        yield {"type": "done", "answer": full_answer, "tools_used": tools_used, "route": "eurocode"}
+        yield {"type": "done", "answer": full_answer, "tools_used": tools_used, "route": "eurocode", "sources": sources}
 
     async def aanswer(self, question: str) -> Dict[str, Any]:
         """Run the graph and return the final answer + metadata."""
