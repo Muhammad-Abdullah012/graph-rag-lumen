@@ -26,6 +26,27 @@ class GraphQuerier:
     def __init__(self):
         self.db = get_neo4j_connection()
 
+    # Common German function words that add noise to BM25 fulltext search.
+    # Technical terms, section numbers, load names etc. are kept.
+    _DE_STOPWORDS: frozenset = frozenset({
+        "welche", "welcher", "welches", "welchen", "welchem",
+        "sind", "sein", "ist", "war", "wird", "wird", "werden",
+        "für", "bei", "einer", "einem", "eines", "eine", "ein",
+        "zu", "zum", "zur", "nach", "aus", "mit", "von", "vom",
+        "in", "im", "an", "am", "auf", "über", "unter", "durch",
+        "die", "der", "das", "dem", "den", "des",
+        "und", "oder", "aber", "auch", "noch", "nicht", "kein", "keine",
+        "wie", "was", "wann", "wo", "warum", "welche",
+        "können", "dürfen", "müssen", "sollen", "muss", "soll", "darf",
+        "hat", "haben", "hatte", "hatten",
+        "sich", "es", "sie", "er", "wir", "ich", "ihr",
+        "sowie", "um", "als", "dass", "ob", "wenn", "weil",
+        "berücksichtigen", "berücksichtigt", "verwenden", "verwendet",
+        "bestimmen", "bestimmt", "ermitteln", "ermittelt",
+        "angeben", "angegeben", "anwenden", "angewendet",
+        "geben", "gibt", "nehmen", "ansetzen",
+    })
+
     @staticmethod
     def _sanitize_lucene(query: str) -> str:
         """Strip Lucene fulltext query special characters.
@@ -37,6 +58,28 @@ class GraphQuerier:
         """
         cleaned = re.sub(r'[+\-&|!(){}\[\]^"~*?:\\/]', ' ', query)
         return ' '.join(cleaned.split()) or '*'
+
+    @classmethod
+    def _to_keywords(cls, query: str) -> str:
+        """Extract key technical terms from a natural-language query for BM25 search.
+
+        Strips German stopwords and short filler words so that fulltext search
+        matches on specific technical terms (e.g. "Kombinationswert Temperatur
+        Straßenbrücke") rather than common sentence words that appear on hundreds
+        of pages.  Falls back to the sanitized query if nothing survives.
+        """
+        sanitized = re.sub(r'[+\-&|!(){}\[\]^"~*?:\\/]', ' ', query)
+        words = sanitized.split()
+        keywords = [
+            w for w in words
+            if w.lower().rstrip(".,?!:") not in cls._DE_STOPWORDS
+            and (
+                len(w) >= 4                          # normal words
+                or re.match(r'^\d[\d.,]*$', w)       # numbers: 71, 8.3, 1.5
+                or (len(w) >= 2 and w[0].isupper())  # abbrevs / variables: EC, ψ, G
+            )
+        ]
+        return ' '.join(keywords) if keywords else sanitized
 
     # ================================================================== #
     #  1. STRUCTURAL NAVIGATION
@@ -624,7 +667,7 @@ class GraphQuerier:
             """CALL db.index.vector.queryNodes('page_embedding_index', $limit, $embedding)
                YIELD node, score
                WHERE node.content IS NOT NULL AND trim(node.content) <> ''
-                 AND score >= 0.4
+                 AND score >= 0.5
                OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
                OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
@@ -644,13 +687,17 @@ class GraphQuerier:
         ) or []
 
     def _fulltext_search_pages(
-        self, query: str, limit: int
+        self, query: str, limit: int, keywords: str = ""
     ) -> List[Dict[str, Any]]:
         """BM25 fulltext search on page content.
 
         Same WITH-aggregation fix as _vector_search_pages to prevent duplicate
         rows for pages that belong to multiple chapters.
+
+        Uses *keywords* (LLM-extracted) when provided; falls back to the
+        static stopword filter (_to_keywords) when the LLM call failed.
         """
+        search_terms = keywords if keywords else self._to_keywords(query)
         return self.db.execute_query(
             """CALL db.index.fulltext.queryNodes('page_fulltext', $query)
                YIELD node, score
@@ -670,7 +717,7 @@ class GraphQuerier:
                       chapter, document, score,
                       section_titles, section_ids
                ORDER BY score DESC LIMIT $limit""",
-            {"query": self._sanitize_lucene(query), "limit": limit * 2},
+            {"query": self._sanitize_lucene(search_terms), "limit": limit * 2},
         ) or []
 
     @staticmethod
@@ -751,12 +798,15 @@ class GraphQuerier:
                 break
         return unique
 
-    def search_pages(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def search_pages(
+        self, query: str, limit: int = 5, keywords: str = ""
+    ) -> List[Dict[str, Any]]:
         """Hybrid page search: vector + fulltext merged with RRF, with adjacent pages.
 
         Strategy:
-        1. Run vector similarity search (score >= 0.4 threshold).
-        2. Run BM25 fulltext search in parallel.
+        1. Run vector similarity search (score >= 0.5 threshold).
+        2. Run BM25 fulltext search using *keywords* (LLM-extracted) when
+           provided, or the static stopword filter as fallback.
         3. Merge both with Reciprocal Rank Fusion — pages in both lists score
            higher; deduplication by (page_number, document) eliminates the
            fan-out bug where one page appeared multiple times via different
@@ -782,7 +832,7 @@ class GraphQuerier:
 
         fulltext_results: List[Dict[str, Any]] = []
         try:
-            fulltext_results = self._fulltext_search_pages(query, limit)
+            fulltext_results = self._fulltext_search_pages(query, limit, keywords=keywords)
         except Exception as e:
             logger.debug("Fulltext page search failed: %s", e)
 

@@ -79,6 +79,7 @@ class AgentState(TypedDict, total=False):
     """Typed state flowing through the graph."""
     question: str                       # original user question (any language)
     search_query: str                   # German translation used for graph search
+    keywords: str                       # LLM-extracted technical keywords for BM25
     route: str                          # "greeting" | "eurocode"
     search_results: Dict[str, Any]      # raw graph search results
     ranked_context: str                 # top context string for LLM
@@ -116,8 +117,10 @@ LANGUAGE:
 - Reply in the same language as the user's question.
 
 IF NOT IN CONTEXT:
-- If the answer is not in the CONTEXT, write only: "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
-- Do NOT add values or explanations from your training data.
+- If the answer is not in the CONTEXT, you MUST write ONLY this exact sentence: "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+- Do NOT write anything else. Do NOT add general knowledge, suggestions, or explanations from your training data.
+- Do NOT say "generally speaking", "in Eurocode...", "typically...", or anything similar.
+- Silence is better than a wrong answer.
 """
 
 
@@ -252,6 +255,27 @@ _TRANSLATE_SYSTEM = (
     "  section → Abschnitt"
 )
 
+_KEYWORD_SYSTEM = (
+    "You are a search query optimizer for a Eurocode structural engineering knowledge base. "
+    "Extract 3-6 key technical search terms from the query below.\n\n"
+    "Rules:\n"
+    "- Include specific Eurocode terms, load types, material names, norm numbers, "
+    "  numeric values (e.g. 71, 8.3), and abbreviations (e.g. EC3, ψ0, γQ)\n"
+    "- Keep the original German spelling exactly — do NOT translate or modify terms\n"
+    "- Exclude question words (welche, was, wie), prepositions, articles, "
+    "  conjunctions, and generic verbs (berücksichtigen, bestimmen, etc.)\n"
+    "- Return ONLY a space-separated list of terms — no explanation, no punctuation, no quotes\n\n"
+    "Examples:\n"
+    "  Query: 'Welche Kombinationswerte sind für Temperatur bei einer Straßenbrücke zu berücksichtigen?'\n"
+    "  Output: Kombinationswerte Temperatur Straßenbrücke\n\n"
+    "  Query: 'Kerbfall 71 Kerbdetail Kategorie'\n"
+    "  Output: Kerbfall 71 Kerbdetail Kategorie\n\n"
+    "  Query: 'Welche Lastmodelle gibt es für Eisenbahnbrücken nach EN 1991-2?'\n"
+    "  Output: Lastmodelle Eisenbahnbrücken EN 1991-2\n\n"
+    "  Query: 'Was ist der Teilsicherheitsbeiwert γQ für veränderliche Einwirkungen?'\n"
+    "  Output: Teilsicherheitsbeiwert γQ veränderliche Einwirkungen"
+)
+
 
 def _translate_to_german(question: str, llm: Any) -> str:
     """Translate *question* to German for graph search.  If already German, returns as-is."""
@@ -283,6 +307,46 @@ async def _atranslate_to_german(question: str, llm: Any) -> str:
     except Exception as e:
         logger.warning("Translation failed, using original query: %s", e)
     return question
+
+
+def _extract_keywords(question: str, llm: Any) -> str:
+    """Extract key technical search terms from *question* using the LLM.
+
+    Returns a space-separated string of keywords (e.g. "Kombinationswerte
+    Temperatur Straßenbrücke").  Returns an empty string on failure so the
+    caller can fall back to the static stopword filter in GraphQuerier.
+    """
+    try:
+        resp = llm.invoke([
+            SystemMessage(content=_KEYWORD_SYSTEM),
+            HumanMessage(content=question.strip()),
+        ])
+        keywords = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+        # Sanity: reject multi-line responses (model returned an explanation)
+        keywords = keywords.splitlines()[0].strip() if keywords else ""
+        if keywords:
+            logger.info("Keywords extracted: '%s' → '%s'", question[:60], keywords[:80])
+            return keywords
+    except Exception as e:
+        logger.warning("Keyword extraction failed, falling back to stopword filter: %s", e)
+    return ""
+
+
+async def _aextract_keywords(question: str, llm: Any) -> str:
+    """Async version of _extract_keywords."""
+    try:
+        resp = await llm.ainvoke([
+            SystemMessage(content=_KEYWORD_SYSTEM),
+            HumanMessage(content=question.strip()),
+        ])
+        keywords = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+        keywords = keywords.splitlines()[0].strip() if keywords else ""
+        if keywords:
+            logger.info("Keywords extracted: '%s' → '%s'", question[:60], keywords[:80])
+            return keywords
+    except Exception as e:
+        logger.warning("Keyword extraction failed, falling back to stopword filter: %s", e)
+    return ""
 
 
 def _classify_query(question: str, llm: Any) -> str:
@@ -342,23 +406,28 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
     def graph_search(state: AgentState) -> AgentState:
         question = state["question"]
         search_query = _translate_to_german(question, llm)
+        keywords = _extract_keywords(search_query, llm)
         tools_used: List[Dict[str, Any]] = []
 
         try:
-            pages = querier.search_pages(search_query, limit=8)
-            tools_used.append({"tool": "search_pages", "arguments": {"query": search_query}})
+            pages = querier.search_pages(search_query, limit=8, keywords=keywords)
+            tools_used.append({
+                "tool": "search_pages",
+                "arguments": {"query": search_query, "keywords": keywords},
+            })
         except Exception as e:
             logger.error("Page search failed for '%s': %s", search_query[:80], e)
             pages = []
             tools_used.append({
                 "tool": "search_pages",
-                "arguments": {"query": search_query},
+                "arguments": {"query": search_query, "keywords": keywords},
                 "error": str(e),
             })
 
         return {
             **state,
             "search_query": search_query,
+            "keywords": keywords,
             "search_results": pages,
             "tools_used": tools_used,
         }
@@ -506,18 +575,26 @@ class EurocodeAgent:
             return
 
         # ── Eurocode path ─────────────────────────────────────────────
-        # Step 2: translate + search top 8 pages
+        # Step 2: translate → extract keywords → search top 8 pages
         yield {"type": "status", "step": "searching", "message": "Suche im Wissensgraphen…"}
         search_query = await _atranslate_to_german(question, self.llm)
+        keywords = await _aextract_keywords(search_query, self.llm)
 
         tools_used: List[Dict[str, Any]] = []
         pages: List[Dict[str, Any]] = []
         try:
-            pages = self.querier.search_pages(search_query, limit=8)
-            tools_used.append({"tool": "search_pages", "arguments": {"query": search_query, "pages": len(pages)}})
+            pages = self.querier.search_pages(search_query, limit=8, keywords=keywords)
+            tools_used.append({
+                "tool": "search_pages",
+                "arguments": {"query": search_query, "keywords": keywords, "pages": len(pages)},
+            })
         except Exception as e:
             logger.error("Page search failed in stream: %s", e)
-            tools_used.append({"tool": "search_pages", "arguments": {"query": search_query}, "error": str(e)})
+            tools_used.append({
+                "tool": "search_pages",
+                "arguments": {"query": search_query, "keywords": keywords},
+                "error": str(e),
+            })
 
         # Step 3: format pages as context
         yield {"type": "status", "step": "ranking", "message": "Bereite Kontext vor…"}
