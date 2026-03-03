@@ -638,16 +638,17 @@ class EurocodeAgent:
         # Step 5: post-process assembled answer and emit done
         full_answer = _postprocess_latex(full_answer)
 
-        # Build source list from retrieved pages (page_number + document + chapter)
+        # Build source list — one entry per page, same order and count as context.
+        # Use `is not None` so page 0 is not excluded by falsy truthiness check.
         sources = [
             {
                 "page_number": p.get("page_number"),
-                "document":    p.get("document", ""),
+                "document":    p.get("document") or "",
                 "chapter":     p.get("chapter", ""),
                 "preview":     (p.get("content") or "")[:600].strip(),
             }
             for p in pages
-            if p.get("page_number") and p.get("document")
+            if p.get("page_number") is not None and p.get("document")
         ]
 
         # ── Debug log: final answer (for hallucination checking) ──────

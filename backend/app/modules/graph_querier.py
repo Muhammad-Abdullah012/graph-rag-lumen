@@ -660,8 +660,11 @@ class GraphQuerier:
 
         Uses a WITH aggregation step to collapse the OPTIONAL MATCH fan-out
         (a page linked to multiple chapters produces multiple rows without it).
-        Only returns pages with cosine similarity >= 0.4 to filter low-relevance noise.
+        Only returns pages with cosine similarity >= 0.5 to filter low-relevance noise.
         Fetches limit*2 candidates so the RRF merge has enough to work with.
+
+        For orphan pages (pure table pages with no CONTAINS_PAGE link), falls
+        back to the neighbouring page's chapter/document via NEXT_PAGE.
         """
         return self.db.execute_query(
             """CALL db.index.vector.queryNodes('page_embedding_index', $limit, $embedding)
@@ -672,15 +675,33 @@ class GraphQuerier:
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
                OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
                WITH node, score,
-                    collect(DISTINCT ch.title)[0]    AS chapter,
-                    collect(DISTINCT d.filename)[0]  AS document,
+                    collect(DISTINCT ch.title)[0]    AS direct_ch,
+                    collect(DISTINCT d.filename)[0]  AS direct_doc,
                     collect(DISTINCT s.title)         AS section_titles,
                     collect(DISTINCT s.id)            AS section_ids
+               // Variable-length fallback for orphan pages (up to 10 hops back)
+               CALL {
+                 WITH node, direct_doc
+                 WITH node WHERE direct_doc IS NULL
+                 MATCH (linked:Page)-[:NEXT_PAGE*1..10]->(node)
+                 WHERE EXISTS { MATCH (:Chapter)-[:CONTAINS_PAGE]->(linked) }
+                 WITH linked ORDER BY linked.page_number DESC LIMIT 1
+                 MATCH (ch_fb:Chapter)-[:CONTAINS_PAGE]->(linked)
+                 MATCH (d_fb:Document)-[:HAS_CHAPTER]->(ch_fb)
+                 RETURN collect(DISTINCT ch_fb.title)[0] AS fb_ch,
+                        collect(DISTINCT d_fb.filename)[0] AS fb_doc
+                 UNION
+                 WITH node, direct_doc
+                 WITH node WHERE direct_doc IS NOT NULL
+                 RETURN null AS fb_ch, null AS fb_doc
+               }
                RETURN node.id         AS page_id,
                       node.page_number AS page_number,
                       substring(node.content, 0, 8000) AS content,
                       node.header      AS header,
-                      chapter, document, score,
+                      coalesce(direct_ch, fb_ch)   AS chapter,
+                      coalesce(direct_doc, fb_doc) AS document,
+                      score,
                       section_titles, section_ids
                ORDER BY score DESC""",
             {"limit": limit * 2, "embedding": embedding},
@@ -692,7 +713,8 @@ class GraphQuerier:
         """BM25 fulltext search on page content.
 
         Same WITH-aggregation fix as _vector_search_pages to prevent duplicate
-        rows for pages that belong to multiple chapters.
+        rows for pages that belong to multiple chapters.  Same NEXT_PAGE
+        fallback for orphan table pages.
 
         Uses *keywords* (LLM-extracted) when provided; falls back to the
         static stopword filter (_to_keywords) when the LLM call failed.
@@ -706,15 +728,33 @@ class GraphQuerier:
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
                OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
                WITH node, score,
-                    collect(DISTINCT ch.title)[0]    AS chapter,
-                    collect(DISTINCT d.filename)[0]  AS document,
+                    collect(DISTINCT ch.title)[0]    AS direct_ch,
+                    collect(DISTINCT d.filename)[0]  AS direct_doc,
                     collect(DISTINCT s.title)         AS section_titles,
                     collect(DISTINCT s.id)            AS section_ids
+               // Variable-length fallback for orphan pages (up to 10 hops back)
+               CALL {
+                 WITH node, direct_doc
+                 WITH node WHERE direct_doc IS NULL
+                 MATCH (linked:Page)-[:NEXT_PAGE*1..10]->(node)
+                 WHERE EXISTS { MATCH (:Chapter)-[:CONTAINS_PAGE]->(linked) }
+                 WITH linked ORDER BY linked.page_number DESC LIMIT 1
+                 MATCH (ch_fb:Chapter)-[:CONTAINS_PAGE]->(linked)
+                 MATCH (d_fb:Document)-[:HAS_CHAPTER]->(ch_fb)
+                 RETURN collect(DISTINCT ch_fb.title)[0] AS fb_ch,
+                        collect(DISTINCT d_fb.filename)[0] AS fb_doc
+                 UNION
+                 WITH node, direct_doc
+                 WITH node WHERE direct_doc IS NOT NULL
+                 RETURN null AS fb_ch, null AS fb_doc
+               }
                RETURN node.id         AS page_id,
                       node.page_number AS page_number,
                       substring(node.content, 0, 8000) AS content,
                       node.header      AS header,
-                      chapter, document, score,
+                      coalesce(direct_ch, fb_ch)   AS chapter,
+                      coalesce(direct_doc, fb_doc) AS document,
+                      score,
                       section_titles, section_ids
                ORDER BY score DESC LIMIT $limit""",
             {"query": self._sanitize_lucene(search_terms), "limit": limit * 2},
@@ -733,12 +773,19 @@ class GraphQuerier:
         combined RRF score, naturally surfacing the most relevant pages.
         Deduplication is by (page_number, document) key.
         """
+        def _key(p: Dict[str, Any]) -> tuple:
+            # Normalise None → "" so the same page always gets the same key
+            # regardless of whether the OPTIONAL MATCH resolved the document.
+            return (p.get("page_number"), p.get("document") or "")
+
         scores: Dict[tuple, Dict[str, Any]] = {}
         for rank, page in enumerate(list_a):
-            key = (page.get("page_number"), page.get("document", ""))
+            key = _key(page)
+            if key in scores:
+                scores[key]["rrf"] += 1.0 / (k + rank + 1)
             scores[key] = {"page": page, "rrf": 1.0 / (k + rank + 1)}
         for rank, page in enumerate(list_b):
-            key = (page.get("page_number"), page.get("document", ""))
+            key = _key(page)
             if key in scores:
                 scores[key]["rrf"] += 1.0 / (k + rank + 1)
             else:
@@ -774,14 +821,37 @@ class GraphQuerier:
                WHERE nxt.content IS NOT NULL AND trim(nxt.content) <> ''
                OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(nxt)
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
-               WITH nxt,
-                    collect(DISTINCT ch.title)[0]   AS chapter,
-                    collect(DISTINCT d.filename)[0] AS document
+               WITH p, nxt,
+                    collect(DISTINCT ch.title)[0]    AS direct_ch,
+                    collect(DISTINCT d.filename)[0]  AS direct_doc
+               // Variable-length fallback for orphan adjacent pages
+               CALL {
+                 WITH nxt, direct_doc, p
+                 WITH nxt, p WHERE direct_doc IS NULL
+                 // First try: traverse NEXT_PAGE backwards from nxt
+                 OPTIONAL MATCH (linked:Page)-[:NEXT_PAGE*1..10]->(nxt)
+                 WHERE EXISTS { MATCH (:Chapter)-[:CONTAINS_PAGE]->(linked) }
+                 WITH nxt, p, linked ORDER BY linked.page_number DESC LIMIT 1
+                 // Second try: use the source page's chapter (same document)
+                 OPTIONAL MATCH (ch_src:Chapter)-[:CONTAINS_PAGE]->(p)
+                 OPTIONAL MATCH (d_src:Document)-[:HAS_CHAPTER]->(ch_src)
+                 OPTIONAL MATCH (ch_fb:Chapter)-[:CONTAINS_PAGE]->(linked)
+                 OPTIONAL MATCH (d_fb:Document)-[:HAS_CHAPTER]->(ch_fb)
+                 RETURN coalesce(collect(DISTINCT ch_fb.title)[0],
+                                 collect(DISTINCT ch_src.title)[0]) AS fb_ch,
+                        coalesce(collect(DISTINCT d_fb.filename)[0],
+                                 collect(DISTINCT d_src.filename)[0]) AS fb_doc
+                 UNION
+                 WITH nxt, direct_doc, p
+                 WITH nxt WHERE direct_doc IS NOT NULL
+                 RETURN null AS fb_ch, null AS fb_doc
+               }
                RETURN nxt.id          AS page_id,
                       nxt.page_number  AS page_number,
                       substring(nxt.content, 0, 8000) AS content,
                       nxt.header       AS header,
-                      chapter, document,
+                      coalesce(direct_ch, fb_ch)   AS chapter,
+                      coalesce(direct_doc, fb_doc) AS document,
                       0.0              AS score,
                       []               AS section_titles,
                       []               AS section_ids""",
@@ -790,7 +860,7 @@ class GraphQuerier:
 
         unique: List[Dict[str, Any]] = []
         for page in results:
-            key = (page.get("page_number"), page.get("document", ""))
+            key = (page.get("page_number"), page.get("document") or "")
             if key not in existing_keys:
                 existing_keys.add(key)
                 unique.append(page)
@@ -843,13 +913,22 @@ class GraphQuerier:
 
         # Step 4: fetch adjacent pages for top 3 results
         existing_keys = {
-            (p.get("page_number"), p.get("document", "")) for p in merged
+            (p.get("page_number"), p.get("document") or "") for p in merged
         }
         adjacent = self._fetch_adjacent_pages(merged, existing_keys)
         if adjacent:
             merged.extend(adjacent)
 
-        return merged
+        # Final deduplication safety net — catches any residual duplicates
+        # that slip through if document resolves inconsistently across queries.
+        seen: set = set()
+        unique: List[Dict[str, Any]] = []
+        for p in merged:
+            key = (p.get("page_number"), p.get("document") or "")
+            if key not in seen:
+                seen.add(key)
+                unique.append(p)
+        return unique
 
     def get_sections_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         """Fetch full section content for a list of section IDs.
