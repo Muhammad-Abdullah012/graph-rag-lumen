@@ -83,6 +83,8 @@ class AgentState(TypedDict, total=False):
     route: str                          # "greeting" | "eurocode"
     search_results: Dict[str, Any]      # raw graph search results
     ranked_context: str                 # top context string for LLM
+    img_mapping: Dict[str, str]         # IMG-N → real ![caption](url) mapping (OCR-embedded)
+    extra_figures: List[str]            # Additional figures to append after answer (markdown lines)
     tools_used: List[Dict[str, Any]]    # metadata about searches run
     answer: str                         # final answer text
 
@@ -109,9 +111,21 @@ FORMULAS:
 - Do NOT rewrite, simplify, rearrange, or paraphrase any formula — not even slightly.
 - Do NOT write a formula that is not present in the CONTEXT.
 
-IMAGES:
-- Images appear in the CONTEXT as ![caption](url). Copy them VERBATIM if relevant.
-- Do NOT invent image URLs.
+TABLES:
+- The CONTEXT contains markdown tables using pipe syntax (| col1 | col2 |).
+- ALWAYS include the relevant table in your answer by copying the pipe-delimited markdown table EXACTLY as it appears in the CONTEXT.
+- NEVER summarize, paraphrase, or convert a table to bullet points or prose. ALWAYS output it as a markdown table.
+- NEVER say "see Table X.Y", "refer to the table", or "as shown in the table" — the user cannot see the table unless you copy it.
+- You may filter to only the relevant rows, but ALWAYS keep the header row and the separator row (| --- | --- |).
+- Example — if the CONTEXT has:
+  | Kerbfall | Beschreibung | Anforderungen |
+  | --- | --- | --- |
+  | 71 | Detail 1 | R ≥ 150 |
+  | 80 | Detail 2 | l ≤ 50mm |
+  then your answer MUST include:
+  | Kerbfall | Beschreibung | Anforderungen |
+  | --- | --- | --- |
+  | 71 | Detail 1 | R ≥ 150 |
 
 LANGUAGE:
 - Reply in the same language as the user's question.
@@ -129,12 +143,45 @@ IF NOT IN CONTEXT:
 # ================================================================== #
 
 
-def _format_pages_as_context(pages: List[Dict[str, Any]]) -> str:
+_IMG_RE = re.compile(r'!\[([^\]]*)\]\((/api/images/[^)]+)\)')
+
+
+def _replace_images_with_placeholders(
+    text: str, mapping: Dict[str, str], counter: List[int]
+) -> str:
+    """Replace ``![caption](/api/images/...)`` with ``[IMG-N]`` placeholders.
+
+    *mapping* is mutated in-place: ``{"IMG-1": "![caption](/api/images/...)", ...}``.
+    *counter* is a one-element list ``[next_number]`` so it survives across calls.
+    """
+    def _replacer(m: re.Match) -> str:
+        key = f"IMG-{counter[0]}"
+        counter[0] += 1
+        mapping[key] = m.group(0)  # full ``![caption](url)``
+        return f"[{key}]"
+    return _IMG_RE.sub(_replacer, text)
+
+
+def _restore_image_placeholders(answer: str, mapping: Dict[str, str]) -> str:
+    """Replace ``[IMG-N]`` tokens in the LLM answer with real image markdown."""
+    for key, md in mapping.items():
+        answer = answer.replace(f"[{key}]", md)
+    return answer
+
+
+def _format_pages_as_context(
+    pages: List[Dict[str, Any]],
+    img_mapping: Optional[Dict[str, str]] = None,
+    img_counter: Optional[List[int]] = None,
+) -> str:
     """Format a list of pages as context for the LLM.
 
     Each page entry already contains the full OCR text of that page —
     formulas, tables, and figures are all inline in the page content.
-    No separate lookup is needed.
+
+    When *img_mapping* / *img_counter* are provided, inline image
+    references are replaced with short ``[IMG-N]`` placeholders to
+    prevent the LLM from hallucinating corrupted URLs.
     """
     if not pages:
         return "(Keine relevanten Seiten im Wissensgraphen gefunden.)"
@@ -145,6 +192,11 @@ def _format_pages_as_context(pages: List[Dict[str, Any]]) -> str:
         chapter  = page.get("chapter", "")
         doc      = page.get("document", "")
         content  = page.get("content", "")
+
+        if img_mapping is not None and img_counter is not None:
+            content = _replace_images_with_placeholders(
+                content, img_mapping, img_counter
+            )
 
         ref      = f" (Dokument: {doc})" if doc else ""
         chap_str = f" | {chapter}" if chapter else ""
@@ -219,14 +271,18 @@ def _postprocess_latex(text: str) -> str:
 
 _ROUTER_SYSTEM = (
     "You are a message classifier for a structural-engineering assistant. "
-    "Decide whether the user's message is a GREETING/CHITCHAT or a QUESTION "
-    "that requires searching a technical knowledge base.\n\n"
-    "GREETING/CHITCHAT includes: hellos, farewells, thanks, 'how are you', "
-    "capability questions ('what can you do?'), and small-talk.\n\n"
-    "QUESTION includes: any request for technical information, definitions, "
-    "calculations, formulas, standards, or anything that might be answered "
-    "by searching a knowledge base — even if vague or short.\n\n"
-    "Respond with exactly one word: greeting  OR  question\n"
+    "The knowledge base contains ONLY Eurocode standards for structural "
+    "engineering (steel, concrete, bridges, loads, design, fatigue, etc.).\n\n"
+    "Classify the message into exactly one category:\n\n"
+    "greeting — hellos, farewells, thanks, 'how are you', capability questions, small-talk.\n\n"
+    "question — requests about structural engineering, Eurocodes, civil engineering, "
+    "building codes, loads, materials, steel, concrete, timber, bridges, foundations, "
+    "seismic design, fatigue, formulas, safety factors, or any topic that could "
+    "plausibly appear in a Eurocode standard.\n\n"
+    "offtopic — anything clearly unrelated to structural engineering or Eurocodes: "
+    "astronomy, cooking, history, geography, politics, biology, general science "
+    "questions, sports, entertainment, etc.\n\n"
+    "Respond with exactly one word: greeting  OR  question  OR  offtopic\n"
     "No explanation, no punctuation — just the single word."
 )
 
@@ -350,11 +406,11 @@ async def _aextract_keywords(question: str, llm: Any) -> str:
 
 
 def _classify_query(question: str, llm: Any) -> str:
-    """Classify *question* using the LLM; returns 'greeting' or 'eurocode'.
+    """Classify *question* using the LLM; returns 'greeting', 'offtopic', or 'eurocode'.
 
     A trivial empty-string guard runs first.  The LLM is prompted to return
-    exactly one word ('greeting' or 'question').  Any failure or ambiguous
-    response defaults to 'eurocode' so the graph search always runs.
+    exactly one word ('greeting', 'question', or 'offtopic').  Any failure or
+    ambiguous response defaults to 'eurocode' so the graph search always runs.
     """
     if not question.strip():
         return "greeting"
@@ -368,6 +424,9 @@ def _classify_query(question: str, llm: Any) -> str:
         if label.startswith("greeting"):
             logger.info("Router: '%s' → greeting", question[:60])
             return "greeting"
+        if label.startswith("offtopic"):
+            logger.info("Router: '%s' → offtopic", question[:60])
+            return "offtopic"
     except Exception as e:
         logger.warning("Router LLM call failed, defaulting to eurocode: %s", e)
 
@@ -402,6 +461,15 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
             answer = "Hallo! Wie kann ich Ihnen helfen?"
         return {**state, "answer": answer, "tools_used": []}
 
+    # ── Node: offtopic ─────────────────────────────────────────────
+    def offtopic(state: AgentState) -> AgentState:
+        return {
+            **state,
+            "answer": "Diese Frage liegt außerhalb meines Fachgebiets. "
+                      "Ich kann nur Fragen zu Eurocodes und Tragwerksplanung beantworten.",
+            "tools_used": [],
+        }
+
     # ── Node: graph search ───────────────────────────────────────────
     def graph_search(state: AgentState) -> AgentState:
         question = state["question"]
@@ -435,22 +503,73 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
     # ── Node: build context ──────────────────────────────────────────
     def rank_context(state: AgentState) -> AgentState:
         pages = state.get("search_results", [])
-        context = _format_pages_as_context(pages)
+        img_mapping: Dict[str, str] = {}
+        img_counter: List[int] = [1]
+        context = _format_pages_as_context(pages, img_mapping, img_counter)
+
+        # Fetch figures for sections found on retrieved pages
+        all_section_ids: List[str] = []
+        seen_sids: set = set()
+        for p in pages:
+            for sid in (p.get("section_ids") or []):
+                if sid and sid not in seen_sids:
+                    all_section_ids.append(sid)
+                    seen_sids.add(sid)
 
         tools_used = list(state.get("tools_used", []))
+
+        extra_figures: List[str] = []
+        if all_section_ids:
+            try:
+                figures = querier.get_figures_for_sections(
+                    all_section_ids[:20], limit=10
+                )
+                if figures:
+                    existing_paths: set = {
+                        v.split("](")[1].rstrip(")")
+                        for v in img_mapping.values()
+                    }
+                    seen_paths: set = set()
+                    for fig in figures:
+                        path = fig.get("image_path", "")
+                        caption = fig.get("caption", "") or fig.get("number", "")
+                        if path and path not in seen_paths and path not in existing_paths:
+                            seen_paths.add(path)
+                            extra_figures.append(f"![{caption}]({path})")
+                    if extra_figures:
+                        tools_used.append({
+                            "tool": "get_figures",
+                            "arguments": {
+                                "section_ids": len(all_section_ids),
+                                "figures_found": len(extra_figures),
+                            },
+                        })
+            except Exception as e:
+                logger.debug("Figure fetch failed: %s", e)
+
         tools_used.append({
             "tool": "rank_context",
             "arguments": {"top_items": context.count("["), "chars": len(context)},
         })
 
-        return {**state, "ranked_context": context, "tools_used": tools_used}
+        return {**state, "ranked_context": context, "img_mapping": img_mapping, "extra_figures": extra_figures, "tools_used": tools_used}
 
     # ── Node: answer LLM ────────────────────────────────────────────
     def answer_llm(state: AgentState) -> AgentState:
         question = state["question"]
         context = state.get("ranked_context", "") or "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
+        img_mapping = state.get("img_mapping", {})
 
-        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION: {question}"
+        user_prompt = (
+            f"CONTEXT:\n{context}\n\n"
+            "REMINDER:\n"
+            "- TABLES: If the CONTEXT contains a markdown table (lines with | ), "
+            "you MUST copy it into your answer as a markdown table. "
+            "Do NOT convert tables to bullet points or prose.\n"
+            "- FORMULAS: If the CONTEXT contains formulas in $$...$$ or $...$, "
+            "copy them EXACTLY into your answer — do not rewrite or omit them.\n\n"
+            f"QUESTION: {question}"
+        )
 
         try:
             messages = [
@@ -465,6 +584,14 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
                 "Die Anfrage konnte aufgrund eines technischen Fehlers nicht verarbeitet werden. "
                 "Bitte versuchen Sie es erneut."
             )
+        if img_mapping:
+            answer = _restore_image_placeholders(answer, img_mapping)
+
+        # Append extra figures if any
+        extra_figures = state.get("extra_figures", [])
+        if extra_figures:
+            answer += "\n\n---\n**Abbildungen:**\n" + "\n".join(extra_figures)
+
         return {**state, "answer": answer}
 
     # ── Node: post-process ──────────────────────────────────────────
@@ -481,6 +608,7 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
 
     graph.add_node("router", router)
     graph.add_node("greet", greet)
+    graph.add_node("offtopic", offtopic)
     graph.add_node("graph_search", graph_search)
     graph.add_node("rank_context", rank_context)
     graph.add_node("answer_llm", answer_llm)
@@ -493,11 +621,13 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         route_decision,
         {
             "greeting": "greet",
+            "offtopic": "offtopic",
             "eurocode": "graph_search",
         },
     )
 
     graph.add_edge("greet", END)
+    graph.add_edge("offtopic", END)
     graph.add_edge("graph_search", "rank_context")
     graph.add_edge("rank_context", "answer_llm")
     graph.add_edge("answer_llm", "postprocess")
@@ -550,8 +680,20 @@ class EurocodeAgent:
             label = (resp.content if hasattr(resp, "content") else str(resp)).strip().lower()
             if label.startswith("greeting"):
                 route = "greeting"
+            elif label.startswith("offtopic"):
+                route = "offtopic"
         except Exception as e:
             logger.warning("Router call failed in stream, defaulting to eurocode: %s", e)
+
+        # ── Off-topic path ─────────────────────────────────────────────
+        if route == "offtopic":
+            offtopic_msg = (
+                "Diese Frage liegt außerhalb meines Fachgebiets. "
+                "Ich kann nur Fragen zu Eurocodes und Tragwerksplanung beantworten."
+            )
+            yield {"type": "token", "content": offtopic_msg}
+            yield {"type": "done", "answer": offtopic_msg, "tools_used": [], "route": "offtopic"}
+            return
 
         # ── Greeting path ─────────────────────────────────────────────
         if route == "greeting":
@@ -596,9 +738,50 @@ class EurocodeAgent:
                 "error": str(e),
             })
 
-        # Step 3: format pages as context
+        # Step 3: format pages as context (replace images with placeholders)
         yield {"type": "status", "step": "ranking", "message": "Bereite Kontext vor…"}
-        context = _format_pages_as_context(pages)
+        img_mapping: Dict[str, str] = {}
+        img_counter: List[int] = [1]
+        context = _format_pages_as_context(pages, img_mapping, img_counter)
+
+        # Step 3b: fetch figures for sections found on retrieved pages
+        all_section_ids: List[str] = []
+        seen_sids: set = set()
+        for p in pages:
+            for sid in (p.get("section_ids") or []):
+                if sid and sid not in seen_sids:
+                    all_section_ids.append(sid)
+                    seen_sids.add(sid)
+
+        extra_figures: List[str] = []
+        if all_section_ids:
+            try:
+                figures = self.querier.get_figures_for_sections(
+                    all_section_ids[:20], limit=10
+                )
+                if figures:
+                    existing_paths: set = {
+                        v.split("](")[1].rstrip(")")
+                        for v in img_mapping.values()
+                    }
+                    seen_paths: set = set()
+                    for fig in figures:
+                        path = fig.get("image_path", "")
+                        caption = fig.get("caption", "") or fig.get("number", "")
+                        if path and path not in seen_paths and path not in existing_paths:
+                            seen_paths.add(path)
+                            extra_figures.append(f"![{caption}]({path})")
+                    if extra_figures:
+                        tools_used.append({
+                            "tool": "get_figures",
+                            "arguments": {
+                                "section_ids": len(all_section_ids),
+                                "figures_found": len(extra_figures),
+                            },
+                        })
+            except Exception as e:
+                logger.debug("Figure fetch failed: %s", e)
+
         tools_used.append({
             "tool": "build_context",
             "arguments": {"pages": len(pages), "chars": len(context)},
@@ -617,7 +800,16 @@ class EurocodeAgent:
         # Step 4: stream LLM answer
         yield {"type": "status", "step": "answering", "message": "Generiere Antwort…"}
 
-        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION: {question}"
+        user_prompt = (
+            f"CONTEXT:\n{context}\n\n"
+            "REMINDER:\n"
+            "- TABLES: If the CONTEXT contains a markdown table (lines with | ), "
+            "you MUST copy it into your answer as a markdown table. "
+            "Do NOT convert tables to bullet points or prose.\n"
+            "- FORMULAS: If the CONTEXT contains formulas in $$...$$ or $...$, "
+            "copy them EXACTLY into your answer — do not rewrite or omit them.\n\n"
+            f"QUESTION: {question}"
+        )
 
         full_answer = ""
         try:
@@ -635,8 +827,14 @@ class EurocodeAgent:
             yield {"type": "token", "content": err}
             full_answer = err
 
-        # Step 5: post-process assembled answer and emit done
+        # Step 5: post-process — restore image placeholders + fix LaTeX + append extra figures
+        if img_mapping:
+            full_answer = _restore_image_placeholders(full_answer, img_mapping)
         full_answer = _postprocess_latex(full_answer)
+
+        # Append extra figures if any
+        if extra_figures:
+            full_answer += "\n\n---\n**Abbildungen:**\n" + "\n".join(extra_figures)
 
         # Build source list — one entry per page, same order and count as context.
         # Use `is not None` so page 0 is not excluded by falsy truthiness check.

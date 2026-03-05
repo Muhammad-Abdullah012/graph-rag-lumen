@@ -183,6 +183,43 @@
   color: #555;
 }
 
+/* ── Images / Figures inside assistant messages ──────────── */
+.message.assistant .message-content img {
+  max-width: 100%;
+  height: auto;
+  margin: 0.6em 0;
+  border-radius: 4px;
+  border: 1px solid #ddd;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+/* ── Tables inside assistant messages ─────────────────────── */
+.message.assistant .message-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.6em 0;
+  font-size: 0.88em;
+  overflow-x: auto;
+  display: block;
+}
+
+.message.assistant .message-content th,
+.message.assistant .message-content td {
+  border: 1px solid #ccc;
+  padding: 0.35em 0.6em;
+  text-align: left;
+}
+
+.message.assistant .message-content th {
+  background: #e8e8e8;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.message.assistant .message-content tr:nth-child(even) {
+  background: #f5f5f5;
+}
+
 .sources {
   background: #f9f9f9;
   border-left: 4px solid #bbb;
@@ -267,13 +304,46 @@
   background: #f0f0f0;
   border-radius: 4px;
   font-size: 0.78rem;
-  font-family: monospace;
   line-height: 1.5;
-  white-space: pre-wrap;
   word-break: break-word;
-  max-height: 200px;
+  max-height: 250px;
   overflow-y: auto;
   color: #333;
+}
+
+.source-preview table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.4em 0;
+  font-size: 0.9em;
+}
+
+.source-preview th,
+.source-preview td {
+  border: 1px solid #ccc;
+  padding: 0.25em 0.5em;
+  text-align: left;
+}
+
+.source-preview th {
+  background: #e0e0e0;
+  font-weight: 600;
+}
+
+.source-preview img {
+  max-width: 100%;
+  max-height: 120px;
+  height: auto;
+}
+
+.source-preview p {
+  margin: 0.3em 0;
+}
+
+.source-preview h1, .source-preview h2, .source-preview h3,
+.source-preview h4, .source-preview h5, .source-preview h6 {
+  margin: 0.3em 0;
+  font-size: 0.95em;
 }
 
 .confidence {

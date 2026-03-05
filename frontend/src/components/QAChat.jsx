@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import rehypeRaw from 'rehype-raw';
@@ -32,10 +33,18 @@ function decodeLatexEntities(content) {
  * is hosted.
  */
 function CustomImage({ src, alt, ...props }) {
-  const resolvedSrc =
-    src && src.startsWith('/api/')
-      ? `${API_BASE_URL}${src}`
-      : src;
+  // LLM sometimes prepends a hallucinated domain (e.g. https://example.com)
+  // to relative /api/images/... paths.  Extract the /api/ path and resolve
+  // it against the real backend URL.
+  let resolvedSrc = src;
+  if (src) {
+    const apiMatch = src.match(/\/api\/images\/[^\s)]+/);
+    if (apiMatch) {
+      resolvedSrc = `${API_BASE_URL}${apiMatch[0]}`;
+    } else if (src.startsWith('/api/')) {
+      resolvedSrc = `${API_BASE_URL}${src}`;
+    }
+  }
   return (
     <img
       src={resolvedSrc}
@@ -47,7 +56,7 @@ function CustomImage({ src, alt, ...props }) {
 }
 
 const MARKDOWN_PROPS = {
-  remarkPlugins: [remarkMath],
+  remarkPlugins: [remarkGfm, remarkMath],
   rehypePlugins: [[rehypeKatex, { throwOnError: false, strict: false }], rehypeRaw],
   components: { img: CustomImage },
 };
@@ -86,7 +95,11 @@ function SourceItem({ src, index }) {
       </div>
       {src.chapter && <small>{src.chapter}</small>}
       {open && src.preview && (
-        <pre className="source-preview">{src.preview}</pre>
+        <div className="source-preview">
+          <ReactMarkdown {...MARKDOWN_PROPS} >
+            {decodeLatexEntities(src.preview)}
+          </ReactMarkdown>
+        </div>
       )}
     </li>
   );
