@@ -122,41 +122,39 @@ def _detect_chapter_type(ch: dict) -> str:
     return "other"
 
 
-def _detect_volumes(chapters: List[Dict]) -> List[Dict]:
-    """Group chapters into volumes by scanning for volume-keyword headings.
+def _detect_volumes(chapters: List[Dict], doc_name: str = "") -> List[Dict]:
+    """Detect the volume for a document from its filename, wrapping all chapters in it.
 
-    If no volume headings are found, all chapters go into one default volume.
+    Volume information is encoded in the document filename, not in chapter headings.
+    Supported patterns (case-insensitive):
+    - "Band N"            → Handbuch EC3 Band 3, normen handbuch eurocode 8 band 2
+    - "Band N und M"      → Handbuch EC 7 Band 1 und 2
+    - "Anlage_N[_M]..."   → BEM-ING-Anlage_4_1_zum_ARS_22_2012-Entwurf (→ Anlage 4.1)
+
+    If no pattern is matched, a single default volume "Band 1" is used.
     """
-    vol_kws = ["band ", "volume ", "teil ", "part ", "abschnitt ", "vol."]
+    # Pattern 1: "Band N und M" (multi-band label, e.g. "Band 1 und 2")
+    m = re.search(r'\bband\s+(\d+)\s+und\s+(\d+)\b', doc_name, re.IGNORECASE)
+    if m:
+        label = f"Band {m.group(1)} und {m.group(2)}"
+        number = m.group(1)
+        return [{"title": label, "number": number, "chapters": chapters}]
 
-    volumes: List[Dict] = []
-    current_vol: Optional[Dict] = None
+    # Pattern 2: "Band N" (single band number)
+    m = re.search(r'\bband\s+(\d+)\b', doc_name, re.IGNORECASE)
+    if m:
+        label = f"Band {m.group(1)}"
+        return [{"title": label, "number": m.group(1), "chapters": chapters}]
 
-    for ch in chapters:
-        title_lower = ch.get("title", "").lower()
-        is_vol_heading = any(kw in title_lower for kw in vol_kws)
+    # Pattern 3: "Anlage_N[_M]" (BEM-ING annex files, e.g. Anlage_4_1 → Anlage 4.1)
+    m = re.search(r'Anlage[_\s](\d+)(?:[_\s](\d+))?', doc_name, re.IGNORECASE)
+    if m:
+        number = m.group(1) + (f".{m.group(2)}" if m.group(2) else "")
+        label = f"Anlage {number}"
+        return [{"title": label, "number": number, "chapters": chapters}]
 
-        if is_vol_heading:
-            if current_vol and current_vol["chapters"]:
-                volumes.append(current_vol)
-            current_vol = {
-                "title": ch["title"],
-                "number": str(len(volumes) + 1),
-                "chapters": [],
-            }
-        else:
-            if current_vol is None:
-                current_vol = {"title": "Inhalt", "number": "1", "chapters": []}
-            current_vol["chapters"].append(ch)
-
-    if current_vol and current_vol["chapters"]:
-        volumes.append(current_vol)
-
-    # Fallback: if nothing grouped, single default volume
-    if not volumes:
-        volumes = [{"title": "Inhalt", "number": "1", "chapters": chapters}]
-
-    return volumes
+    # Fallback: single default volume
+    return [{"title": "Band 1", "number": "1", "chapters": chapters}]
 
 
 
@@ -445,7 +443,7 @@ class GraphBuilder:
                 ],
             }]
 
-        volumes = _detect_volumes(raw_chapters)
+        volumes = _detect_volumes(raw_chapters, doc_name)
         for vol_data in volumes:
             vol_id = self._create_volume(doc_id, vol_data)
             stats["volumes"] += 1
