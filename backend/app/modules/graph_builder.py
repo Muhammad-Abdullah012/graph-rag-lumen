@@ -272,6 +272,109 @@ class GraphBuilder:
 
     def __init__(self):
         self.db = get_neo4j_connection()
+        self._embedding_dim: Optional[int] = None
+
+    # ----------------------------------------------------------------- #
+    #  Embedding helpers
+    # ----------------------------------------------------------------- #
+
+    def _detect_embedding_dimensions(self) -> int:
+        """Auto-detect the embedding model's output dimensions.
+
+        Embeds a short probe text once and caches the result so that
+        vector indexes are always created with the correct dimensionality,
+        regardless of which embedding model is configured.
+        """
+        if self._embedding_dim is not None:
+            return self._embedding_dim
+        from backend.app.modules.ollama_client import get_ollama_client
+        probe = get_ollama_client().generate_embedding("dimension probe")
+        if not probe:
+            raise RuntimeError(
+                "Cannot detect embedding dimensions — embedding model returned "
+                "an empty vector.  Is the Ollama embedding model loaded?"
+            )
+        self._embedding_dim = len(probe)
+        logger.info("Detected embedding dimensions: %d", self._embedding_dim)
+        return self._embedding_dim
+
+    def _embed_chunked(
+        self,
+        ollama,
+        text: str,
+        strategy: str = "mean",
+    ) -> list:
+        """Embed *text* by splitting into overlapping chunks and combining.
+
+        This avoids hardcoded truncation — the full text is embedded regardless
+        of length.  Short texts that fit in a single chunk skip the splitting
+        overhead entirely.
+
+        Parameters
+        ----------
+        ollama : OllamaClient
+            Client used to call the embedding model.
+        text : str
+            Full text to embed (any length).
+        strategy : ``"mean"`` | ``"weighted"``
+            ``"mean"``     — equal-weight average of all chunk embeddings.
+            ``"weighted"`` — first chunk gets 2× weight (useful when the
+            beginning of the text carries the most important information,
+            e.g. title + intro for sections and chapters).
+
+        Returns
+        -------
+        list[float]
+            Combined embedding vector, or ``[]`` on failure.
+        """
+        chunk_size = settings.embedding_chunk_size
+        overlap = settings.embedding_chunk_overlap
+
+        # Guard: overlap must be strictly less than chunk_size
+        if overlap >= chunk_size:
+            overlap = 0
+
+        # Fast path: text fits in a single chunk
+        if len(text) <= chunk_size:
+            return ollama.generate_embedding(text)
+
+        # Split into overlapping chunks
+        stride = chunk_size - overlap
+        chunks: List[str] = []
+        start = 0
+        while start < len(text):
+            chunks.append(text[start : start + chunk_size])
+            start += stride
+
+        # Embed each chunk
+        embeddings: List[list] = []
+        for chunk in chunks:
+            emb = ollama.generate_embedding(chunk)
+            if emb:
+                embeddings.append(emb)
+
+        if not embeddings:
+            return []
+        if len(embeddings) == 1:
+            return embeddings[0]
+
+        # Combine with the chosen strategy
+        dim = len(embeddings[0])
+        if strategy == "weighted":
+            # First chunk gets 2× weight
+            weights = [2.0] + [1.0] * (len(embeddings) - 1)
+        else:
+            weights = [1.0] * len(embeddings)
+
+        total_weight = sum(weights)
+        combined = [0.0] * dim
+        for emb, w in zip(embeddings, weights):
+            for i in range(dim):
+                combined[i] += emb[i] * w
+        for i in range(dim):
+            combined[i] /= total_weight
+
+        return combined
 
     # ----------------------------------------------------------------- #
     #  Public API
@@ -919,60 +1022,291 @@ class GraphBuilder:
             logger.debug("Could not link related concepts: %s", e)
 
     # ----------------------------------------------------------------- #
-    #  Embedding generation (Section + Concept + Formula)
+    #  Rich summary generation (Chapter + Document)
+    # ----------------------------------------------------------------- #
+
+    _CHAPTER_SUMMARY_SYSTEM = (
+        "You are a technical summarizer for Eurocode structural engineering "
+        "documents.  Given the chapter structure below (section titles, section "
+        "content, formula symbols, and table captions), write a concise "
+        "{max_words}-word description of what this chapter covers.  Focus on "
+        "the technical topics, standards referenced, and key formulas/tables.  "
+        "Write in the same language as the source content.  "
+        "Return ONLY the description — no labels, no headers, no bullet points."
+    )
+
+    def _extract_formula_symbols(self, expressions: List[str]) -> List[str]:
+        """Extract single-character formula symbols from LaTeX/Unicode expressions."""
+        symbols: set = set()
+        # Greek letters and common engineering symbols
+        greek = {
+            "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
+            "epsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ",
+            "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ",
+            "nu": "ν", "xi": "ξ", "pi": "π", "rho": "ρ",
+            "sigma": "σ", "tau": "τ", "upsilon": "υ", "phi": "φ",
+            "chi": "χ", "psi": "ψ", "omega": "ω",
+            "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ",
+            "Xi": "Ξ", "Pi": "Π", "Sigma": "Σ", "Phi": "Φ",
+            "Psi": "Ψ", "Omega": "Ω",
+        }
+        for expr in expressions:
+            if not expr:
+                continue
+            # Extract from LaTeX \alpha, \gamma, etc.
+            for name, char in greek.items():
+                if f"\\{name}" in expr:
+                    symbols.add(char)
+            # Extract standalone Unicode Greek characters already in the text
+            for char in greek.values():
+                if char in expr:
+                    symbols.add(char)
+        return sorted(symbols)
+
+    def _build_chapter_summary(self, chapter_id: str, ollama) -> str:
+        """Build a rich summary for a single chapter from its graph data.
+
+        Queries all sections (full text), formula symbols, and table captions,
+        then calls the LLM for a concise description.
+        """
+        # Get chapter metadata
+        ch_rows = self.db.execute_query(
+            """MATCH (ch:Chapter {id: $id})
+               RETURN ch.number AS number, ch.title AS title""",
+            {"id": chapter_id},
+        )
+        if not ch_rows:
+            return ""
+        ch = ch_rows[0]
+        ch_number = ch.get("number", "")
+        ch_title = ch.get("title", "")
+
+        # Get all sections with full text
+        sections = self.db.execute_query(
+            """MATCH (ch:Chapter {id: $id})-[:HAS_SECTION]->(s:Section)
+               RETURN s.title AS title, s.full_text AS full_text,
+                      s.content_preview AS preview
+               ORDER BY s.number""",
+            {"id": chapter_id},
+        ) or []
+
+        # Get formula expressions for symbol extraction
+        formula_rows = self.db.execute_query(
+            """MATCH (ch:Chapter {id: $id})-[:HAS_SECTION]->(:Section)
+                     -[:HAS_FORMULA]->(f:Formula)
+               RETURN coalesce(f.unicode, f.latex) AS expr""",
+            {"id": chapter_id},
+        ) or []
+        expressions = [r.get("expr", "") for r in formula_rows]
+        symbols = self._extract_formula_symbols(expressions)
+
+        # Get table captions
+        table_rows = self.db.execute_query(
+            """MATCH (ch:Chapter {id: $id})-[:HAS_SECTION]->(:Section)
+                     -[:HAS_TABLE]->(t:Table)
+               WHERE t.caption IS NOT NULL AND t.caption <> ''
+               RETURN DISTINCT t.caption AS caption""",
+            {"id": chapter_id},
+        ) or []
+        captions = [r["caption"] for r in table_rows if r.get("caption")]
+
+        # ── Assemble structured text ────────────────────────────────────
+        parts: List[str] = [f"Kapitel {ch_number}: {ch_title}"]
+        parts.append("")
+
+        if sections:
+            parts.append("Abschnitte:")
+            for sec in sections:
+                title = sec.get("title", "")
+                full_text = sec.get("full_text", "") or sec.get("preview", "") or ""
+                # First paragraph for the summary_text field
+                first_para = full_text.split("\n\n")[0].strip() if full_text else ""
+                if first_para:
+                    parts.append(f"- {title}: {first_para}")
+                else:
+                    parts.append(f"- {title}")
+            parts.append("")
+
+        if symbols:
+            parts.append(f"Formelsymbole: {', '.join(symbols)}")
+            parts.append("")
+
+        if captions:
+            parts.append("Tabellenüberschriften:")
+            for cap in captions:
+                parts.append(f"- {cap}")
+            parts.append("")
+
+        structured_text = "\n".join(parts)
+
+        # ── LLM description from full section texts ─────────────────────
+        llm_input_parts: List[str] = []
+        for sec in sections:
+            title = sec.get("title", "")
+            full_text = sec.get("full_text", "") or ""
+            if full_text:
+                llm_input_parts.append(f"## {title}\n{full_text}")
+            else:
+                llm_input_parts.append(f"## {title}")
+        llm_input = "\n\n".join(llm_input_parts)
+
+        llm_description = ""
+        if llm_input.strip():
+            system_prompt = self._CHAPTER_SUMMARY_SYSTEM.format(
+                max_words=settings.summary_max_words
+            )
+            try:
+                llm_description = ollama.generate_text(
+                    f"{system_prompt}\n\n---\n\n{llm_input}",
+                    temperature=0.3,
+                )
+            except Exception as e:
+                logger.warning(
+                    "LLM summary failed for chapter %s: %s", chapter_id, e
+                )
+
+        if llm_description:
+            structured_text += f"Zusammenfassung:\n{llm_description.strip()}"
+
+        return structured_text.strip()
+
+    def _build_document_summary(self, doc_id: str) -> str:
+        """Build a document summary by concatenating all chapter summaries."""
+        doc_rows = self.db.execute_query(
+            """MATCH (d:Document {id: $id})
+               RETURN d.filename AS filename,
+                      d.eurocode_part AS eurocode_part,
+                      d.document_type AS document_type""",
+            {"id": doc_id},
+        )
+        if not doc_rows:
+            return ""
+        doc = doc_rows[0]
+        filename = doc.get("filename", "")
+        ec_part = doc.get("eurocode_part", "")
+        doc_type = doc.get("document_type", "")
+
+        chapter_rows = self.db.execute_query(
+            """MATCH (d:Document {id: $id})-[:HAS_CHAPTER]->(ch:Chapter)
+               WHERE ch.summary_text IS NOT NULL AND ch.summary_text <> ''
+               RETURN ch.summary_text AS summary
+               ORDER BY ch.number""",
+            {"id": doc_id},
+        ) or []
+
+        header = f"Dokument: {filename}"
+        if ec_part or doc_type:
+            meta = ", ".join(p for p in [ec_part, doc_type] if p)
+            header += f" ({meta})"
+
+        chapter_summaries = [r["summary"] for r in chapter_rows if r.get("summary")]
+        if not chapter_summaries:
+            return header
+
+        return header + "\n\n" + "\n\n".join(chapter_summaries)
+
+    def generate_summaries(self) -> int:
+        """Generate rich summaries for all Chapter and Document nodes.
+
+        Must run after ``ingest_document()`` (so sections, formulas, tables
+        exist) and before ``generate_embeddings()`` (so summaries can be
+        embedded).
+
+        Returns total number of summaries created.
+        """
+        from backend.app.modules.ollama_client import get_ollama_client
+        ollama = get_ollama_client()
+        count = 0
+
+        # ── Chapter summaries ───────────────────────────────────────────
+        chapters = self.db.execute_query(
+            """MATCH (ch:Chapter)
+               WHERE ch.summary_text IS NULL
+               RETURN ch.id AS id, ch.title AS title""",
+        ) or []
+
+        logger.info("Generating summaries for %d chapters …", len(chapters))
+        for ch in chapters:
+            try:
+                summary = self._build_chapter_summary(ch["id"], ollama)
+                if summary:
+                    self.db.execute_query(
+                        """MATCH (ch:Chapter {id: $id})
+                           SET ch.summary_text = $summary""",
+                        {"id": ch["id"], "summary": summary},
+                    )
+                    count += 1
+                    logger.debug("Summary for chapter '%s': %d chars",
+                                 ch.get("title", ""), len(summary))
+            except Exception as e:
+                logger.warning("Summary failed for chapter %s: %s", ch["id"], e)
+
+        # ── Document summaries ──────────────────────────────────────────
+        docs = self.db.execute_query(
+            """MATCH (d:Document)
+               RETURN d.id AS id, d.filename AS filename""",
+        ) or []
+
+        logger.info("Generating summaries for %d documents …", len(docs))
+        for doc in docs:
+            try:
+                summary = self._build_document_summary(doc["id"])
+                if summary:
+                    self.db.execute_query(
+                        """MATCH (d:Document {id: $id})
+                           SET d.summary_text = $summary""",
+                        {"id": doc["id"], "summary": summary},
+                    )
+                    count += 1
+                    logger.debug("Summary for document '%s': %d chars",
+                                 doc.get("filename", ""), len(summary))
+            except Exception as e:
+                logger.warning("Summary failed for document %s: %s", doc["id"], e)
+
+        logger.info("Generated %d summaries", count)
+        return count
+
+    # ----------------------------------------------------------------- #
+    #  Embedding generation
     # ----------------------------------------------------------------- #
 
     def generate_embeddings(self, doc_name: Optional[str] = None) -> int:
-        """Generate embeddings for Section, Concept, and Formula nodes via Ollama.
+        """Generate embeddings for all node types via Ollama.
 
-        Creates vector indexes if they don't exist.
+        Creates vector indexes (with auto-detected dimensions) if they
+        don't exist.  Uses chunked embedding so the **full text** of every
+        node is embedded — no hardcoded truncation.
+
         Returns total number of embeddings stored.
         """
         from backend.app.modules.ollama_client import get_ollama_client
         ollama = get_ollama_client()
         embedded = 0
 
-        # Ensure vector indexes
-        for q in [
-            """CREATE VECTOR INDEX section_embedding_index IF NOT EXISTS
-               FOR (s:Section) ON (s.embedding)
-               OPTIONS {indexConfig: {
-                   `vector.dimensions`: 768,
-                   `vector.similarity_function`: 'cosine'
-               }}""",
-            """CREATE VECTOR INDEX concept_embedding_index IF NOT EXISTS
-               FOR (c:Concept) ON (c.embedding)
-               OPTIONS {indexConfig: {
-                   `vector.dimensions`: 768,
-                   `vector.similarity_function`: 'cosine'
-               }}""",
-            """CREATE VECTOR INDEX formula_embedding_index IF NOT EXISTS
-               FOR (f:Formula) ON (f.embedding)
-               OPTIONS {indexConfig: {
-                   `vector.dimensions`: 768,
-                   `vector.similarity_function`: 'cosine'
-               }}""",
-            """CREATE VECTOR INDEX table_embedding_index IF NOT EXISTS
-               FOR (t:Table) ON (t.embedding)
-               OPTIONS {indexConfig: {
-                   `vector.dimensions`: 768,
-                   `vector.similarity_function`: 'cosine'
-               }}""",
-            """CREATE VECTOR INDEX figure_embedding_index IF NOT EXISTS
-               FOR (f:Figure) ON (f.embedding)
-               OPTIONS {indexConfig: {
-                   `vector.dimensions`: 768,
-                   `vector.similarity_function`: 'cosine'
-               }}""",
-            """CREATE VECTOR INDEX page_embedding_index IF NOT EXISTS
-               FOR (p:Page) ON (p.embedding)
-               OPTIONS {indexConfig: {
-                   `vector.dimensions`: 768,
-                   `vector.similarity_function`: 'cosine'
-               }}""",
-        ]:
+        dim = self._detect_embedding_dimensions()
+
+        # Ensure vector indexes — dimensions auto-detected from the model
+        index_defs = [
+            ("section_embedding_index", "Section", "s"),
+            ("concept_embedding_index", "Concept", "c"),
+            ("formula_embedding_index", "Formula", "f"),
+            ("table_embedding_index", "Table", "t"),
+            ("figure_embedding_index", "Figure", "f"),
+            ("page_embedding_index", "Page", "p"),
+            ("chapter_embedding_index", "Chapter", "ch"),
+            ("document_embedding_index", "Document", "d"),
+        ]
+        for idx_name, label, var in index_defs:
             try:
-                self.db.execute_query(q)
+                self.db.execute_query(
+                    f"""CREATE VECTOR INDEX {idx_name} IF NOT EXISTS
+                        FOR ({var}:{label}) ON ({var}.embedding)
+                        OPTIONS {{indexConfig: {{
+                            `vector.dimensions`: $dim,
+                            `vector.similarity_function`: 'cosine'
+                        }}}}""",
+                    {"dim": dim},
+                )
             except Exception as e:
                 logger.debug("Vector index note: %s", e)
 
@@ -988,14 +1322,11 @@ class GraphBuilder:
         for sec in sections:
             title = sec.get("title", "")
             body  = sec.get("text", "") or ""
-            # Embed title prominently so short/long sections are found equally well.
-            # 8000 chars covers the vast majority of section content without
-            # hitting the embedding model's token limit (~8192 tokens).
             text = f"{title}\n\n{body}".strip()
             if not text or len(text.strip()) < 10:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:8000])
+                emb = self._embed_chunked(ollama, text, strategy="weighted")
                 if emb:
                     self.db.execute_query(
                         """MATCH (s:Section {id: $id}) SET s.embedding = $emb""",
@@ -1019,7 +1350,7 @@ class GraphBuilder:
             if len(text.strip()) < 5:
                 continue
             try:
-                emb = ollama.generate_embedding(text)
+                emb = self._embed_chunked(ollama, text, strategy="mean")
                 if emb:
                     self.db.execute_query(
                         """MATCH (c:Concept {id: $id}) SET c.embedding = $emb""",
@@ -1042,15 +1373,13 @@ class GraphBuilder:
 
         logger.info("Embedding %d formulas …", len(formulas))
         for frm in formulas:
-            # Embed section title + expression so the formula is findable by topic.
-            # Using unicode where available makes it more semantically readable.
             sec_title = frm.get("section_title", "")
             expr      = frm.get("expr", "") or frm.get("latex", "")
             text = f"{sec_title}\n{expr}".strip() if sec_title else expr
             if len(text.strip()) < 3:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:1000])
+                emb = self._embed_chunked(ollama, text, strategy="mean")
                 if emb:
                     self.db.execute_query(
                         """MATCH (f:Formula {id: $id}) SET f.embedding = $emb""",
@@ -1084,7 +1413,7 @@ class GraphBuilder:
             if len(text.strip()) < 5:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:4000])
+                emb = self._embed_chunked(ollama, text, strategy="mean")
                 if emb:
                     self.db.execute_query(
                         """MATCH (t:Table {id: $id}) SET t.embedding = $emb""",
@@ -1118,7 +1447,7 @@ class GraphBuilder:
             if len(text.strip()) < 5:
                 continue
             try:
-                emb = ollama.generate_embedding(text[:1000])
+                emb = self._embed_chunked(ollama, text, strategy="mean")
                 if emb:
                     self.db.execute_query(
                         """MATCH (f:Figure {id: $id}) SET f.embedding = $emb""",
@@ -1130,6 +1459,12 @@ class GraphBuilder:
 
         # ── Embed Pages ──────────────────────────────────────────────────
         embedded += self._generate_page_embeddings(ollama)
+
+        # ── Embed Chapters ───────────────────────────────────────────────
+        embedded += self._generate_chapter_embeddings(ollama)
+
+        # ── Embed Documents ──────────────────────────────────────────────
+        embedded += self._generate_document_embeddings(ollama)
 
         logger.info("Stored %d embeddings", embedded)
         return embedded
@@ -1150,11 +1485,11 @@ class GraphBuilder:
         logger.info("Embedding %d pages …", len(pages))
         embedded = 0
         for pg in pages:
-            text = pg["content"][:8000]
+            text = pg["content"]
             if len(text.strip()) < 10:
                 continue
             try:
-                emb = ollama.generate_embedding(text)
+                emb = self._embed_chunked(ollama, text, strategy="mean")
                 if emb:
                     self.db.execute_query(
                         """MATCH (p:Page {id: $id}) SET p.embedding = $emb""",
@@ -1163,6 +1498,72 @@ class GraphBuilder:
                     embedded += 1
             except Exception as e:
                 logger.warning("Page embedding failed %s: %s", pg["id"], e)
+
+        return embedded
+
+    def _generate_chapter_embeddings(self, ollama=None) -> int:
+        """Generate embeddings for Chapter nodes that have summary_text."""
+        if ollama is None:
+            from backend.app.modules.ollama_client import get_ollama_client
+            ollama = get_ollama_client()
+
+        chapters = self.db.execute_query(
+            """MATCH (ch:Chapter)
+               WHERE ch.embedding IS NULL
+                 AND ch.summary_text IS NOT NULL AND ch.summary_text <> ''
+               RETURN ch.id AS id, ch.summary_text AS text
+               LIMIT 2000""",
+        )
+
+        logger.info("Embedding %d chapters …", len(chapters))
+        embedded = 0
+        for ch in chapters:
+            text = ch["text"]
+            if len(text.strip()) < 10:
+                continue
+            try:
+                emb = self._embed_chunked(ollama, text, strategy="weighted")
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (ch:Chapter {id: $id}) SET ch.embedding = $emb""",
+                        {"id": ch["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Chapter embedding failed %s: %s", ch["id"], e)
+
+        return embedded
+
+    def _generate_document_embeddings(self, ollama=None) -> int:
+        """Generate embeddings for Document nodes that have summary_text."""
+        if ollama is None:
+            from backend.app.modules.ollama_client import get_ollama_client
+            ollama = get_ollama_client()
+
+        docs = self.db.execute_query(
+            """MATCH (d:Document)
+               WHERE d.embedding IS NULL
+                 AND d.summary_text IS NOT NULL AND d.summary_text <> ''
+               RETURN d.id AS id, d.summary_text AS text
+               LIMIT 500""",
+        )
+
+        logger.info("Embedding %d documents …", len(docs))
+        embedded = 0
+        for doc in docs:
+            text = doc["text"]
+            if len(text.strip()) < 10:
+                continue
+            try:
+                emb = self._embed_chunked(ollama, text, strategy="mean")
+                if emb:
+                    self.db.execute_query(
+                        """MATCH (d:Document {id: $id}) SET d.embedding = $emb""",
+                        {"id": doc["id"], "emb": emb},
+                    )
+                    embedded += 1
+            except Exception as e:
+                logger.warning("Document embedding failed %s: %s", doc["id"], e)
 
         return embedded
 

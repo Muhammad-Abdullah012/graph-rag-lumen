@@ -2,12 +2,14 @@
 
 ## Overview
 
-Every user query goes through a 7-step pipeline before the LLM generates an answer.
+Every user query goes through a multi-stage pipeline before the LLM generates an answer.
 The graph is never bypassed — for eurocode questions, the LLM always reads from retrieved pages, never from its training data.
+
+The architecture uses **three parallel retrieval paths** (graph traversal, dense vector, sparse BM25) merged via Reciprocal Rank Fusion, followed by **cross-encoder reranking** and **graph enrichment**.
 
 ---
 
-## Step-by-Step Pipeline
+## Pipeline Diagram
 
 ```
 User Question
@@ -28,35 +30,49 @@ User Question
 └──────┬──────┘
        │
        ▼
-┌──────────────────────────────────┐
-│  4. Hybrid Retrieval (Neo4j)     │
-│                                  │
-│  ┌──────────────┐  ┌──────────┐  │
-│  │ Vector Search│  │  BM25    │  │
-│  │ (embeddings) │  │ Fulltext │  │
-│  └──────┬───────┘  └────┬─────┘  │
-│         │               │        │
-│         └──────┬────────┘        │
-│                ▼                 │
-│         RRF Merge + Dedup        │
-│                ▼                 │
-│       Adjacent Pages (+2)        │
-└──────────────┬───────────────────┘
-               │  up to 10 pages
-               ▼
+┌──────────────────────────────────────────────────────┐
+│  4. 3-Path Hybrid Search (Neo4j)                      │
+│                                                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │  Path 1:     │  │  Path 2:     │  │  Path 3:     │ │
+│  │  Top-Down    │  │  Dense       │  │  Sparse      │ │
+│  │  Graph       │  │  Vector      │  │  BM25        │ │
+│  │  Traversal   │  │  (page +     │  │  (exact      │ │
+│  │  (rich       │  │   section    │  │   Eurocode   │ │
+│  │   summaries) │  │   embeddings)│  │   terms)     │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘ │
+│         │                 │                 │         │
+│         └────────────┬────┘─────────────────┘         │
+│                      ▼                                │
+│               N-way RRF Fusion                        │
+│             (rewards pages in multiple paths)         │
+└──────────────────┬───────────────────────────────────-┘
+                   │  ~15 candidate pages
+                   ▼
+┌──────────────────────────┐
+│  5. Cross-Encoder Rerank │  BAAI/bge-reranker-v2-m3
+│     scores (query, page) │  drops irrelevant pages
+└──────────┬───────────────┘
+           │  6-8 pages
+           ▼
+┌──────────────────────────┐
+│  6. Graph Enrichment     │  NEXT_PAGE adjacency
+│     (post-rerank)        │  HAS_FIGURE, HAS_FORMULA
+└──────────┬───────────────┘
+           │
+           ▼
 ┌─────────────────┐
-│ 5. Build Context│  Format pages + replace images with [IMG-N]
-│                 │  Collect extra figures separately
-└──────┬──────────┘
-       │  ~80 000 chars
-       ▼
-┌─────────────────┐
-│  6. Answer LLM  │  Stream answer (TABLES + FORMULAS in REMINDER)
+│ 7. Build Context│  Format pages + replace images with [IMG-N]
 └──────┬──────────┘
        │
        ▼
 ┌─────────────────┐
-│  7. Post-proc   │  Restore [IMG-N] → markdown, fix LaTeX, append Abbildungen
+│  8. Answer LLM  │  Stream answer (TABLES + FORMULAS in REMINDER)
+└──────┬──────────┘
+       │
+       ▼
+┌─────────────────┐
+│  9. Post-proc   │  Restore [IMG-N] → markdown, fix LaTeX, append figures
 └─────────────────┘
 ```
 
@@ -89,206 +105,214 @@ User Question
 - Fallback on failure: static German stopword filter
 - Keywords used exclusively for BM25 fulltext search; vector search uses the full German query
 
-### Step 4 — Hybrid Retrieval
+### Step 4 — 3-Path Hybrid Search
 
-**4a. Vector Search** (`_vector_search_pages`)
-- Embedding model: `nomic-embed-text-v2-moe` (768 dimensions)
-- Index: `page_embedding_index` (cosine similarity)
-- Threshold: `score >= 0.5`
-- Fetches `limit × 2 = 16` candidates
-- Each Page node stores its full OCR text (formulas, tables, images inline)
+All three paths share a single embedding call — no redundant computation.
 
-**4b. BM25 Fulltext Search** (`_fulltext_search_pages`)
+**Path 1: Top-Down Graph Traversal** (`_topdown_search`)
+
+Uses rich chapter and document summaries to navigate the hierarchy:
+
+1. Vector search on `document_embedding_index` → top 3 documents (configurable via `TOPDOWN_MAX_DOCS`)
+2. Vector search on `chapter_embedding_index` filtered to those documents → top 5 chapters (configurable via `TOPDOWN_MAX_CHAPTERS`)
+3. Fetch all pages from those chapters via `CONTAINS_PAGE` relationship
+
+Rich summaries contain:
+- All section titles with first paragraphs
+- Formula symbols (λ, γ, σ, ψ, ...)
+- Table captions
+- LLM-generated 150-word description
+
+Graceful degradation: returns `[]` if summary indexes don't exist yet.
+
+**Path 2: Dense Vector** (`_dense_vector_search`)
+
+Dual-level vector search for maximum recall:
+
+- Sub-path A: `page_embedding_index` — direct page-level similarity (cosine, threshold ≥ 0.5)
+- Sub-path B: `section_embedding_index` — section-level similarity resolved to pages via `HAS_SECTION`
+- Results merged with 2-way RRF before joining the main fusion
+
+**Path 3: Sparse BM25** (`_fulltext_search_pages`)
+
+Exact term matching — critical for Eurocode references:
+
 - Index: `page_fulltext` (Lucene BM25)
 - Input: LLM-extracted keywords (or stopword-filtered fallback)
-- Lucene special chars are sanitized before the query
-- Fetches `limit × 2 = 16` candidates
+- Excellent for: section numbers ("3.2.1"), load combinations ("ψ₀ · Qk"), norm references ("EN 1993-1-1")
+- Lucene special chars sanitized before query
 
-**4c. Reciprocal Rank Fusion** (`_rrf_merge`)
-- Merges the two ranked lists into one
-- Score formula: `RRF(page) = 1/(k + rank_vector + 1) + 1/(k + rank_fulltext + 1)` with `k=60`
-- Pages appearing in both lists rank higher than pages in only one list
-- Deduplication by `(page_number, document)` — prevents the same page appearing twice via different chapter paths
-- Final output: top `limit = 8` pages
+**N-way RRF Fusion** (`_rrf_merge_multi`)
 
-**4d. Adjacent Pages** (`_fetch_adjacent_pages`)
-- For the top 3 RRF results, fetches their `NEXT_PAGE` neighbour
-- Adds up to 2 extra pages (if not already in the result set)
-- Purpose: tables and continuation text often land on the page immediately after the referencing page
-- Total: up to 10 pages sent to context
+- Score formula: `RRF(page) = Σ 1/(k + rank_i + 1)` across all paths where page appears
+- `k = 60` (configurable via `HYBRID_RRF_K`)
+- Pages appearing in multiple paths rank higher — the key insight that improves accuracy
+- Deduplication by `(page_number, document)` key
+- Output: ~15 candidate pages (configurable via `HYBRID_CANDIDATES_PER_PATH`)
 
-### Step 5 — Build Context
+### Step 5 — Cross-Encoder Reranking
+
+- Model: `BAAI/bge-reranker-v2-m3` (multilingual, supports German)
+- Runs on CPU (GPU reserved for Ollama)
+- Each page split into overlapping chunks (4000 chars, 400 overlap)
+- All `(query, chunk)` pairs scored in one batched inference call
+- **Max chunk score** used as page score — ensures relevant content anywhere in the page is captured
+- Filters: top `RERANKER_TOP_K` (default 8) pages with score ≥ `RERANKER_THRESHOLD` (default -5.0)
+- Result: 6-8 high-confidence pages
+
+### Step 6 — Graph Enrichment (Post-Rerank)
+
+After reranking selects the best pages, the graph expands context for completeness:
+
+- **NEXT_PAGE adjacency**: Fetches the next page for top results (tables often span pages). Max `ENRICHMENT_MAX_ADJACENT` (default 2) extra pages.
+- **HAS_FIGURE**: Collects figures from sections on retrieved pages. Max `ENRICHMENT_MAX_FIGURES` (default 10).
+- **HAS_FORMULA**: Collects formulas from sections on retrieved pages. Max `ENRICHMENT_MAX_FORMULAS` (default 10).
+
+This is enrichment, not retrieval — it adds context without changing the ranking.
+
+### Step 7 — Build Context
 
 - Pages formatted as numbered blocks: `[N] Seite X | Chapter (Dokument: ...)\n<content>`
 - **Image placeholder system**:
-  - OCR-embedded image markdown (`![caption](/api/images/...)`) is replaced with short `[IMG-N]` tokens in page text
-  - A mapping is stored: `{IMG-1: "![caption](/api/images/...)", ...}`
-  - This prevents the LLM from seeing/copying/corrupting full image URLs
-- **Extra figures**:
-  - Section IDs from all retrieved pages are collected
-  - `get_figures_for_sections(section_ids[:20], limit=10)` fetches Figure nodes linked to those sections
-  - These figures are stored separately in `extra_figures` list (NOT injected into context)
-  - Prevents the LLM from explaining/repeating the placeholder system
-- Each page content capped at 8 000 chars
-- Total context can reach ~80 000 chars
+  - OCR-embedded image markdown (`![caption](/api/images/...)`) replaced with `[IMG-N]` tokens
+  - Mapping stored: `{IMG-1: "![caption](/api/images/...)", ...}`
+  - Prevents LLM from seeing/corrupting full image URLs
+- **Extra figures**: stored separately (not injected into LLM context)
 
-### Step 6 — Answer LLM
+### Step 8 — Answer LLM
 
 - Model: `mistral-small3.2:24b`, streamed token-by-token
 - System prompt (`ANSWER_SYSTEM`) enforces:
   - Copy formulas **verbatim** from context — no rewriting
   - Copy tables as markdown — no summarization
   - Reply in user's language
-  - If answer is not in context: output **only** the sentence `"Diese Information ist im bereitgestellten Kontext nicht vorhanden."` — nothing else
-- REMINDER in user prompt covers only **TABLES** and **FORMULAS** (no image instructions — prevents LLM from explaining the placeholder system)
+  - If answer is not in context: output **only** `"Diese Information ist im bereitgestellten Kontext nicht vorhanden."`
 
-### Step 7 — Post-processing
+### Step 9 — Post-processing
 
-**7a. Restore image placeholders**
-- Replace `[IMG-N]` tokens in the LLM answer with real image markdown: `![caption](/api/images/...)`
-- Done after LLM generation so the LLM never sees the full URLs
-
-**7b. Fix bare LaTeX**
-- `\[...\]` → `$$...$$`
-- `\(...\)` → `$$...$$`
-- Lines with LaTeX tokens but no `$` → wrap in `$$...$$`
-
-**7c. Append extra figures**
-- If `extra_figures` is non-empty:
-  - Append `\n\n---\n**Abbildungen:**\n`
-  - Append one `![caption](path)` line per figure
-- Done entirely outside the LLM (no risk of hallucination or repetition)
+- Restore `[IMG-N]` → real image markdown
+- Fix bare LaTeX (`\[...\]` → `$$...$$`, etc.)
+- Append extra figures section
 
 ---
 
-## Current Limitations & Accuracy Issues
+## Embeddings
 
-### 1. Missing Documents (Highest Impact)
-**Problem:** If the relevant Eurocode part is not uploaded, the answer is always wrong.
-The retrieval can only return pages that exist in the graph.
+### Auto-Detected Dimensions
 
-**Fix:** Upload all relevant Eurocode parts. There is no workaround in retrieval.
+Embedding dimensions are auto-detected at runtime by probing the configured model. No hardcoded dimension values — works with any embedding model (bge-m3 = 1024-dim, nomic = 768-dim, etc.).
 
----
+### Chunked Full-Text Embedding
 
-### 2. Embedding Quality for Technical Text
-**Problem:** `nomic-embed-text-v2-moe` is a general-purpose model. It does not
-understand Eurocode-specific terminology deeply.
+All node types are embedded using chunked embedding (`_embed_chunked`) — **no text truncation**:
 
-**Symptoms:** Score threshold at 0.5 still allows semantically incorrect pages through.
+1. Text split into overlapping chunks (configurable via `EMBEDDING_CHUNK_SIZE`, `EMBEDDING_CHUNK_OVERLAP`)
+2. Each chunk embedded independently
+3. Combined using strategy:
+   - **mean**: equal-weight average (pages, tables, figures, formulas, documents)
+   - **weighted**: first chunk gets 2x weight (sections, chapters — title/intro most important)
 
-**Possible fix:**
-- Fine-tune the embedding model on Eurocode text (complex, requires labeled data)
-- Use a stronger embedding model (e.g. `mxbai-embed-large`, `bge-m3`) — swap via `OLLAMA_EMBEDDING_MODEL`
-- Re-embed all pages after switching model (requires graph rebuild)
+### Embedded Node Types (8 vector indexes)
 
----
-
-### 3. BM25 Vocabulary Mismatch
-**Problem:** German compound words behave differently in Lucene BM25.
-`"Straßenbrücke"` does not match `"Brücke"` — they are different tokens.
-
-**Symptoms:** A query using one German compound word misses pages that use a
-different but synonymous compound.
-
-**Possible fix:**
-- Use a German language analyzer in Neo4j fulltext index (stemming/decomposition)
-- Currently Neo4j uses the default Lucene analyzer; switching to `german` analyzer
-  would require dropping and recreating the `page_fulltext` index
+| Node | Index | Strategy | Source Text |
+|------|-------|----------|-------------|
+| Document | `document_embedding_index` | mean | Rich summary (all chapter summaries concatenated) |
+| Chapter | `chapter_embedding_index` | weighted | Rich summary (sections, formulas, tables, LLM description) |
+| Section | `section_embedding_index` | weighted | title + full_text |
+| Page | `page_embedding_index` | mean | Full OCR content |
+| Table | `table_embedding_index` | mean | section_title + caption + content + annotation |
+| Figure | `figure_embedding_index` | mean | section_title + caption + description + annotation |
+| Formula | `formula_embedding_index` | mean | section_title + unicode/latex |
+| Concept | `concept_embedding_index` | mean | name + description |
 
 ---
 
-### 4. LLM Instruction Following (Hallucination)
-**Problem:** `mistral-small3.2:24b` sometimes ignores the "not found" rule and generates
-an answer from its training data instead.
+## Rich Chapter & Document Summaries
 
-**Symptoms:** Model answers with general Eurocode knowledge when the specific value is not in the retrieved pages.
+Generated at build time (not query time) via `POST /api/graph/generate-summaries`.
 
-**Mitigation:** Off-topic queries are blocked at the router before any graph search.
+### Chapter Summary Structure
 
-**Possible fix:**
-- Use Claude API (`claude-sonnet-4-6`) for the answer step only, keeping local embeddings and retrieval
-- Add cross-encoder re-ranker to prevent low-quality pages from being used
-- Post-process: check if answer contains the "not found" phrase and if not, re-run with a stricter prompt
+```
+Kapitel {number}: {title}
 
----
+Abschnitte:
+- {section_title}: {first_paragraph}
+- {section_title}: {first_paragraph}
+...
 
-### 5. Re-ranking is Order-Only (No Score Cutoff After Merge)
-**Problem:** After RRF merge, all 8 pages are passed to the LLM regardless of
-their actual relevance. The 8th page might be very weakly related.
+Formelsymbole: λ, γ, σ, ψ, ...
 
-**Symptoms:** LLM context contains irrelevant pages, which can confuse the model
-or cause it to quote an unrelated passage.
+Tabellenüberschriften:
+- {caption_1}
+- {caption_2}
 
-**Possible fix:**
-- Add a cross-encoder re-ranker (e.g. `BAAI/bge-reranker-v2-m3`) as a 4th step
-  after RRF, which scores each (query, page) pair and can drop low-scoring pages
-- This is the biggest accuracy improvement that does not require new documents
+Zusammenfassung:
+{LLM-generated 150-word description based on full section texts}
+```
 
----
+### Document Summary
 
-### 6. Table Data Depends on Re-processing
-**Problem:** Documents uploaded before `table_format="markdown"` was set store only
-`[tbl-N.html]` placeholder text — no actual table content in the graph.
-
-**Status:** Current OCR pipeline uses `table_format="markdown"`, producing pipe-delimited tables.
-
-**Fix:** Re-upload all documents so Mistral OCR re-runs with correct table format
-and table content is embedded into the page text.
+Concatenation of all chapter summaries with document metadata header. No additional LLM call.
 
 ---
 
-### 7. Single-Page Granularity
-**Problem:** Retrieval is at the Page level. If the answer spans two pages and
-the second page scores low, it may be missed.
+## Configuration (Environment Variables)
 
-**Mitigation:** Adjacent page fetching for top 3 results partially addresses this.
-
-**Possible fix:** Overlapping page windows (include page N-1 and N+1 for all top 8 results,
-not just top 3). Increases context size but improves recall for multi-page answers.
-
----
-
-### 8. Image URL Hallucination
-**Problem:** Images are stored as hashed filenames (`/api/images/33a378d1_...`).
-If the LLM sees a raw image URL in context, it may corrupt the hash during generation.
-
-**Status:** `[IMG-N]` placeholder system (Step 5) prevents this by replacing all image
-markdown before the LLM sees it. Images are restored after generation, and extra figures
-are appended directly in post-processing without LLM involvement.
-
-**Result:** LLM never sees or copies image URLs, eliminating hallucination risk for this channel.
-
----
-
-## Improvement Roadmap (Priority Order)
-
-| Priority | Action | Effort | Impact | Status |
-|---|---|---|---|---|
-| 1 | Upload all missing Eurocode PDFs | Low | Very high | Ongoing |
-| 2 | Re-process all existing documents (table fix) | Low | High | Done (`table_format=markdown`) |
-| 3 | Cross-encoder re-ranker after RRF | Medium | High | Pending |
-| 4 | Switch to better embedding model (`bge-m3`) | Medium | Medium | Pending |
-| 5 | German analyzer in Neo4j fulltext index | Medium | Medium | Pending |
-| 6 | Use Claude API for the answer step only | Low (cost) | High (hallucination fix) | Pending |
-| 7 | Expand adjacent page window (N-1, N+1 for all top 8) | Low | Medium | Pending |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TOPDOWN_MAX_DOCS` | 3 | Max documents in graph traversal path |
+| `TOPDOWN_MAX_CHAPTERS` | 5 | Max chapters in graph traversal path |
+| `HYBRID_RRF_K` | 60 | RRF smoothing parameter |
+| `HYBRID_CANDIDATES_PER_PATH` | 15 | Candidates per search path before fusion |
+| `RERANKER_ENABLED` | true | Enable/disable cross-encoder reranking |
+| `RERANKER_MODEL` | BAAI/bge-reranker-v2-m3 | Cross-encoder model |
+| `RERANKER_TOP_K` | 8 | Max pages after reranking |
+| `RERANKER_THRESHOLD` | -5.0 | Score cutoff for reranker |
+| `ENRICHMENT_MAX_ADJACENT` | 2 | Max adjacent pages added |
+| `ENRICHMENT_MAX_FIGURES` | 10 | Max figures from graph enrichment |
+| `ENRICHMENT_MAX_FORMULAS` | 10 | Max formulas from graph enrichment |
+| `EMBEDDING_CHUNK_SIZE` | 6000 | Chars per embedding chunk |
+| `EMBEDDING_CHUNK_OVERLAP` | 500 | Overlap between embedding chunks |
+| `SUMMARY_MAX_WORDS` | 150 | LLM summary length |
 
 ---
 
 ## Data Flow in Neo4j
 
 ```
-Document
-  └─► Chapter (HAS_CHAPTER)
+Document  (summary_text, embedding)
+  └─► Chapter (HAS_CHAPTER)  (summary_text, embedding)
         └─► Page (CONTAINS_PAGE)  ◄── what we retrieve
-              ├─► Page (NEXT_PAGE) ◄── adjacent page fetch
-              └─► Section (HAS_SECTION)
-                    └─► Figure (HAS_FIGURE) ◄── extra_figures fetch
+              ├─► Page (NEXT_PAGE) ◄── enrichment: adjacent pages
+              └─► Section (HAS_SECTION)  (embedding)
+                    ├─► Figure (HAS_FIGURE)  ◄── enrichment: figures
+                    └─► Formula (HAS_FORMULA) ◄── enrichment: formulas
 
 Page.content = full OCR text (formulas + markdown tables + inline images)
-Page.embedding = nomic-embed-text-v2-moe 768-dim vector
+Page.embedding = chunked full-text embedding (auto-detected dimensions)
 ```
 
 Indexes:
-- `page_embedding_index` — vector index on `Page.embedding`
-- `page_fulltext` — Lucene BM25 index on `Page.content`
+- 8 vector indexes (auto-detected dimensions, cosine similarity)
+- 6 fulltext indexes (Lucene BM25)
+- 5 property indexes + 9 unique constraints
+
+---
+
+## Build Pipeline
+
+```
+rebuild-graph.sh pipeline:
+  1. Clear graph (DETACH DELETE all nodes)
+  2. Drop all vector indexes
+  3. Build graph from JSON (ingest all documents)
+  4. Generate summaries (chapter + document)
+  5. Generate embeddings (all 8 node types)
+```
+
+API endpoints:
+- `POST /api/graph/build` — ingest JSON files
+- `POST /api/graph/generate-summaries` — create rich summaries
+- `POST /api/graph/generate-embeddings` — embed all nodes
+- `POST /api/graph/compute-similarity` — SEMANTICALLY_SIMILAR edges

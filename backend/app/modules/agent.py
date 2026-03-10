@@ -85,6 +85,7 @@ class AgentState(TypedDict, total=False):
     ranked_context: str                 # top context string for LLM
     img_mapping: Dict[str, str]         # IMG-N → real ![caption](url) mapping (OCR-embedded)
     extra_figures: List[str]            # Additional figures to append after answer (markdown lines)
+    _extra_figures_raw: List[Dict[str, Any]]  # Raw figure dicts from graph enrichment
     tools_used: List[Dict[str, Any]]    # metadata about searches run
     answer: str                         # final answer text
 
@@ -478,19 +479,49 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         tools_used: List[Dict[str, Any]] = []
 
         try:
-            pages = querier.search_pages(search_query, limit=8, keywords=keywords)
+            pages = querier.search_hybrid(
+                search_query,
+                limit=settings.hybrid_candidates_per_path,
+                keywords=keywords,
+            )
             tools_used.append({
-                "tool": "search_pages",
-                "arguments": {"query": search_query, "keywords": keywords},
+                "tool": "search_hybrid",
+                "arguments": {"query": search_query, "keywords": keywords, "pages": len(pages)},
             })
         except Exception as e:
-            logger.error("Page search failed for '%s': %s", search_query[:80], e)
+            logger.error("Hybrid search failed for '%s': %s", search_query[:80], e)
             pages = []
             tools_used.append({
-                "tool": "search_pages",
+                "tool": "search_hybrid",
                 "arguments": {"query": search_query, "keywords": keywords},
                 "error": str(e),
             })
+
+        # Cross-encoder reranking
+        from backend.app.modules.reranker import get_reranker
+        reranker = get_reranker()
+        if reranker and pages:
+            try:
+                pages = reranker.rerank(
+                    search_query,
+                    pages,
+                    top_k=settings.reranker_top_k,
+                    threshold=settings.reranker_threshold,
+                )
+                tools_used.append({
+                    "tool": "rerank",
+                    "arguments": {"pages_after": len(pages)},
+                })
+            except Exception as e:
+                logger.warning("Reranker failed, using unranked pages: %s", e)
+
+        # Graph enrichment
+        extra_figures_raw: List[Dict[str, Any]] = []
+        extra_formulas: List[Dict[str, Any]] = []
+        try:
+            pages, extra_figures_raw, extra_formulas = querier.enrich_with_graph(pages)
+        except Exception as e:
+            logger.debug("Graph enrichment failed: %s", e)
 
         return {
             **state,
@@ -498,6 +529,7 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
             "keywords": keywords,
             "search_results": pages,
             "tools_used": tools_used,
+            "_extra_figures_raw": extra_figures_raw,
         }
 
     # ── Node: build context ──────────────────────────────────────────
@@ -507,45 +539,23 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         img_counter: List[int] = [1]
         context = _format_pages_as_context(pages, img_mapping, img_counter)
 
-        # Fetch figures for sections found on retrieved pages
-        all_section_ids: List[str] = []
-        seen_sids: set = set()
-        for p in pages:
-            for sid in (p.get("section_ids") or []):
-                if sid and sid not in seen_sids:
-                    all_section_ids.append(sid)
-                    seen_sids.add(sid)
-
         tools_used = list(state.get("tools_used", []))
 
+        # Build extra_figures markdown from enrichment results
         extra_figures: List[str] = []
-        if all_section_ids:
-            try:
-                figures = querier.get_figures_for_sections(
-                    all_section_ids[:20], limit=10
-                )
-                if figures:
-                    existing_paths: set = {
-                        v.split("](")[1].rstrip(")")
-                        for v in img_mapping.values()
-                    }
-                    seen_paths: set = set()
-                    for fig in figures:
-                        path = fig.get("image_path", "")
-                        caption = fig.get("caption", "") or fig.get("number", "")
-                        if path and path not in seen_paths and path not in existing_paths:
-                            seen_paths.add(path)
-                            extra_figures.append(f"![{caption}]({path})")
-                    if extra_figures:
-                        tools_used.append({
-                            "tool": "get_figures",
-                            "arguments": {
-                                "section_ids": len(all_section_ids),
-                                "figures_found": len(extra_figures),
-                            },
-                        })
-            except Exception as e:
-                logger.debug("Figure fetch failed: %s", e)
+        extra_figures_raw = state.get("_extra_figures_raw", [])
+        if extra_figures_raw:
+            existing_paths: set = set()
+            for v in img_mapping.values():
+                if "](/" in v:
+                    existing_paths.add(v.split("](")[1].rstrip(")"))
+            seen_paths: set = set()
+            for fig in extra_figures_raw:
+                path = fig.get("image_path", "")
+                caption = fig.get("caption", "") or fig.get("number", "")
+                if path and path not in seen_paths and path not in existing_paths:
+                    seen_paths.add(path)
+                    extra_figures.append(f"![{caption}]({path})")
 
         tools_used.append({
             "tool": "rank_context",
@@ -717,7 +727,7 @@ class EurocodeAgent:
             return
 
         # ── Eurocode path ─────────────────────────────────────────────
-        # Step 2: translate → extract keywords → search top 8 pages
+        # Step 2: translate → extract keywords → 3-path hybrid search
         yield {"type": "status", "step": "searching", "message": "Suche im Wissensgraphen…"}
         search_query = await _atranslate_to_german(question, self.llm)
         keywords = await _aextract_keywords(search_query, self.llm)
@@ -725,18 +735,57 @@ class EurocodeAgent:
         tools_used: List[Dict[str, Any]] = []
         pages: List[Dict[str, Any]] = []
         try:
-            pages = self.querier.search_pages(search_query, limit=8, keywords=keywords)
+            pages = self.querier.search_hybrid(
+                search_query,
+                limit=settings.hybrid_candidates_per_path,
+                keywords=keywords,
+            )
             tools_used.append({
-                "tool": "search_pages",
+                "tool": "search_hybrid",
                 "arguments": {"query": search_query, "keywords": keywords, "pages": len(pages)},
             })
         except Exception as e:
-            logger.error("Page search failed in stream: %s", e)
+            logger.error("Hybrid search failed in stream: %s", e)
             tools_used.append({
-                "tool": "search_pages",
+                "tool": "search_hybrid",
                 "arguments": {"query": search_query, "keywords": keywords},
                 "error": str(e),
             })
+
+        # Step 2b: cross-encoder reranking
+        yield {"type": "status", "step": "reranking", "message": "Bewerte Relevanz…"}
+        from backend.app.modules.reranker import get_reranker
+        reranker = get_reranker()
+        if reranker and pages:
+            try:
+                pages = reranker.rerank(
+                    search_query,
+                    pages,
+                    top_k=settings.reranker_top_k,
+                    threshold=settings.reranker_threshold,
+                )
+                tools_used.append({
+                    "tool": "rerank",
+                    "arguments": {"pages_after": len(pages)},
+                })
+            except Exception as e:
+                logger.warning("Reranker failed, using unranked pages: %s", e)
+
+        # Step 2c: graph enrichment (adjacent pages, figures, formulas)
+        extra_figures_raw: List[Dict[str, Any]] = []
+        extra_formulas: List[Dict[str, Any]] = []
+        try:
+            pages, extra_figures_raw, extra_formulas = self.querier.enrich_with_graph(pages)
+            if extra_figures_raw or extra_formulas:
+                tools_used.append({
+                    "tool": "enrich_with_graph",
+                    "arguments": {
+                        "figures": len(extra_figures_raw),
+                        "formulas": len(extra_formulas),
+                    },
+                })
+        except Exception as e:
+            logger.debug("Graph enrichment failed: %s", e)
 
         # Step 3: format pages as context (replace images with placeholders)
         yield {"type": "status", "step": "ranking", "message": "Bereite Kontext vor…"}
@@ -744,43 +793,20 @@ class EurocodeAgent:
         img_counter: List[int] = [1]
         context = _format_pages_as_context(pages, img_mapping, img_counter)
 
-        # Step 3b: fetch figures for sections found on retrieved pages
-        all_section_ids: List[str] = []
-        seen_sids: set = set()
-        for p in pages:
-            for sid in (p.get("section_ids") or []):
-                if sid and sid not in seen_sids:
-                    all_section_ids.append(sid)
-                    seen_sids.add(sid)
-
+        # Build extra_figures markdown from enrichment results
         extra_figures: List[str] = []
-        if all_section_ids:
-            try:
-                figures = self.querier.get_figures_for_sections(
-                    all_section_ids[:20], limit=10
-                )
-                if figures:
-                    existing_paths: set = {
-                        v.split("](")[1].rstrip(")")
-                        for v in img_mapping.values()
-                    }
-                    seen_paths: set = set()
-                    for fig in figures:
-                        path = fig.get("image_path", "")
-                        caption = fig.get("caption", "") or fig.get("number", "")
-                        if path and path not in seen_paths and path not in existing_paths:
-                            seen_paths.add(path)
-                            extra_figures.append(f"![{caption}]({path})")
-                    if extra_figures:
-                        tools_used.append({
-                            "tool": "get_figures",
-                            "arguments": {
-                                "section_ids": len(all_section_ids),
-                                "figures_found": len(extra_figures),
-                            },
-                        })
-            except Exception as e:
-                logger.debug("Figure fetch failed: %s", e)
+        if extra_figures_raw:
+            existing_paths: set = set()
+            for v in img_mapping.values():
+                if "](/" in v:
+                    existing_paths.add(v.split("](")[1].rstrip(")"))
+            seen_paths: set = set()
+            for fig in extra_figures_raw:
+                path = fig.get("image_path", "")
+                caption = fig.get("caption", "") or fig.get("number", "")
+                if path and path not in seen_paths and path not in existing_paths:
+                    seen_paths.add(path)
+                    extra_figures.append(f"![{caption}]({path})")
 
         tools_used.append({
             "tool": "build_context",

@@ -68,6 +68,22 @@ async def generate_embeddings():
         return {"status": f"error: {str(e)}", "embeddings_created": 0}
 
 
+@router.post("/generate-summaries")
+async def generate_summaries():
+    """Generate rich chapter and document summaries for top-down retrieval.
+
+    Must run after graph build (sections, formulas, tables exist) and
+    before embedding generation (so summaries can be embedded).
+    """
+    try:
+        builder = get_graph_builder()
+        count = builder.generate_summaries()
+        return {"status": "success", "summaries_created": count}
+    except Exception as e:
+        logger.error(f"Summary generation failed: {str(e)}")
+        return {"status": f"error: {str(e)}", "summaries_created": 0}
+
+
 @router.post("/compute-similarity")
 async def compute_similarity(threshold: float = 0.80, top_k: int = 5):
     """Compute SEMANTICALLY_SIMILAR edges between sections across documents."""

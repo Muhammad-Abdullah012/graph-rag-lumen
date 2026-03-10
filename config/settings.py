@@ -47,6 +47,22 @@ class Settings(BaseSettings):
     embedding_chunk_size: int = int(os.getenv("EMBEDDING_CHUNK_SIZE", "6000"))
     embedding_chunk_overlap: int = int(os.getenv("EMBEDDING_CHUNK_OVERLAP", "500"))
 
+    # Hybrid retrieval
+    hybrid_rrf_k: int = int(os.getenv("HYBRID_RRF_K", "60"))
+    hybrid_candidates_per_path: int = int(os.getenv("HYBRID_CANDIDATES_PER_PATH", "15"))
+
+    # Summary generation
+    summary_max_words: int = int(os.getenv("SUMMARY_MAX_WORDS", "150"))
+
+    # Graph enrichment
+    enrichment_max_adjacent: int = int(os.getenv("ENRICHMENT_MAX_ADJACENT", "2"))
+    enrichment_max_figures: int = int(os.getenv("ENRICHMENT_MAX_FIGURES", "10"))
+    enrichment_max_formulas: int = int(os.getenv("ENRICHMENT_MAX_FORMULAS", "10"))
+
+    # Content retrieval limits (chars returned from Neo4j per result row)
+    page_content_limit: int = int(os.getenv("PAGE_CONTENT_LIMIT", "50000"))
+    section_content_limit: int = int(os.getenv("SECTION_CONTENT_LIMIT", "50000"))
+
     # Documents
     documents_path: str = os.getenv("DOCUMENTS_PATH", "documents")
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", str(50 * 1024 * 1024)))

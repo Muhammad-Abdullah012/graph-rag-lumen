@@ -16,6 +16,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from backend.app.modules.database import get_neo4j_connection
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -201,8 +202,8 @@ class GraphQuerier:
     def search_sections(self, keyword: str, limit: int = 15) -> List[Dict[str, Any]]:
         """Search sections by title / content via full-text index, fallback CONTAINS.
 
-        Returns section content (4000 chars) plus all associated formula LaTeX
-        so the LLM sees the exact formulas belonging to each section.
+        Returns section content (configurable via SECTION_CONTENT_LIMIT) plus
+        all associated formula LaTeX so the LLM sees the exact formulas.
         """
         try:
             results = self.db.execute_query(
@@ -211,13 +212,13 @@ class GraphQuerier:
                    OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(node)
                    OPTIONAL MATCH (node)-[:HAS_FORMULA]->(frm:Formula)
                    RETURN node.id AS id, node.title AS title,
-                          substring(node.full_text, 0, 4000) AS content,
+                          substring(node.full_text, 0, $content_limit) AS content,
                           node.start_page AS page,
                           d.filename AS document, score,
                           collect(DISTINCT frm.latex) AS formula_latex
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": self._sanitize_lucene(keyword), "limit": limit},
+                {"query": self._sanitize_lucene(keyword), "limit": limit, "content_limit": settings.section_content_limit},
             )
             if results:
                 return results
@@ -231,12 +232,12 @@ class GraphQuerier:
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                OPTIONAL MATCH (s)-[:HAS_FORMULA]->(frm:Formula)
                RETURN s.id AS id, s.title AS title,
-                      substring(s.full_text, 0, 4000) AS content,
+                      substring(s.full_text, 0, $content_limit) AS content,
                       s.start_page AS page,
                       d.filename AS document, 0.5 AS score,
                       collect(DISTINCT frm.latex) AS formula_latex
                LIMIT $limit""",
-            {"kw": keyword, "limit": limit},
+            {"kw": keyword, "limit": limit, "content_limit": settings.section_content_limit},
         )
 
     # ================================================================== #
@@ -320,14 +321,14 @@ class GraphQuerier:
                OPTIONAL MATCH (s)-[:HAS_FORMULA]->(frm:Formula)
                RETURN s.id AS id, s.title AS title,
                       s.title AS section,
-                      substring(s.full_text, 0, 4000) AS content,
+                      substring(s.full_text, 0, $content_limit) AS content,
                       s.content_preview AS preview,
                       m.confidence AS confidence, d.filename AS document,
                       s.start_page AS page,
                       collect(DISTINCT frm.latex) AS formula_latex
                ORDER BY m.confidence DESC
                LIMIT 20""",
-            {"name": concept_name},
+            {"name": concept_name, "content_limit": settings.section_content_limit},
         )
 
     def get_related_concepts(self, concept_name: str) -> List[Dict[str, Any]]:
@@ -564,13 +565,13 @@ class GraphQuerier:
                        OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(node)
                        OPTIONAL MATCH (node)-[:HAS_FORMULA]->(frm:Formula)
                        RETURN node.id AS id, node.title AS title,
-                              substring(node.full_text, 0, 4000) AS content,
+                              substring(node.full_text, 0, $content_limit) AS content,
                               node.start_page AS page,
                               d.filename AS document,
                               score,
                               collect(DISTINCT frm.latex) AS formula_latex
                        ORDER BY score DESC""",
-                    {"top_k": top_k, "embedding": embedding},
+                    {"top_k": top_k, "embedding": embedding, "content_limit": settings.section_content_limit},
                 )
                 if results:
                     return results
@@ -697,14 +698,14 @@ class GraphQuerier:
                }
                RETURN node.id         AS page_id,
                       node.page_number AS page_number,
-                      substring(node.content, 0, 8000) AS content,
+                      substring(node.content, 0, $content_limit) AS content,
                       node.header      AS header,
                       coalesce(direct_ch, fb_ch)   AS chapter,
                       coalesce(direct_doc, fb_doc) AS document,
                       score,
                       section_titles, section_ids
                ORDER BY score DESC""",
-            {"limit": limit * 2, "embedding": embedding},
+            {"limit": limit * 2, "embedding": embedding, "content_limit": settings.page_content_limit},
         ) or []
 
     def _fulltext_search_pages(
@@ -750,14 +751,14 @@ class GraphQuerier:
                }
                RETURN node.id         AS page_id,
                       node.page_number AS page_number,
-                      substring(node.content, 0, 8000) AS content,
+                      substring(node.content, 0, $content_limit) AS content,
                       node.header      AS header,
                       coalesce(direct_ch, fb_ch)   AS chapter,
                       coalesce(direct_doc, fb_doc) AS document,
                       score,
                       section_titles, section_ids
                ORDER BY score DESC LIMIT $limit""",
-            {"query": self._sanitize_lucene(search_terms), "limit": limit * 2},
+            {"query": self._sanitize_lucene(search_terms), "limit": limit * 2, "content_limit": settings.page_content_limit},
         ) or []
 
     @staticmethod
@@ -783,7 +784,8 @@ class GraphQuerier:
             key = _key(page)
             if key in scores:
                 scores[key]["rrf"] += 1.0 / (k + rank + 1)
-            scores[key] = {"page": page, "rrf": 1.0 / (k + rank + 1)}
+            else:
+                scores[key] = {"page": page, "rrf": 1.0 / (k + rank + 1)}
         for rank, page in enumerate(list_b):
             key = _key(page)
             if key in scores:
@@ -848,14 +850,14 @@ class GraphQuerier:
                }
                RETURN nxt.id          AS page_id,
                       nxt.page_number  AS page_number,
-                      substring(nxt.content, 0, 8000) AS content,
+                      substring(nxt.content, 0, $content_limit) AS content,
                       nxt.header       AS header,
                       coalesce(direct_ch, fb_ch)   AS chapter,
                       coalesce(direct_doc, fb_doc) AS document,
                       0.0              AS score,
                       []               AS section_titles,
                       []               AS section_ids""",
-            {"ids": page_ids},
+            {"ids": page_ids, "content_limit": settings.page_content_limit},
         ) or []
 
         unique: List[Dict[str, Any]] = []
@@ -930,6 +932,314 @@ class GraphQuerier:
                 unique.append(p)
         return unique
 
+    # ----------------------------------------------------------------- #
+    #  3-Path Hybrid Search
+    # ----------------------------------------------------------------- #
+
+    def _topdown_search(
+        self, embedding: list, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Path 1: Graph traversal via rich document/chapter summaries.
+
+        1. Score Documents by vector similarity on ``document_embedding_index``.
+        2. Score Chapters within those docs on ``chapter_embedding_index``.
+        3. Fetch all pages from the top chapters via ``CONTAINS_PAGE``.
+
+        Returns ``[]`` gracefully if the indexes don't exist yet.
+        """
+        from config.settings import settings
+
+        # Step 1: top documents
+        try:
+            doc_rows = self.db.execute_query(
+                """CALL db.index.vector.queryNodes(
+                       'document_embedding_index', $max_docs, $embedding
+                   ) YIELD node, score
+                   WHERE score >= 0.4
+                   RETURN node.id AS doc_id, node.filename AS filename, score
+                   ORDER BY score DESC""",
+                {"max_docs": settings.topdown_max_docs, "embedding": embedding},
+            ) or []
+        except Exception as e:
+            logger.debug("Top-down document search unavailable: %s", e)
+            return []
+
+        if not doc_rows:
+            return []
+
+        doc_ids = [r["doc_id"] for r in doc_rows]
+
+        # Step 2: top chapters within those documents
+        try:
+            chapter_rows = self.db.execute_query(
+                """CALL db.index.vector.queryNodes(
+                       'chapter_embedding_index', $candidates, $embedding
+                   ) YIELD node, score
+                   WHERE score >= 0.4
+                   MATCH (d:Document)-[:HAS_CHAPTER]->(node)
+                   WHERE d.id IN $doc_ids
+                   RETURN node.id AS chapter_id, score
+                   ORDER BY score DESC
+                   LIMIT $max_chapters""",
+                {
+                    "candidates": settings.topdown_max_chapters * 3,
+                    "embedding": embedding,
+                    "doc_ids": doc_ids,
+                    "max_chapters": settings.topdown_max_chapters,
+                },
+            ) or []
+        except Exception as e:
+            logger.debug("Top-down chapter search unavailable: %s", e)
+            return []
+
+        if not chapter_rows:
+            return []
+
+        chapter_ids = [r["chapter_id"] for r in chapter_rows]
+
+        # Step 3: fetch all pages from those chapters
+        pages = self.db.execute_query(
+            """UNWIND $chapter_ids AS cid
+               MATCH (ch:Chapter {id: cid})-[:CONTAINS_PAGE]->(p:Page)
+               WHERE p.content IS NOT NULL AND trim(p.content) <> ''
+               MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+               OPTIONAL MATCH (p)-[:HAS_SECTION]->(s:Section)
+               WITH p, ch, d,
+                    collect(DISTINCT s.title) AS section_titles,
+                    collect(DISTINCT s.id)    AS section_ids
+               RETURN p.id          AS page_id,
+                      p.page_number  AS page_number,
+                      substring(p.content, 0, $content_limit) AS content,
+                      p.header       AS header,
+                      ch.title       AS chapter,
+                      d.filename     AS document,
+                      0.0            AS score,
+                      section_titles, section_ids""",
+            {"chapter_ids": chapter_ids, "content_limit": settings.page_content_limit},
+        ) or []
+
+        logger.debug("Top-down search: %d docs → %d chapters → %d pages",
+                      len(doc_ids), len(chapter_ids), len(pages))
+        return pages[:limit]
+
+    def _dense_vector_search(
+        self, embedding: list, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Path 2: Dense vector search on page + section embeddings.
+
+        Runs vector search on both ``page_embedding_index`` and
+        ``section_embedding_index``, resolves section hits to their pages,
+        and merges with 2-way RRF.
+        """
+        # Sub-path A: page-level vector search (existing)
+        page_results: List[Dict[str, Any]] = []
+        try:
+            page_results = self._vector_search_pages(embedding, limit)
+        except Exception as e:
+            logger.debug("Dense page vector search failed: %s", e)
+
+        # Sub-path B: section-level vector search → resolve to pages
+        section_page_results: List[Dict[str, Any]] = []
+        try:
+            section_page_results = self.db.execute_query(
+                """CALL db.index.vector.queryNodes(
+                       'section_embedding_index', $limit, $embedding
+                   ) YIELD node, score
+                   WHERE score >= 0.5
+                   MATCH (p:Page)-[:HAS_SECTION]->(node)
+                   WHERE p.content IS NOT NULL AND trim(p.content) <> ''
+                   OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(p)
+                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+                   WITH p, score,
+                        collect(DISTINCT ch.title)[0]   AS chapter,
+                        collect(DISTINCT d.filename)[0] AS document,
+                        collect(DISTINCT node.title)     AS section_titles,
+                        collect(DISTINCT node.id)        AS section_ids
+                   RETURN p.id          AS page_id,
+                          p.page_number  AS page_number,
+                          substring(p.content, 0, $content_limit) AS content,
+                          p.header       AS header,
+                          chapter, document, score,
+                          section_titles, section_ids
+                   ORDER BY score DESC""",
+                {"limit": limit * 2, "embedding": embedding, "content_limit": settings.page_content_limit},
+            ) or []
+        except Exception as e:
+            logger.debug("Dense section vector search failed: %s", e)
+
+        # Merge page-vector and section-vector results
+        if page_results and section_page_results:
+            return self._rrf_merge(page_results, section_page_results, limit)
+        return page_results or section_page_results
+
+    @staticmethod
+    def _rrf_merge_multi(
+        ranked_lists: List[List[Dict[str, Any]]],
+        limit: int,
+        k: int = 60,
+    ) -> List[Dict[str, Any]]:
+        """N-way Reciprocal Rank Fusion.
+
+        Generalises ``_rrf_merge`` to merge any number of ranked page lists.
+        Pages appearing in multiple lists naturally receive higher combined
+        scores.  Deduplication is by ``(page_number, document)`` key.
+        """
+        def _key(p: Dict[str, Any]) -> tuple:
+            return (p.get("page_number"), p.get("document") or "")
+
+        scores: Dict[tuple, Dict[str, Any]] = {}
+        for ranked_list in ranked_lists:
+            for rank, page in enumerate(ranked_list):
+                key = _key(page)
+                rrf_score = 1.0 / (k + rank + 1)
+                if key in scores:
+                    scores[key]["rrf"] += rrf_score
+                else:
+                    scores[key] = {"page": page, "rrf": rrf_score}
+
+        sorted_items = sorted(
+            scores.values(), key=lambda x: x["rrf"], reverse=True
+        )
+        return [item["page"] for item in sorted_items[:limit]]
+
+    def search_hybrid(
+        self, query: str, limit: int = 8, keywords: str = ""
+    ) -> List[Dict[str, Any]]:
+        """3-path hybrid search: graph traversal + dense vector + sparse BM25.
+
+        Each path produces a ranked page list.  The three lists are merged
+        with N-way RRF so that pages appearing in multiple paths are
+        rewarded.  No adjacent-page expansion here — that happens in
+        ``enrich_with_graph()`` after reranking.
+        """
+        from config.settings import settings
+
+        # Embed query once — shared by all paths
+        embedding = None
+        try:
+            from backend.app.modules.ollama_client import get_ollama_client
+            embedding = get_ollama_client().generate_embedding(query)
+        except Exception as e:
+            logger.debug("Embedding failed: %s", e)
+
+        candidates = settings.hybrid_candidates_per_path
+
+        # Path 1: Graph traversal (top-down via rich summaries)
+        path_topdown: List[Dict[str, Any]] = []
+        if embedding:
+            try:
+                path_topdown = self._topdown_search(embedding, candidates)
+            except Exception as e:
+                logger.debug("Top-down path failed: %s", e)
+
+        # Path 2: Dense vector (page + section embeddings)
+        path_vector: List[Dict[str, Any]] = []
+        if embedding:
+            try:
+                path_vector = self._dense_vector_search(embedding, candidates)
+            except Exception as e:
+                logger.debug("Dense vector path failed: %s", e)
+
+        # Path 3: Sparse BM25 (exact term matching)
+        path_bm25: List[Dict[str, Any]] = []
+        try:
+            path_bm25 = self._fulltext_search_pages(query, candidates, keywords=keywords)
+        except Exception as e:
+            logger.debug("BM25 path failed: %s", e)
+
+        # Collect non-empty paths for RRF
+        active_paths = [p for p in [path_topdown, path_vector, path_bm25] if p]
+        if not active_paths:
+            return []
+
+        if len(active_paths) == 1:
+            return active_paths[0][:limit]
+
+        merged = self._rrf_merge_multi(
+            active_paths, limit=limit, k=settings.hybrid_rrf_k
+        )
+
+        logger.info(
+            "Hybrid search: topdown=%d, vector=%d, bm25=%d → merged=%d",
+            len(path_topdown), len(path_vector), len(path_bm25), len(merged),
+        )
+        return merged
+
+    # ----------------------------------------------------------------- #
+    #  Post-rerank graph enrichment
+    # ----------------------------------------------------------------- #
+
+    def enrich_with_graph(
+        self,
+        pages: List[Dict[str, Any]],
+    ) -> tuple:
+        """Expand reranked pages with graph context for completeness.
+
+        Called *after* the cross-encoder reranker has selected the final
+        6-8 pages.  Uses the graph to add:
+
+        1. **NEXT_PAGE** adjacency — catches tables on the following page.
+        2. **HAS_FIGURE** — figures from sections on retrieved pages.
+        3. **HAS_FORMULA** — formulas from sections on retrieved pages.
+
+        Returns
+        -------
+        (enriched_pages, extra_figures, extra_formulas)
+        """
+        from config.settings import settings
+
+        # 1. Adjacent pages
+        existing_keys = {
+            (p.get("page_number"), p.get("document") or "") for p in pages
+        }
+        adjacent = self._fetch_adjacent_pages(
+            pages, existing_keys, max_extra=settings.enrichment_max_adjacent
+        )
+        enriched_pages = list(pages)
+        if adjacent:
+            enriched_pages.extend(adjacent)
+
+        # Collect section IDs from all pages (including adjacent)
+        section_ids: List[str] = []
+        seen_sids: set = set()
+        for p in enriched_pages:
+            for sid in (p.get("section_ids") or []):
+                if sid and sid not in seen_sids:
+                    section_ids.append(sid)
+                    seen_sids.add(sid)
+
+        # 2. Figures
+        extra_figures: List[Dict[str, Any]] = []
+        if section_ids:
+            try:
+                extra_figures = self.get_figures_for_sections(
+                    section_ids[:20], limit=settings.enrichment_max_figures
+                )
+            except Exception as e:
+                logger.debug("Figure enrichment failed: %s", e)
+
+        # 3. Formulas
+        extra_formulas: List[Dict[str, Any]] = []
+        if section_ids:
+            try:
+                extra_formulas = self.db.execute_query(
+                    """UNWIND $sids AS sid
+                       MATCH (s:Section {id: sid})-[:HAS_FORMULA]->(f:Formula)
+                       RETURN f.latex      AS latex,
+                              f.unicode    AS unicode,
+                              s.title      AS section,
+                              f.section_title AS section_title
+                       LIMIT $limit""",
+                    {
+                        "sids": section_ids[:20],
+                        "limit": settings.enrichment_max_formulas,
+                    },
+                ) or []
+            except Exception as e:
+                logger.debug("Formula enrichment failed: %s", e)
+
+        return enriched_pages, extra_figures, extra_formulas
+
     def get_sections_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         """Fetch full section content for a list of section IDs.
 
@@ -944,12 +1254,12 @@ class GraphQuerier:
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(:Chapter)-[:HAS_SECTION]->(s)
                OPTIONAL MATCH (s)-[:HAS_FORMULA]->(frm:Formula)
                RETURN s.id AS id, s.title AS title,
-                      substring(s.full_text, 0, 4000) AS content,
+                      substring(s.full_text, 0, $content_limit) AS content,
                       s.start_page AS page,
                       d.filename AS document,
                       1.0 AS score,
                       collect(DISTINCT frm.latex) AS formula_latex""",
-            {"ids": ids},
+            {"ids": ids, "content_limit": settings.section_content_limit},
         )
 
     def get_tables_for_sections(
