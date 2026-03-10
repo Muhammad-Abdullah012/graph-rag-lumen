@@ -85,7 +85,7 @@ def _figure_fields(fig: dict) -> dict:
         human_text = raw_desc
 
     return {
-        "caption":     (human_text or annotation)[:200],
+        "caption":     (human_text or annotation),
         "description": human_text,
         "image_type":  fig.get("type", "image"),
         "annotation":  annotation,
@@ -543,7 +543,7 @@ class GraphBuilder:
                     "id": sec_id, "number": sec_number, "title": sec_title,
                     "level": sec_level, "start_page": start_page,
                     "end_page": end_page, "preview": content_preview,
-                    "full_text": full_text[:50000],
+                    "full_text": full_text,
                 },
             )
             stats["sections"] += 1
@@ -632,7 +632,7 @@ class GraphBuilder:
                         "caption": tbl.get("caption", ""),
                         "content": (
                             tbl.get("text", "") or tbl.get("html", "")
-                        )[:10000],
+                        ),
                         "annotation":    tbl.get("annotation", ""),
                         "section_title": sec_title,
                         "sid": sec_id,
@@ -775,7 +775,7 @@ class GraphBuilder:
                 {
                     "id": pid, "pnum": pnum,
                     "header": header, "footer": footer,
-                    "content": content[:50000],
+                    "content": content,
                 },
             )
 
