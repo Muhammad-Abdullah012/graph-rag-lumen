@@ -26,11 +26,26 @@ class Settings(BaseSettings):
     postgres_password: str = os.getenv("POSTGRES_PASSWORD", "graphrag_secret")
     postgres_db: str = os.getenv("POSTGRES_DB", "graphrag")
 
+    # Re-ranker (cross-encoder)
+    reranker_enabled: bool = os.getenv("RERANKER_ENABLED", "true").lower() in ("true", "1", "yes")
+    reranker_model: str = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+    reranker_top_k: int = int(os.getenv("RERANKER_TOP_K", "8"))
+    reranker_threshold: float = float(os.getenv("RERANKER_THRESHOLD", "-5.0"))
+
     # Backend
     backend_host: str = os.getenv("BACKEND_HOST", "0.0.0.0")
     backend_port: int = int(os.getenv("BACKEND_PORT", "8000"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     environment: str = os.getenv("ENVIRONMENT", "development")
+
+    # Top-down hierarchical retrieval
+    topdown_max_docs: int = int(os.getenv("TOPDOWN_MAX_DOCS", "3"))
+    topdown_max_chapters: int = int(os.getenv("TOPDOWN_MAX_CHAPTERS", "5"))
+    topdown_fallback_min: int = int(os.getenv("TOPDOWN_FALLBACK_MIN", "3"))
+
+    # Embedding chunking
+    embedding_chunk_size: int = int(os.getenv("EMBEDDING_CHUNK_SIZE", "6000"))
+    embedding_chunk_overlap: int = int(os.getenv("EMBEDDING_CHUNK_OVERLAP", "500"))
 
     # Documents
     documents_path: str = os.getenv("DOCUMENTS_PATH", "documents")

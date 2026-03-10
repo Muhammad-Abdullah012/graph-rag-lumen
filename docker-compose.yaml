@@ -84,6 +84,7 @@ services:
       - ./backend/json:/app/backend/json
       - ./backend/images:/app/backend/images
       - ./:/app
+      - huggingface_cache:/root/.cache/huggingface
     ports:
       - "9000:8000"
     depends_on:
@@ -167,6 +168,7 @@ volumes:
   postgres_data:
   neo4j_data:
   neo4j_logs:
+  huggingface_cache:
 
 networks:
   traefik-net:

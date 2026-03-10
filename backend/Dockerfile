@@ -15,6 +15,9 @@ RUN uv venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 
+COPY requirements.ml.txt ./
+RUN uv pip install --no-cache-dir -r requirements.ml.txt
+
 COPY requirements.backend.txt ./
 RUN uv pip install --no-cache-dir -r requirements.backend.txt
 

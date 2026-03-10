@@ -67,6 +67,19 @@ docker exec "$NEO4J_CONTAINER" \
 
 echo "  OK: Graph cleared"
 
+# ── Step 3b: Drop vector indexes so they are recreated with the correct dimension ──
+echo ""
+echo "Step 3b: Dropping vector indexes..."
+docker exec "$NEO4J_CONTAINER" \
+    cypher-shell -u "$NEO4J_USERNAME" -p "$NEO4J_PASSWORD" \
+    "DROP INDEX page_embedding_index IF EXISTS;
+     DROP INDEX section_embedding_index IF EXISTS;
+     DROP INDEX concept_embedding_index IF EXISTS;
+     DROP INDEX formula_embedding_index IF EXISTS;
+     DROP INDEX table_embedding_index IF EXISTS;
+     DROP INDEX figure_embedding_index IF EXISTS;" 2>/dev/null || true
+echo "  OK: Vector indexes dropped"
+
 # ── Step 4: Verify backend is reachable ────────────────────────────────────────
 echo ""
 echo "Step 4: Checking backend API..."
