@@ -4,12 +4,12 @@ Schema hierarchy
 ================
 Document → [Volume] → Chapter → Page → Section
   Section → {Table, Figure, Formula, Subsection}
-  Section -[:MENTIONS]→ Concept
-  Concept ↔ Concept  (RELATED_TO)
   Section ↔ Section  (SEMANTICALLY_SIMILAR)
 
 Every node ultimately belongs to exactly one Document.
-Embeddings are stored on Section.embedding and Concept.embedding for hybrid
+Document.id  = exact source filename including UUID prefix (stable unique key).
+Document.name = human-readable name stripped of UUID prefix and file extension.
+Embeddings are stored on Section, Page, Chapter, and Document nodes for hybrid
 retrieval (structural + semantic).
 """
 from __future__ import annotations
@@ -42,6 +42,20 @@ def _make_uuid(*parts: str) -> str:
     """Deterministic UUID-5 from concatenated parts."""
     raw = "::".join(str(p) for p in parts)
     return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
+
+
+_UUID_PREFIX_RE = re.compile(r'^[a-f0-9]{32}_', re.IGNORECASE)
+
+
+def _strip_uuid_prefix(name: str) -> str:
+    """Strip leading '<32-hex>_' UUID prefix and common file extensions.
+
+    '1fd2be19fb0843eb9ce089d3da39087f_Handbuch EC3 Band 3.pdf'
+      → 'Handbuch EC3 Band 3'
+    """
+    name = _UUID_PREFIX_RE.sub('', name)
+    name = re.sub(r'\.(pdf|json|md)$', '', name, flags=re.IGNORECASE)
+    return name.strip()
 
 
 def _figure_fields(fig: dict) -> dict:
@@ -189,77 +203,7 @@ def _file_checksum(filepath: str) -> str:
     return h.hexdigest()
 
 
-# ===================================================================== #
-#  Domain concept dictionary (German + English civil-engineering terms)
-# ===================================================================== #
 
-DOMAIN_CONCEPTS: Dict[str, str] = {
-    # German
-    "Einwirkung": "Loads and actions applied to structures",
-    "Widerstand": "Resistance of structural elements",
-    "Bemessung": "Design and dimensioning of structures",
-    "Tragfähigkeit": "Load-bearing capacity",
-    "Gebrauchstauglichkeit": "Serviceability of structures",
-    "Teilsicherheitsbeiwert": "Partial safety factor",
-    "Grenzzustand": "Limit state",
-    "Tragwerk": "Structure / structural system",
-    "Erdbeben": "Earthquake / seismic action",
-    "Fundament": "Foundation",
-    "Bewehrung": "Reinforcement",
-    "Beton": "Concrete",
-    "Stahl": "Steel",
-    "Spannung": "Stress",
-    "Dehnung": "Strain",
-    "Verformung": "Deformation",
-    "Biegemoment": "Bending moment",
-    "Querkraft": "Shear force",
-    "Normalkraft": "Normal force",
-    "Torsion": "Torsion",
-    "Stabilität": "Stability",
-    "Knicken": "Buckling",
-    "Ermüdung": "Fatigue",
-    "Dauerhaftigkeit": "Durability",
-    "Brandschutz": "Fire protection",
-    "Korrosion": "Corrosion",
-    "Setzung": "Settlement",
-    "Erdruck": "Earth pressure",
-    "Grundbruch": "Bearing capacity failure",
-    "Böschungsbruch": "Slope failure",
-    "Pfahlgründung": "Pile foundation",
-    "Brücke": "Bridge",
-    "Tunnel": "Tunnel",
-    "Dach": "Roof",
-    "Wand": "Wall",
-    "Stütze": "Column",
-    "Balken": "Beam",
-    "Platte": "Slab",
-    "Lastfall": "Load case",
-    "Lastkombination": "Load combination",
-    "Schnittgröße": "Internal force",
-    "Sicherheitskonzept": "Safety concept",
-    "Zuverlässigkeit": "Reliability",
-    "Nachweis": "Verification / proof",
-    "Elastizitätsmodul": "Modulus of elasticity",
-    "Schubmodul": "Shear modulus",
-    "Kriechzahl": "Creep coefficient",
-    "Schwinden": "Shrinkage",
-    "Vorspannung": "Prestressing",
-    "Verbund": "Bond / composite action",
-    "Rissbild": "Crack pattern",
-    "Rissbreite": "Crack width",
-    "Durchstanzen": "Punching shear",
-    # English
-    "action": "Loads and actions applied to structures",
-    "resistance": "Resistance of structural elements",
-    "load combination": "Combination of loads for design",
-    "partial factor": "Partial safety factor",
-    "limit state": "Limit state for design verification",
-    "serviceability": "Serviceability limit state (SLS)",
-    "ultimate": "Ultimate limit state (ULS)",
-    "seismic": "Seismic / earthquake action",
-    "foundation": "Foundation / substructure",
-    "reinforcement": "Steel reinforcement in concrete",
-}
 
 
 # ===================================================================== #
@@ -392,7 +336,7 @@ class GraphBuilder:
         total: Dict[str, int] = {
             "files": 0, "documents": 0, "volumes": 0, "chapters": 0,
             "pages": 0, "sections": 0, "tables": 0, "figures": 0,
-            "formulas": 0, "concepts": 0,
+            "formulas": 0,
         }
 
         for filepath in json_files:
@@ -434,19 +378,20 @@ class GraphBuilder:
         stats = {
             "documents": 0, "volumes": 0, "chapters": 0, "pages": 0,
             "sections": 0, "tables": 0, "figures": 0, "formulas": 0,
-            "concepts": 0,
         }
 
         # ── Document ────────────────────────────────────────────────────
-        doc_name = data.get("document", os.path.basename(source_path))
+        # doc_id  = exact filename including UUID prefix (unique stable key)
+        # doc_name = human-readable name stripped of UUID prefix and extension
         filename = data.get("source_file", os.path.basename(source_path))
+        doc_id   = filename
+        doc_name = _strip_uuid_prefix(filename)
         language = data.get("language", "de")
-        doc_id = _make_uuid("document", doc_name)
         doc_type = _detect_document_type(filename)
-        ec_part = _detect_eurocode_part(
-            filename,
-            (data.get("full_markdown", "") or "")[:3000],
-        )
+        # Use first page content for better Eurocode part detection
+        _pages = data.get("pages") or []
+        _first_page_content = (_pages[0].get("content", "") if _pages else "")[:3000]
+        ec_part = _detect_eurocode_part(doc_name, _first_page_content)
         checksum = _file_checksum(source_path)
 
         self.db.execute_query(
@@ -459,7 +404,7 @@ class GraphBuilder:
                    d.version          = $version,
                    d.checksum         = $checksum""",
             {
-                "id": doc_id, "filename": filename,
+                "id": doc_id, "filename": doc_name,
                 "doc_type": doc_type, "ec_part": ec_part,
                 "language": language,
                 "version": data.get("version", "1.0"),
@@ -779,12 +724,6 @@ class GraphBuilder:
                 )
             stats["formulas"] += 1
 
-        # ── Concept extraction & MENTIONS edges ─────────────────────────
-        concept_count = self._extract_and_create_concepts(
-            doc_id, doc_name, data, section_map,
-        )
-        stats["concepts"] = concept_count
-
         logger.info("Ingested document '%s': %s", doc_name, stats)
         return stats
 
@@ -867,7 +806,6 @@ class GraphBuilder:
             "CREATE CONSTRAINT chapter_id_unique IF NOT EXISTS FOR (ch:Chapter) REQUIRE ch.id IS UNIQUE",
             "CREATE CONSTRAINT page_id_unique IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
             "CREATE CONSTRAINT section_id_unique IF NOT EXISTS FOR (s:Section) REQUIRE s.id IS UNIQUE",
-            "CREATE CONSTRAINT concept_id_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT table_id_unique IF NOT EXISTS FOR (t:Table) REQUIRE t.id IS UNIQUE",
             "CREATE CONSTRAINT figure_id_unique IF NOT EXISTS FOR (f:Figure) REQUIRE f.id IS UNIQUE",
             "CREATE CONSTRAINT formula_id_unique IF NOT EXISTS FOR (fm:Formula) REQUIRE fm.id IS UNIQUE",
@@ -881,7 +819,6 @@ class GraphBuilder:
         indexes = [
             "CREATE INDEX section_number_idx IF NOT EXISTS FOR (s:Section) ON (s.number)",
             "CREATE INDEX chapter_number_idx IF NOT EXISTS FOR (ch:Chapter) ON (ch.number)",
-            "CREATE INDEX concept_norm_idx IF NOT EXISTS FOR (c:Concept) ON (c.normalized_name)",
             "CREATE INDEX page_number_idx IF NOT EXISTS FOR (p:Page) ON (p.page_number)",
             "CREATE INDEX doc_type_idx IF NOT EXISTS FOR (d:Document) ON (d.document_type)",
         ]
@@ -900,8 +837,6 @@ class GraphBuilder:
         fulltext_indexes = [
             """CREATE FULLTEXT INDEX section_fulltext IF NOT EXISTS
                FOR (s:Section) ON EACH [s.title, s.full_text, s.content_preview]""",
-            """CREATE FULLTEXT INDEX concept_fulltext IF NOT EXISTS
-               FOR (c:Concept) ON EACH [c.name, c.description]""",
             """CREATE FULLTEXT INDEX table_fulltext IF NOT EXISTS
                FOR (t:Table) ON EACH [t.caption, t.content, t.section_title]""",
             """CREATE FULLTEXT INDEX formula_fulltext IF NOT EXISTS
@@ -909,117 +844,13 @@ class GraphBuilder:
             """CREATE FULLTEXT INDEX figure_fulltext IF NOT EXISTS
                FOR (f:Figure) ON EACH [f.caption, f.description, f.annotation]""",
             """CREATE FULLTEXT INDEX page_fulltext IF NOT EXISTS
-               FOR (p:Page) ON EACH [p.content, p.header]""",
+               FOR (p:Page) ON EACH [p.content, p.header, p.footer]""",
         ]
         for q in fulltext_indexes:
             try:
                 self.db.execute_query(q)
             except Exception:
                 pass
-
-    # ----------------------------------------------------------------- #
-    #  Concept Extraction
-    # ----------------------------------------------------------------- #
-
-    def _extract_and_create_concepts(
-        self,
-        doc_id: str,
-        doc_name: str,
-        data: Dict[str, Any],
-        section_map: Dict[str, Dict],
-    ) -> int:
-        """Extract concepts via domain dictionary + legacy fields.
-
-        Creates Concept nodes, MENTIONS edges (Section→Concept) and
-        RELATED_TO edges (Concept↔Concept based on co-occurrence).
-        """
-        count = 0
-        created: Dict[str, str] = {}  # normalized_name → concept_id
-
-        def _ensure_concept(name: str, description: str) -> str:
-            nonlocal count
-            normalized = name.lower().strip()
-            if normalized in created:
-                return created[normalized]
-            cid = _make_uuid("concept", normalized)
-            self.db.execute_query(
-                """MERGE (c:Concept {id: $id})
-                   SET c.name            = $name,
-                       c.normalized_name = $normalized,
-                       c.description     = $description""",
-                {"id": cid, "name": name, "normalized": normalized,
-                 "description": description},
-            )
-            created[normalized] = cid
-            count += 1
-            return cid
-
-        def _link_mention(sec_id: str, concept_id: str, confidence: float):
-            self.db.execute_query(
-                """MATCH (s:Section {id: $sid})
-                   MATCH (c:Concept {id: $cid})
-                   MERGE (s)-[r:MENTIONS]->(c)
-                   SET r.confidence = $conf""",
-                {"sid": sec_id, "cid": concept_id, "conf": confidence},
-            )
-
-        # 1) Domain-dictionary scan over section full_text
-        for sec_id, info in section_map.items():
-            text = (info.get("full_text", "") or info.get("title", "")).lower()
-            for concept_name, desc in DOMAIN_CONCEPTS.items():
-                if concept_name.lower() in text:
-                    cid = _ensure_concept(concept_name, desc)
-                    occ = text.count(concept_name.lower())
-                    confidence = min(1.0, 0.3 + occ * 0.1)
-                    _link_mention(sec_id, cid, confidence)
-
-        # 2) Legacy fields → Concepts
-        for sec_data in data.get("sections", []):
-            sec_title = sec_data.get("section", "")
-            sec_id = _make_uuid("section", doc_name, sec_title)
-
-            for sym in sec_data.get("symbols", []):
-                name = sym.get("symbol", "")
-                if name:
-                    cid = _ensure_concept(name, sym.get("definition", ""))
-                    _link_mention(sec_id, cid, 0.9)
-
-            for defn in sec_data.get("definitions", []):
-                term = defn.get("term", "")
-                if term:
-                    cid = _ensure_concept(term, defn.get("definition", ""))
-                    _link_mention(sec_id, cid, 0.95)
-
-            for abbr in sec_data.get("abbreviations", []):
-                name = abbr.get("abbreviation", "")
-                if name:
-                    cid = _ensure_concept(name, abbr.get("definition", ""))
-                    _link_mention(sec_id, cid, 0.85)
-
-            for unit in sec_data.get("units", []):
-                qty = unit.get("quantity", "")
-                if qty:
-                    cid = _ensure_concept(qty, f"Unit: {unit.get('unit', '')}")
-                    _link_mention(sec_id, cid, 0.8)
-
-        # 3) RELATED_TO between co-occurring concepts
-        self._link_related_concepts()
-
-        return count
-
-    def _link_related_concepts(self):
-        """Create RELATED_TO edges between Concepts that co-occur in sections."""
-        try:
-            self.db.execute_query(
-                """MATCH (c1:Concept)<-[:MENTIONS]-(s:Section)-[:MENTIONS]->(c2:Concept)
-                   WHERE c1.id < c2.id
-                   WITH c1, c2, count(s) AS co
-                   WHERE co >= 1
-                   MERGE (c1)-[r:RELATED_TO]->(c2)
-                   SET r.weight = toFloat(co) / 10.0""",
-            )
-        except Exception as e:
-            logger.debug("Could not link related concepts: %s", e)
 
     # ----------------------------------------------------------------- #
     #  Rich summary generation (Chapter + Document)

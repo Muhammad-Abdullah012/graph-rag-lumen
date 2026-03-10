@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     hybrid_candidates_per_path: int = int(os.getenv("HYBRID_CANDIDATES_PER_PATH", "15"))
 
     # Summary generation
-    summary_max_words: int = int(os.getenv("SUMMARY_MAX_WORDS", "150"))
+    summary_max_words: int = int(os.getenv("SUMMARY_MAX_WORDS", "500"))
 
     # Graph enrichment
     enrichment_max_adjacent: int = int(os.getenv("ENRICHMENT_MAX_ADJACENT", "2"))
