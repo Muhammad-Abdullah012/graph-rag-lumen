@@ -93,6 +93,33 @@ def _figure_fields(fig: dict) -> dict:
     }
 
 
+def _extract_formula_context(
+    paragraphs: List[Dict], formula_page: Any,
+) -> str:
+    """Extract paragraphs surrounding a formula on the same page as context.
+
+    Returns up to ``settings.formula_context_chars`` characters of paragraph
+    text from the same page, giving the LLM the prose that defines the
+    formula's symbols and usage.
+    """
+    if not formula_page or not paragraphs:
+        return ""
+
+    frm_page_str = str(formula_page)
+    same_page = [
+        p.get("text", "") for p in paragraphs
+        if str(p.get("page", "")) == frm_page_str and p.get("text")
+    ]
+    if not same_page:
+        return ""
+
+    joined = " ".join(same_page)
+    max_chars = settings.formula_context_chars
+    if len(joined) > max_chars:
+        joined = joined[:max_chars]
+    return joined
+
+
 def _detect_chapter_type(ch: dict) -> str:
     """Classify a chapter as table_of_contents, introductory, appendix, main_chapter, or other."""
     title_lower = ch.get("title", "").lower()
@@ -668,11 +695,15 @@ class GraphBuilder:
                 raw_latex = normalize_latex(frm.get("expression", "") or frm.get("formula", ""))
                 # Prefer pre-computed unicode from OCR; fallback to converter
                 unicode_formula = frm.get("unicode") or latex_to_unicode(raw_latex)
+                # Extract surrounding paragraph text from the same page
+                frm_context = _extract_formula_context(paragraphs, frm.get("page"))
                 self.db.execute_query(
                     """MERGE (f:Formula {id: $id})
                        SET f.latex         = $latex,
                            f.unicode       = $unicode,
                            f.section_title = $section_title,
+                           f.context       = $context,
+                           f.page          = $page,
                            f.embedding     = null
                        WITH f
                        MATCH (s:Section {id: $sid})
@@ -682,6 +713,8 @@ class GraphBuilder:
                         "latex": raw_latex,
                         "unicode": unicode_formula,
                         "section_title": sec_title,
+                        "context": frm_context,
+                        "page": frm.get("page"),
                         "sid": sec_id,
                     },
                 )
@@ -826,11 +859,12 @@ class GraphBuilder:
             except Exception as e:
                 logger.debug("Index may already exist: %s", e)
 
-        # Drop page_fulltext before recreating so the new 'content' field is indexed
-        try:
-            self.db.execute_query("DROP INDEX page_fulltext IF EXISTS")
-        except Exception:
-            pass
+        # Drop fulltext indexes before recreating so new fields are included
+        for idx_name in ("page_fulltext", "formula_fulltext"):
+            try:
+                self.db.execute_query(f"DROP INDEX {idx_name} IF EXISTS")
+            except Exception:
+                pass
 
         fulltext_indexes = [
             """CREATE FULLTEXT INDEX section_fulltext IF NOT EXISTS
@@ -838,7 +872,7 @@ class GraphBuilder:
             """CREATE FULLTEXT INDEX table_fulltext IF NOT EXISTS
                FOR (t:Table) ON EACH [t.caption, t.content, t.section_title]""",
             """CREATE FULLTEXT INDEX formula_fulltext IF NOT EXISTS
-               FOR (f:Formula) ON EACH [f.latex, f.unicode, f.section_title]""",
+               FOR (f:Formula) ON EACH [f.latex, f.unicode, f.section_title, f.context]""",
             """CREATE FULLTEXT INDEX figure_fulltext IF NOT EXISTS
                FOR (f:Figure) ON EACH [f.caption, f.description, f.annotation]""",
             """CREATE FULLTEXT INDEX page_fulltext IF NOT EXISTS
@@ -929,15 +963,23 @@ class GraphBuilder:
         expressions = [r.get("expr", "") for r in formula_rows]
         symbols = self._extract_formula_symbols(expressions)
 
-        # Get table captions
+        # Get tables with numbers and captions
         table_rows = self.db.execute_query(
             """MATCH (ch:Chapter {id: $id})-[:HAS_SECTION]->(:Section)
                      -[:HAS_TABLE]->(t:Table)
                WHERE t.caption IS NOT NULL AND t.caption <> ''
-               RETURN DISTINCT t.caption AS caption""",
+               RETURN DISTINCT t.number AS number, t.caption AS caption""",
             {"id": chapter_id},
         ) or []
-        captions = [r["caption"] for r in table_rows if r.get("caption")]
+
+        # Get figures with numbers and captions
+        figure_rows = self.db.execute_query(
+            """MATCH (ch:Chapter {id: $id})-[:HAS_SECTION]->(:Section)
+                     -[:HAS_FIGURE]->(f:Figure)
+               WHERE f.caption IS NOT NULL AND f.caption <> ''
+               RETURN DISTINCT f.number AS number, f.caption AS caption""",
+            {"id": chapter_id},
+        ) or []
 
         # ── Assemble structured text ────────────────────────────────────
         parts: List[str] = [f"Kapitel {ch_number}: {ch_title}"]
@@ -960,10 +1002,26 @@ class GraphBuilder:
             parts.append(f"Formelsymbole: {', '.join(symbols)}")
             parts.append("")
 
-        if captions:
-            parts.append("Tabellenüberschriften:")
-            for cap in captions:
-                parts.append(f"- {cap}")
+        if table_rows:
+            parts.append("Tabellen:")
+            for tbl in table_rows:
+                num = tbl.get("number") or ""
+                cap = tbl.get("caption") or ""
+                if num and cap:
+                    parts.append(f"- Tabelle {num}: {cap}")
+                elif cap:
+                    parts.append(f"- {cap}")
+            parts.append("")
+
+        if figure_rows:
+            parts.append("Abbildungen:")
+            for fig in figure_rows:
+                num = fig.get("number") or ""
+                cap = fig.get("caption") or ""
+                if num and cap:
+                    parts.append(f"- Bild {num}: {cap}")
+                elif cap:
+                    parts.append(f"- {cap}")
             parts.append("")
 
         structured_text = "\n".join(parts)
