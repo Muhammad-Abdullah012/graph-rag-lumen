@@ -32,19 +32,21 @@ logger = logging.getLogger(__name__)
 
 _reranker_instance: Optional["Reranker"] = None
 
-CHUNK_SIZE = 4000     # chars per chunk
-CHUNK_OVERLAP = 400   # overlap between consecutive chunks
-
-
 def _chunk_text(text: str) -> List[str]:
-    """Split *text* into overlapping chunks of ``CHUNK_SIZE`` chars."""
-    if len(text) <= CHUNK_SIZE:
+    """Split *text* into overlapping chunks for cross-encoder scoring.
+
+    Chunk size and overlap are controlled via RERANKER_CHUNK_SIZE and
+    RERANKER_CHUNK_OVERLAP environment variables / settings.
+    """
+    chunk_size = settings.reranker_chunk_size
+    chunk_overlap = settings.reranker_chunk_overlap
+    if len(text) <= chunk_size:
         return [text]
     chunks: List[str] = []
     start = 0
     while start < len(text):
-        chunks.append(text[start: start + CHUNK_SIZE])
-        start += CHUNK_SIZE - CHUNK_OVERLAP
+        chunks.append(text[start: start + chunk_size])
+        start += chunk_size - chunk_overlap
     return chunks
 
 

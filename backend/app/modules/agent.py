@@ -201,7 +201,10 @@ def _format_pages_as_context(
 
         ref      = f" (Dokument: {doc})" if doc else ""
         chap_str = f" | {chapter}" if chapter else ""
-        parts.append(f"[{i}] Seite {page_num}{chap_str}{ref}\n{content}")
+        header   = f"[{i}] Seite {page_num}{chap_str}{ref}"
+        if "rerank_score" in page:
+            header += f" [Relevanz: {page['rerank_score']:.1f}]"
+        parts.append(f"{header}\n{content}")
 
     return "\n\n".join(parts)
 
@@ -474,26 +477,25 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
     # ── Node: graph search ───────────────────────────────────────────
     def graph_search(state: AgentState) -> AgentState:
         question = state["question"]
-        search_query = _translate_to_german(question, llm)
-        keywords = _extract_keywords(search_query, llm)
+        keywords = _extract_keywords(question, llm)
         tools_used: List[Dict[str, Any]] = []
 
         try:
             pages = querier.search_hybrid(
-                search_query,
+                question,
                 limit=settings.hybrid_candidates_per_path,
                 keywords=keywords,
             )
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": search_query, "keywords": keywords, "pages": len(pages)},
+                "arguments": {"query": question, "keywords": keywords, "pages": len(pages)},
             })
         except Exception as e:
-            logger.error("Hybrid search failed for '%s': %s", search_query[:80], e)
+            logger.error("Hybrid search failed for '%s': %s", question[:80], e)
             pages = []
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": search_query, "keywords": keywords},
+                "arguments": {"query": question, "keywords": keywords},
                 "error": str(e),
             })
 
@@ -503,7 +505,7 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         if reranker and pages:
             try:
                 pages = reranker.rerank(
-                    search_query,
+                    question,
                     pages,
                     top_k=settings.reranker_top_k,
                     threshold=settings.reranker_threshold,
@@ -525,11 +527,11 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
 
         return {
             **state,
-            "search_query": search_query,
             "keywords": keywords,
             "search_results": pages,
             "tools_used": tools_used,
             "_extra_figures_raw": extra_figures_raw,
+            "_extra_formulas": extra_formulas,
         }
 
     # ── Node: build context ──────────────────────────────────────────
@@ -580,6 +582,17 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
             "copy them EXACTLY into your answer — do not rewrite or omit them.\n\n"
             f"QUESTION: {question}"
         )
+
+        # Append enriched formulas from graph enrichment
+        extra_formulas = state.get("_extra_formulas", [])
+        if extra_formulas:
+            formula_lines = [
+                f"- {f.get('section', '')}: $${f.get('latex') or f.get('unicode', '')}$$"
+                for f in extra_formulas
+                if f.get("latex") or f.get("unicode")
+            ]
+            if formula_lines:
+                user_prompt += "\n\nRELATED FORMULAS:\n" + "\n".join(formula_lines)
 
         try:
             messages = [
@@ -729,26 +742,26 @@ class EurocodeAgent:
         # ── Eurocode path ─────────────────────────────────────────────
         # Step 2: translate → extract keywords → 3-path hybrid search
         yield {"type": "status", "step": "searching", "message": "Suche im Wissensgraphen…"}
-        search_query = await _atranslate_to_german(question, self.llm)
-        keywords = await _aextract_keywords(search_query, self.llm)
+
+        keywords = await _aextract_keywords(question, self.llm)
 
         tools_used: List[Dict[str, Any]] = []
         pages: List[Dict[str, Any]] = []
         try:
             pages = self.querier.search_hybrid(
-                search_query,
+                question,
                 limit=settings.hybrid_candidates_per_path,
                 keywords=keywords,
             )
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": search_query, "keywords": keywords, "pages": len(pages)},
+                "arguments": {"query": question, "keywords": keywords, "pages": len(pages)},
             })
         except Exception as e:
             logger.error("Hybrid search failed in stream: %s", e)
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": search_query, "keywords": keywords},
+                "arguments": {"query": question, "keywords": keywords},
                 "error": str(e),
             })
 
@@ -759,7 +772,7 @@ class EurocodeAgent:
         if reranker and pages:
             try:
                 pages = reranker.rerank(
-                    search_query,
+                    question,
                     pages,
                     top_k=settings.reranker_top_k,
                     threshold=settings.reranker_threshold,
@@ -817,7 +830,6 @@ class EurocodeAgent:
         _write_debug({
             "ts": datetime.utcnow().isoformat(),
             "question": question,
-            "search_query": search_query,
             "pages_found": len(pages),
             "page_titles": [f"p{p.get('page_number','?')} {p.get('chapter','')}" for p in pages],
             "context": context,
@@ -836,6 +848,16 @@ class EurocodeAgent:
             "copy them EXACTLY into your answer — do not rewrite or omit them.\n\n"
             f"QUESTION: {question}"
         )
+
+        # Append enriched formulas from graph enrichment
+        if extra_formulas:
+            formula_lines = [
+                f"- {f.get('section', '')}: $${f.get('latex') or f.get('unicode', '')}$$"
+                for f in extra_formulas
+                if f.get("latex") or f.get("unicode")
+            ]
+            if formula_lines:
+                user_prompt += "\n\nRELATED FORMULAS:\n" + "\n".join(formula_lines)
 
         full_answer = ""
         try:

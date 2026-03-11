@@ -48,17 +48,48 @@ class GraphQuerier:
         "geben", "gibt", "nehmen", "ansetzen",
     })
 
-    @staticmethod
-    def _sanitize_lucene(query: str) -> str:
-        """Strip Lucene fulltext query special characters.
+    # ISO standard naming pattern for Eurocode / DIN / ISO norm references.
+    # Used to protect references like "EN 1993-1-1" from being mangled by
+    # Lucene escaping — they become phrase queries instead.
+    _NORM_REF_RE: re.Pattern = re.compile(
+        r'\b(EN|EC|DIN|ISO|prEN)\s*\d{4}(?:-\d+)*\b', re.IGNORECASE
+    )
 
-        Characters like + - & | ! ( ) { } [ ] ^ " ~ * ? : \\ / are Lucene
-        operators that cause ParseException when present in natural-language
-        queries (e.g. "Gewölbe- und Betonbrücken" or "Φ2 und Φ3:").
-        We simply remove them so the index receives plain word tokens.
+    @classmethod
+    def _escape_lucene(cls, query: str) -> str:
+        """Escape Lucene fulltext query special characters.
+
+        Norm references (EN 1993-1-1, DIN 1045-1, etc.) are converted to
+        Lucene phrase queries so BM25 matches them as a unit rather than
+        splitting on hyphens.  All other special characters are escaped with
+        backslash to avoid ParseException.
         """
-        cleaned = re.sub(r'[+\-&|!(){}\[\]^"~*?:\\/]', ' ', query)
-        return ' '.join(cleaned.split()) or '*'
+        # 1. Extract and protect norm references as Lucene phrase queries
+        protected_phrases: list[str] = []
+        def _protect_ref(m: re.Match) -> str:
+            # Replace hyphens with spaces inside the phrase so Lucene matches
+            phrase = m.group(0).replace("-", " ")
+            protected_phrases.append(f'"{phrase}"')
+            return ""  # Remove from remaining text
+
+        remaining = cls._NORM_REF_RE.sub(_protect_ref, query)
+
+        # 2. Escape Lucene specials in remaining text
+        specials = r'([+\-&|!(){}\[\]^"~*?:\\/])'
+        escaped = re.sub(specials, r'\\\1', remaining)
+        escaped = escaped.strip()
+
+        # 3. Combine: protected phrase queries + escaped remainder
+        parts = protected_phrases + ([escaped] if escaped else [])
+        return ' '.join(parts) or '*'
+
+    # Short domain terms that must never be filtered by the stopword/length
+    # filter in _to_keywords.  These are standard abbreviations from Eurocode,
+    # DIN, and structural engineering notation.
+    _DOMAIN_TERMS: frozenset = frozenset({
+        "EN", "EC", "DIN", "NA", "NDP", "NCI", "ULS", "SLS",
+        "Ed", "Rd", "Ek", "Rk", "fy", "fu", "fck", "fcd",
+    })
 
     @classmethod
     def _to_keywords(cls, query: str) -> str:
@@ -75,9 +106,10 @@ class GraphQuerier:
             w for w in words
             if w.lower().rstrip(".,?!:") not in cls._DE_STOPWORDS
             and (
-                len(w) >= 4                          # normal words
-                or re.match(r'^\d[\d.,]*$', w)       # numbers: 71, 8.3, 1.5
-                or (len(w) >= 2 and w[0].isupper())  # abbrevs / variables: EC, ψ, G
+                w in cls._DOMAIN_TERMS               # protected domain abbrevs
+                or len(w) >= 4                        # normal words
+                or re.match(r'^\d[\d.,]*$', w)        # numbers: 71, 8.3, 1.5
+                or (len(w) >= 2 and w[0].isupper())   # abbrevs / variables: EC, ψ, G
             )
         ]
         return ' '.join(keywords) if keywords else sanitized
@@ -218,7 +250,7 @@ class GraphQuerier:
                           collect(DISTINCT frm.latex) AS formula_latex
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": self._sanitize_lucene(keyword), "limit": limit, "content_limit": settings.section_content_limit},
+                {"query": self._escape_lucene(keyword), "limit": limit, "content_limit": settings.section_content_limit},
             )
             if results:
                 return results
@@ -294,7 +326,7 @@ class GraphQuerier:
                           node.normalized_name AS normalized_name, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": self._sanitize_lucene(keyword), "limit": limit},
+                {"query": self._escape_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -381,7 +413,7 @@ class GraphQuerier:
                           d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": self._sanitize_lucene(keyword), "limit": limit},
+                {"query": self._escape_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -441,7 +473,7 @@ class GraphQuerier:
                           s.title AS section, d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": self._sanitize_lucene(keyword), "limit": limit},
+                {"query": self._escape_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -508,7 +540,7 @@ class GraphQuerier:
                           s.title AS section, d.filename AS document, score
                    ORDER BY score DESC
                    LIMIT $limit""",
-                {"query": self._sanitize_lucene(keyword), "limit": limit},
+                {"query": self._escape_lucene(keyword), "limit": limit},
             )
             if results:
                 return results
@@ -671,7 +703,7 @@ class GraphQuerier:
             """CALL db.index.vector.queryNodes('page_embedding_index', $limit, $embedding)
                YIELD node, score
                WHERE node.content IS NOT NULL AND trim(node.content) <> ''
-                 AND score >= 0.5
+                 AND score >= $vector_threshold
                OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(node)
                OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
                OPTIONAL MATCH (node)-[:HAS_SECTION]->(s:Section)
@@ -705,7 +737,7 @@ class GraphQuerier:
                       score,
                       section_titles, section_ids
                ORDER BY score DESC""",
-            {"limit": limit * 2, "embedding": embedding, "content_limit": settings.page_content_limit},
+            {"limit": limit * 2, "embedding": embedding, "content_limit": settings.page_content_limit, "vector_threshold": settings.vector_page_threshold},
         ) or []
 
     def _fulltext_search_pages(
@@ -758,7 +790,7 @@ class GraphQuerier:
                       score,
                       section_titles, section_ids
                ORDER BY score DESC LIMIT $limit""",
-            {"query": self._sanitize_lucene(search_terms), "limit": limit * 2, "content_limit": settings.page_content_limit},
+            {"query": self._escape_lucene(search_terms), "limit": limit * 2, "content_limit": settings.page_content_limit},
         ) or []
 
     @staticmethod
@@ -813,7 +845,7 @@ class GraphQuerier:
         """
         if not top_pages:
             return []
-        page_ids = [p["page_id"] for p in top_pages[:3] if p.get("page_id")]
+        page_ids = [p["page_id"] for p in top_pages[:settings.enrichment_max_adjacent] if p.get("page_id")]
         if not page_ids:
             return []
 
@@ -955,10 +987,10 @@ class GraphQuerier:
                 """CALL db.index.vector.queryNodes(
                        'document_embedding_index', $max_docs, $embedding
                    ) YIELD node, score
-                   WHERE score >= 0.4
+                   WHERE score >= $vector_threshold
                    RETURN node.id AS doc_id, node.filename AS filename, score
                    ORDER BY score DESC""",
-                {"max_docs": settings.topdown_max_docs, "embedding": embedding},
+                {"max_docs": settings.topdown_max_docs, "embedding": embedding, "vector_threshold": settings.vector_doc_threshold},
             ) or []
         except Exception as e:
             logger.debug("Top-down document search unavailable: %s", e)
@@ -975,7 +1007,7 @@ class GraphQuerier:
                 """CALL db.index.vector.queryNodes(
                        'chapter_embedding_index', $candidates, $embedding
                    ) YIELD node, score
-                   WHERE score >= 0.4
+                   WHERE score >= $vector_threshold
                    MATCH (d:Document)-[:HAS_CHAPTER]->(node)
                    WHERE d.id IN $doc_ids
                    RETURN node.id AS chapter_id, score
@@ -986,6 +1018,7 @@ class GraphQuerier:
                     "embedding": embedding,
                     "doc_ids": doc_ids,
                     "max_chapters": settings.topdown_max_chapters,
+                    "vector_threshold": settings.vector_doc_threshold,
                 },
             ) or []
         except Exception as e:
@@ -1045,7 +1078,7 @@ class GraphQuerier:
                 """CALL db.index.vector.queryNodes(
                        'section_embedding_index', $limit, $embedding
                    ) YIELD node, score
-                   WHERE score >= 0.5
+                   WHERE score >= $vector_threshold
                    MATCH (p:Page)-[:HAS_SECTION]->(node)
                    WHERE p.content IS NOT NULL AND trim(p.content) <> ''
                    OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(p)
@@ -1062,7 +1095,7 @@ class GraphQuerier:
                           chapter, document, score,
                           section_titles, section_ids
                    ORDER BY score DESC""",
-                {"limit": limit * 2, "embedding": embedding, "content_limit": settings.page_content_limit},
+                {"limit": limit * 2, "embedding": embedding, "content_limit": settings.page_content_limit, "vector_threshold": settings.vector_page_threshold},
             ) or []
         except Exception as e:
             logger.debug("Dense section vector search failed: %s", e)
@@ -1102,12 +1135,124 @@ class GraphQuerier:
         )
         return [item["page"] for item in sorted_items[:limit]]
 
+    # Regex patterns for structured reference detection in queries.
+    # These are standard Eurocode / DIN numbering conventions.
+    _TABLE_REF_RE: re.Pattern = re.compile(
+        r'[Tt]abelle?\s+(\d+[\.\d]*)', re.IGNORECASE
+    )
+    _SECTION_REF_RE: re.Pattern = re.compile(
+        r'(?:Abschnitt|Section|Kapitel)\s+(\d+[\.\d]*)', re.IGNORECASE
+    )
+    _FIGURE_REF_RE: re.Pattern = re.compile(
+        r'(?:Bild|Abbildung|Figure|Fig\.?)\s+(\d+[\.\d]*)', re.IGNORECASE
+    )
+
+    def _intent_targeted_search(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """Detect structured references in query and run targeted lookups.
+
+        When the query contains explicit references like "Tabelle 3.1" or
+        "EN 1993-1-1", runs exact-match Cypher queries against table/section/
+        figure numbers and document names.  Returns pages containing those
+        elements, ranked by match specificity.
+        """
+        if not settings.query_intent_enabled:
+            return []
+
+        pages: List[Dict[str, Any]] = []
+
+        # Detect norm reference to scope the search
+        norm_match = self._NORM_REF_RE.search(query)
+        doc_filter = ""
+        doc_params: Dict[str, Any] = {}
+        if norm_match:
+            norm_ref = norm_match.group(0).replace("-", " ").strip()
+            doc_filter = "AND d.filename CONTAINS $norm_ref"
+            doc_params["norm_ref"] = norm_ref
+
+        # Targeted table lookup
+        table_match = self._TABLE_REF_RE.search(query)
+        if table_match:
+            table_num = table_match.group(1)
+            try:
+                rows = self.db.execute_query(
+                    f"""MATCH (d:Document)-[:HAS_CHAPTER]->(ch:Chapter)
+                              -[:HAS_SECTION]->(s:Section)-[:HAS_TABLE]->(t:Table)
+                        WHERE t.number CONTAINS $table_num {doc_filter}
+                        MATCH (s)-[:CONTAINS_PAGE]->(p:Page)
+                        RETURN DISTINCT p.page_number AS page_number,
+                               p.content AS content,
+                               ch.title AS chapter,
+                               d.filename AS document
+                        LIMIT $limit""",
+                    {"table_num": table_num, "limit": limit, **doc_params},
+                ) or []
+                pages.extend(rows)
+            except Exception as e:
+                logger.debug("Intent table lookup failed: %s", e)
+
+        # Targeted section lookup
+        section_match = self._SECTION_REF_RE.search(query)
+        if section_match:
+            section_num = section_match.group(1)
+            try:
+                rows = self.db.execute_query(
+                    f"""MATCH (d:Document)-[:HAS_CHAPTER]->(ch:Chapter)
+                              -[:HAS_SECTION]->(s:Section)
+                        WHERE s.number STARTS WITH $section_num {doc_filter}
+                        MATCH (s)-[:CONTAINS_PAGE]->(p:Page)
+                        RETURN DISTINCT p.page_number AS page_number,
+                               p.content AS content,
+                               ch.title AS chapter,
+                               d.filename AS document
+                        LIMIT $limit""",
+                    {"section_num": section_num, "limit": limit, **doc_params},
+                ) or []
+                pages.extend(rows)
+            except Exception as e:
+                logger.debug("Intent section lookup failed: %s", e)
+
+        # Targeted figure lookup
+        figure_match = self._FIGURE_REF_RE.search(query)
+        if figure_match:
+            figure_num = figure_match.group(1)
+            try:
+                rows = self.db.execute_query(
+                    f"""MATCH (d:Document)-[:HAS_CHAPTER]->(ch:Chapter)
+                              -[:HAS_SECTION]->(s:Section)-[:HAS_FIGURE]->(f:Figure)
+                        WHERE f.number CONTAINS $figure_num {doc_filter}
+                        MATCH (s)-[:CONTAINS_PAGE]->(p:Page)
+                        RETURN DISTINCT p.page_number AS page_number,
+                               p.content AS content,
+                               ch.title AS chapter,
+                               d.filename AS document
+                        LIMIT $limit""",
+                    {"figure_num": figure_num, "limit": limit, **doc_params},
+                ) or []
+                pages.extend(rows)
+            except Exception as e:
+                logger.debug("Intent figure lookup failed: %s", e)
+
+        if pages:
+            logger.info(
+                "Intent detection found %d targeted results (table=%s, section=%s, figure=%s, norm=%s)",
+                len(pages),
+                table_match.group(0) if table_match else None,
+                section_match.group(0) if section_match else None,
+                figure_match.group(0) if figure_match else None,
+                norm_match.group(0) if norm_match else None,
+            )
+        return pages
+
     def search_hybrid(
         self, query: str, limit: int = 8, keywords: str = ""
     ) -> List[Dict[str, Any]]:
-        """3-path hybrid search: graph traversal + dense vector + sparse BM25.
+        """Hybrid search: intent detection + graph traversal + dense vector + sparse BM25.
 
-        Each path produces a ranked page list.  The three lists are merged
+        When the query contains structured references (table numbers, section
+        numbers, norm references), a targeted lookup path is added and given
+        double weight in RRF to boost exact matches.
+
+        Each path produces a ranked page list.  The lists are merged
         with N-way RRF so that pages appearing in multiple paths are
         rewarded.  No adjacent-page expansion here — that happens in
         ``enrich_with_graph()`` after reranking.
@@ -1123,6 +1268,13 @@ class GraphQuerier:
             logger.debug("Embedding failed: %s", e)
 
         candidates = settings.hybrid_candidates_per_path
+
+        # Path 0: Intent-based targeted lookup (doubled weight in RRF)
+        path_intent: List[Dict[str, Any]] = []
+        try:
+            path_intent = self._intent_targeted_search(query, candidates)
+        except Exception as e:
+            logger.debug("Intent path failed: %s", e)
 
         # Path 1: Graph traversal (top-down via rich summaries)
         path_topdown: List[Dict[str, Any]] = []
@@ -1147,8 +1299,15 @@ class GraphQuerier:
         except Exception as e:
             logger.debug("BM25 path failed: %s", e)
 
-        # Collect non-empty paths for RRF
-        active_paths = [p for p in [path_topdown, path_vector, path_bm25] if p]
+        # Collect non-empty paths for RRF.
+        # Intent results are added twice to double their RRF weight,
+        # making targeted matches rank above generic vector hits.
+        active_paths = []
+        if path_intent:
+            active_paths.append(path_intent)
+            active_paths.append(path_intent)  # double weight
+        active_paths.extend(p for p in [path_topdown, path_vector, path_bm25] if p)
+
         if not active_paths:
             return []
 
@@ -1160,8 +1319,9 @@ class GraphQuerier:
         )
 
         logger.info(
-            "Hybrid search: topdown=%d, vector=%d, bm25=%d → merged=%d",
-            len(path_topdown), len(path_vector), len(path_bm25), len(merged),
+            "Hybrid search: intent=%d, topdown=%d, vector=%d, bm25=%d → merged=%d",
+            len(path_intent), len(path_topdown), len(path_vector),
+            len(path_bm25), len(merged),
         )
         return merged
 

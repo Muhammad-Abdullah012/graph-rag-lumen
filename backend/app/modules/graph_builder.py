@@ -1037,6 +1037,14 @@ class GraphBuilder:
                 llm_input_parts.append(f"## {title}")
         llm_input = "\n\n".join(llm_input_parts)
 
+        # Truncate LLM input to context limit, preserving section boundaries
+        if len(llm_input) > settings.summary_llm_input_limit:
+            llm_input = llm_input[:settings.summary_llm_input_limit]
+            # Trim back to the last complete section boundary
+            last_sep = llm_input.rfind("\n\n## ")
+            if last_sep > 0:
+                llm_input = llm_input[:last_sep]
+
         llm_description = ""
         if llm_input.strip():
             system_prompt = self._CHAPTER_SUMMARY_SYSTEM.format(
@@ -1099,6 +1107,10 @@ class GraphBuilder:
         exist) and before ``generate_embeddings()`` (so summaries can be
         embedded).
 
+        Only summarizes chapters of types configured in SUMMARY_CHAPTER_TYPES
+        (default: main_chapter and appendix). This avoids spending LLM time on
+        table-of-contents, introductory, and other non-content chapters.
+
         Returns total number of summaries created.
         """
         from backend.app.modules.ollama_client import get_ollama_client
@@ -1106,15 +1118,31 @@ class GraphBuilder:
         count = 0
 
         # ── Chapter summaries ───────────────────────────────────────────
+        # Parse configured chapter types to summarize
+        chapter_types = [t.strip() for t in settings.summary_chapter_types.split(",")]
+
         chapters = self.db.execute_query(
             """MATCH (ch:Chapter)
                WHERE ch.summary_text IS NULL
-               RETURN ch.id AS id, ch.title AS title""",
+                 AND ch.chapter_type IN $chapter_types
+               RETURN ch.id AS id, ch.title AS title, ch.chapter_type AS chapter_type""",
+            {"chapter_types": chapter_types},
         ) or []
 
-        logger.info("Generating summaries for %d chapters …", len(chapters))
-        for ch in chapters:
+        logger.info(
+            "Generating summaries for %d chapters (types: %s) …",
+            len(chapters),
+            ", ".join(chapter_types),
+        )
+        for idx, ch in enumerate(chapters):
             try:
+                logger.info(
+                    "Summary %d/%d: chapter '%s' [%s]",
+                    idx + 1,
+                    len(chapters),
+                    ch.get("title", "").replace("\n", " ")[:50],
+                    ch.get("chapter_type", "unknown"),
+                )
                 summary = self._build_chapter_summary(ch["id"], ollama)
                 if summary:
                     self.db.execute_query(
@@ -1123,8 +1151,12 @@ class GraphBuilder:
                         {"id": ch["id"], "summary": summary},
                     )
                     count += 1
-                    logger.debug("Summary for chapter '%s': %d chars",
-                                 ch.get("title", ""), len(summary))
+                    logger.debug(
+                        "Summary for chapter '%s' [%s]: %d chars",
+                        ch.get("title", ""),
+                        ch.get("chapter_type", "unknown"),
+                        len(summary),
+                    )
             except Exception as e:
                 logger.warning("Summary failed for chapter %s: %s", ch["id"], e)
 

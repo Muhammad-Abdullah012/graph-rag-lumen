@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     reranker_enabled: bool = os.getenv("RERANKER_ENABLED", "true").lower() in ("true", "1", "yes")
     reranker_model: str = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
     reranker_top_k: int = int(os.getenv("RERANKER_TOP_K", "8"))
-    reranker_threshold: float = float(os.getenv("RERANKER_THRESHOLD", "-5.0"))
+    reranker_threshold: float = float(os.getenv("RERANKER_THRESHOLD", "0.0"))
+    reranker_chunk_size: int = int(os.getenv("RERANKER_CHUNK_SIZE", "4000"))
+    reranker_chunk_overlap: int = int(os.getenv("RERANKER_CHUNK_OVERLAP", "400"))
 
     # Backend
     backend_host: str = os.getenv("BACKEND_HOST", "0.0.0.0")
@@ -39,8 +41,8 @@ class Settings(BaseSettings):
     environment: str = os.getenv("ENVIRONMENT", "development")
 
     # Top-down hierarchical retrieval
-    topdown_max_docs: int = int(os.getenv("TOPDOWN_MAX_DOCS", "3"))
-    topdown_max_chapters: int = int(os.getenv("TOPDOWN_MAX_CHAPTERS", "5"))
+    topdown_max_docs: int = int(os.getenv("TOPDOWN_MAX_DOCS", "5"))
+    topdown_max_chapters: int = int(os.getenv("TOPDOWN_MAX_CHAPTERS", "8"))
     topdown_fallback_min: int = int(os.getenv("TOPDOWN_FALLBACK_MIN", "3"))
 
     # Embedding chunking
@@ -50,18 +52,26 @@ class Settings(BaseSettings):
     # Hybrid retrieval
     hybrid_rrf_k: int = int(os.getenv("HYBRID_RRF_K", "60"))
     hybrid_candidates_per_path: int = int(os.getenv("HYBRID_CANDIDATES_PER_PATH", "15"))
+    query_intent_enabled: bool = os.getenv("QUERY_INTENT_ENABLED", "true").lower() in ("true", "1", "yes")
+    vector_page_threshold: float = float(os.getenv("VECTOR_PAGE_THRESHOLD", "0.45"))
+    vector_doc_threshold: float = float(os.getenv("VECTOR_DOC_THRESHOLD", "0.35"))
 
     # Summary generation
     summary_max_words: int = int(os.getenv("SUMMARY_MAX_WORDS", "500"))
+    summary_chapter_types: str = os.getenv("SUMMARY_CHAPTER_TYPES", "main_chapter,appendix")
+    summary_llm_input_limit: int = int(os.getenv("SUMMARY_LLM_INPUT_LIMIT", "24000"))
 
     # Graph enrichment
-    enrichment_max_adjacent: int = int(os.getenv("ENRICHMENT_MAX_ADJACENT", "2"))
+    enrichment_max_adjacent: int = int(os.getenv("ENRICHMENT_MAX_ADJACENT", "4"))
     enrichment_max_figures: int = int(os.getenv("ENRICHMENT_MAX_FIGURES", "10"))
     enrichment_max_formulas: int = int(os.getenv("ENRICHMENT_MAX_FORMULAS", "10"))
 
     # Content retrieval limits (chars returned from Neo4j per result row)
     page_content_limit: int = int(os.getenv("PAGE_CONTENT_LIMIT", "50000"))
     section_content_limit: int = int(os.getenv("SECTION_CONTENT_LIMIT", "50000"))
+
+    # Formula context extraction (chars of surrounding paragraphs stored per formula)
+    formula_context_chars: int = int(os.getenv("FORMULA_CONTEXT_CHARS", "1500"))
 
     # Documents
     documents_path: str = os.getenv("DOCUMENTS_PATH", "documents")
