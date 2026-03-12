@@ -91,6 +91,42 @@ class GraphQuerier:
         "Ed", "Rd", "Ek", "Rk", "fy", "fu", "fck", "fcd",
     })
 
+    # Eurocode abbreviation → full-form synonyms used in indexed text.
+    # Applied in BM25 queries so abbreviated queries find indexed content.
+    # Keys are uppercase for case-insensitive lookup.
+    _EUROCODE_SYNONYMS: Dict[str, List[str]] = {
+        "EC1": ["EN 1991", "Eurocode 1"],
+        "EC2": ["EN 1992", "Eurocode 2"],
+        "EC3": ["EN 1993", "Eurocode 3"],
+        "EC4": ["EN 1994", "Eurocode 4"],
+        "EC5": ["EN 1995", "Eurocode 5"],
+        "EC6": ["EN 1996", "Eurocode 6"],
+        "EC7": ["EN 1997", "Eurocode 7"],
+        "EC8": ["EN 1998", "Eurocode 8"],
+        "EC9": ["EN 1999", "Eurocode 9"],
+        "ULS": ["Grenzzustand", "Tragfähigkeit", "Grenzzustand der Tragfähigkeit"],
+        "SLS": ["Gebrauchstauglichkeit", "Grenzzustand der Gebrauchstauglichkeit"],
+        "NDP": ["Nationaler Anhang", "national bestimmte Parameter"],
+        "NCI": ["Nationaler Anhang"],
+    }
+
+    @classmethod
+    def _expand_synonyms(cls, keywords: str) -> str:
+        """Expand Eurocode abbreviations with their full forms for BM25 search.
+
+        Takes a space-separated keyword string and appends synonyms for any
+        recognised abbreviations.  The synonyms are added as extra OR terms so
+        pages using full form names are also retrieved.
+        """
+        words = keywords.split()
+        extras: List[str] = []
+        for w in words:
+            syns = cls._EUROCODE_SYNONYMS.get(w.upper(), [])
+            extras.extend(syns)
+        if extras:
+            return keywords + " " + " ".join(extras)
+        return keywords
+
     @classmethod
     def _to_keywords(cls, query: str) -> str:
         """Extract key technical terms from a natural-language query for BM25 search.
@@ -753,6 +789,7 @@ class GraphQuerier:
         static stopword filter (_to_keywords) when the LLM call failed.
         """
         search_terms = keywords if keywords else self._to_keywords(query)
+        search_terms = self._expand_synonyms(search_terms)
         return self.db.execute_query(
             """CALL db.index.fulltext.queryNodes('page_fulltext', $query)
                YIELD node, score
@@ -1243,23 +1280,85 @@ class GraphQuerier:
             )
         return pages
 
+    def _semantic_similar_expansion(
+        self, pages: List[Dict[str, Any]], limit: int
+    ) -> List[Dict[str, Any]]:
+        """Follow SEMANTICALLY_SIMILAR edges from the top-result sections.
+
+        Collects unique section IDs from the supplied pages (top results after
+        initial RRF merge), queries for sections linked by a SEMANTICALLY_SIMILAR
+        edge with score >= ``settings.semantic_similar_min_score``, and returns
+        the pages containing those similar sections.  This adds cross-document
+        coverage so, for example, an EC3 section that conceptually references
+        a topic explained in EC8 still surfaces the EC8 pages.
+        """
+        section_ids: List[str] = []
+        seen: set = set()
+        for p in pages:
+            for sid in (p.get("section_ids") or []):
+                if sid and sid not in seen:
+                    section_ids.append(sid)
+                    seen.add(sid)
+
+        if not section_ids:
+            return []
+
+        try:
+            return self.db.execute_query(
+                """UNWIND $sids AS sid
+                   MATCH (s:Section {id: sid})-[r:SEMANTICALLY_SIMILAR]-(sim:Section)
+                   WHERE r.score >= $min_score
+                   MATCH (p:Page)-[:HAS_SECTION]->(sim)
+                   WHERE p.content IS NOT NULL AND trim(p.content) <> ''
+                   OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(p)
+                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+                   WITH p, sim, r,
+                        collect(DISTINCT ch.title)[0]   AS chapter,
+                        collect(DISTINCT d.filename)[0] AS document,
+                        collect(DISTINCT sim.title)      AS section_titles,
+                        collect(DISTINCT sim.id)         AS section_ids
+                   RETURN p.id          AS page_id,
+                          p.page_number  AS page_number,
+                          substring(p.content, 0, $content_limit) AS content,
+                          p.header       AS header,
+                          chapter, document,
+                          r.score        AS score,
+                          section_titles, section_ids
+                   ORDER BY r.score DESC
+                   LIMIT $limit""",
+                {
+                    "sids": section_ids,
+                    "min_score": settings.semantic_similar_min_score,
+                    "content_limit": settings.page_content_limit,
+                    "limit": limit,
+                },
+            ) or []
+        except Exception as e:
+            logger.debug("Semantic similar expansion failed: %s", e)
+            return []
+
     def search_hybrid(
-        self, query: str, limit: int = 8, keywords: str = ""
+        self,
+        query: str,
+        limit: int = 8,
+        bm25_query: str = "",
+        _debug: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid search: intent detection + graph traversal + dense vector + sparse BM25.
 
-        When the query contains structured references (table numbers, section
-        numbers, norm references), a targeted lookup path is added and given
-        double weight in RRF to boost exact matches.
+        *query* is embedded with bge-m3 (multilingual) for paths 1-2 so both
+        English and German queries work without translation.
 
-        Each path produces a ranked page list.  The lists are merged
-        with N-way RRF so that pages appearing in multiple paths are
-        rewarded.  No adjacent-page expansion here — that happens in
-        ``enrich_with_graph()`` after reranking.
+        *bm25_query* overrides the BM25 (path 3) input — pass a German translation
+        so Lucene term matching works against the German-indexed text.  Falls back
+        to *query* when not provided.
+
+        *_debug* is an optional dict populated with per-path result counts and
+        compact page summaries; written to debug_raw.jsonl by the agent layer.
         """
         from config.settings import settings
 
-        # Embed query once — shared by all paths
+        # Embed the original query — bge-m3 is multilingual so no translation needed.
         embedding = None
         try:
             from backend.app.modules.ollama_client import get_ollama_client
@@ -1268,6 +1367,9 @@ class GraphQuerier:
             logger.debug("Embedding failed: %s", e)
 
         candidates = settings.hybrid_candidates_per_path
+
+        # BM25 operates on German text; use the German translation when provided.
+        _bm25_input = bm25_query or query
 
         # Path 0: Intent-based targeted lookup (doubled weight in RRF)
         path_intent: List[Dict[str, Any]] = []
@@ -1292,10 +1394,10 @@ class GraphQuerier:
             except Exception as e:
                 logger.debug("Dense vector path failed: %s", e)
 
-        # Path 3: Sparse BM25 (exact term matching)
+        # Path 3: Sparse BM25 — uses German query for accurate term matching
         path_bm25: List[Dict[str, Any]] = []
         try:
-            path_bm25 = self._fulltext_search_pages(query, candidates, keywords=keywords)
+            path_bm25 = self._fulltext_search_pages(_bm25_input, candidates)
         except Exception as e:
             logger.debug("BM25 path failed: %s", e)
 
@@ -1309,20 +1411,57 @@ class GraphQuerier:
         active_paths.extend(p for p in [path_topdown, path_vector, path_bm25] if p)
 
         if not active_paths:
+            if _debug is not None:
+                _debug.update({"bm25_input_query": _bm25_input, "bm25_keywords": "",
+                               "path_intent": {"n": 0}, "path_topdown": {"n": 0},
+                               "path_vector": {"n": 0}, "path_bm25": {"n": 0},
+                               "path_similar": {"n": 0}, "merged": {"n": 0}})
             return []
 
-        if len(active_paths) == 1:
-            return active_paths[0][:limit]
+        # Preliminary merge to discover top sections for semantic expansion.
+        preliminary = self._rrf_merge_multi(active_paths, limit=3, k=settings.hybrid_rrf_k)
 
-        merged = self._rrf_merge_multi(
-            active_paths, limit=limit, k=settings.hybrid_rrf_k
-        )
+        # Path 4: SEMANTICALLY_SIMILAR expansion from top preliminary sections.
+        path_similar: List[Dict[str, Any]] = []
+        if settings.semantic_similar_enabled and preliminary:
+            path_similar = self._semantic_similar_expansion(preliminary, candidates)
+            if path_similar:
+                active_paths.append(path_similar)
+
+        if len(active_paths) == 1:
+            merged = active_paths[0][:limit]
+        else:
+            merged = self._rrf_merge_multi(
+                active_paths, limit=limit, k=settings.hybrid_rrf_k
+            )
 
         logger.info(
-            "Hybrid search: intent=%d, topdown=%d, vector=%d, bm25=%d → merged=%d",
+            "Hybrid search: intent=%d, topdown=%d, vector=%d, bm25=%d, similar=%d → merged=%d",
             len(path_intent), len(path_topdown), len(path_vector),
-            len(path_bm25), len(merged),
+            len(path_bm25), len(path_similar), len(merged),
         )
+
+        # Populate debug dict with per-path summaries for observability.
+        if _debug is not None:
+            def _ps(pages: List[Dict]) -> List[Dict]:
+                return [
+                    {
+                        "pg": p.get("page_number"),
+                        "doc": (p.get("document") or "")[-50:],
+                        "ch": (p.get("chapter") or "")[:40],
+                        "score": round(float(p.get("score") or 0), 3),
+                    }
+                    for p in pages
+                ]
+            _debug["bm25_input_query"] = _bm25_input
+            _debug["bm25_keywords"] = self._expand_synonyms(self._to_keywords(_bm25_input))
+            _debug["path_intent"]  = {"n": len(path_intent),  "pages": _ps(path_intent)}
+            _debug["path_topdown"] = {"n": len(path_topdown), "pages": _ps(path_topdown)}
+            _debug["path_vector"]  = {"n": len(path_vector),  "pages": _ps(path_vector)}
+            _debug["path_bm25"]    = {"n": len(path_bm25),    "pages": _ps(path_bm25)}
+            _debug["path_similar"] = {"n": len(path_similar), "pages": _ps(path_similar)}
+            _debug["merged"]       = {"n": len(merged),       "pages": _ps(merged)}
+
         return merged
 
     # ----------------------------------------------------------------- #

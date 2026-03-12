@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     # Re-ranker (cross-encoder)
     reranker_enabled: bool = os.getenv("RERANKER_ENABLED", "true").lower() in ("true", "1", "yes")
     reranker_model: str = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
-    reranker_top_k: int = int(os.getenv("RERANKER_TOP_K", "8"))
+    reranker_top_k: int = int(os.getenv("RERANKER_TOP_K", "12"))
     reranker_threshold: float = float(os.getenv("RERANKER_THRESHOLD", "0.0"))
     reranker_chunk_size: int = int(os.getenv("RERANKER_CHUNK_SIZE", "4000"))
     reranker_chunk_overlap: int = int(os.getenv("RERANKER_CHUNK_OVERLAP", "400"))
@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     query_intent_enabled: bool = os.getenv("QUERY_INTENT_ENABLED", "true").lower() in ("true", "1", "yes")
     vector_page_threshold: float = float(os.getenv("VECTOR_PAGE_THRESHOLD", "0.45"))
     vector_doc_threshold: float = float(os.getenv("VECTOR_DOC_THRESHOLD", "0.35"))
+    semantic_similar_enabled: bool = os.getenv("SEMANTIC_SIMILAR_ENABLED", "true").lower() in ("true", "1", "yes")
+    semantic_similar_min_score: float = float(os.getenv("SEMANTIC_SIMILAR_MIN_SCORE", "0.80"))
+
+    # Context window budget — total chars across all pages sent to the LLM
+    total_context_budget: int = int(os.getenv("TOTAL_CONTEXT_BUDGET", "80000"))
+    hallucination_min_context_chars: int = int(os.getenv("HALLUCINATION_MIN_CONTEXT_CHARS", "200"))
 
     # Summary generation
     summary_max_words: int = int(os.getenv("SUMMARY_MAX_WORDS", "500"))

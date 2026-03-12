@@ -132,7 +132,10 @@ LANGUAGE:
 - Reply in the same language as the user's question.
 
 IF NOT IN CONTEXT:
-- If the answer is not in the CONTEXT, you MUST write ONLY this exact sentence: "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+- If the answer is not in the CONTEXT, reply in the SAME LANGUAGE as the user's question with ONLY:
+  - German: "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+  - English: "This information is not available in the provided context."
+  - For other languages, translate the same meaning.
 - Do NOT write anything else. Do NOT add general knowledge, suggestions, or explanations from your training data.
 - Do NOT say "generally speaking", "in Eurocode...", "typically...", or anything similar.
 - Silence is better than a wrong answer.
@@ -186,6 +189,19 @@ def _format_pages_as_context(
     """
     if not pages:
         return "(Keine relevanten Seiten im Wissensgraphen gefunden.)"
+
+    # Trim pages to fit within the context budget (lower-ranked pages first).
+    budget = settings.total_context_budget
+    if budget > 0:
+        trimmed: List[Dict[str, Any]] = []
+        used = 0
+        for page in pages:
+            page_len = len(page.get("content", ""))
+            if used + page_len > budget and trimmed:
+                break
+            trimmed.append(page)
+            used += page_len
+        pages = trimmed
 
     parts: List[str] = []
     for i, page in enumerate(pages, 1):
@@ -297,45 +313,63 @@ _TRANSLATE_SYSTEM = (
     "If the query is already in German, return it exactly as-is. "
     "Return ONLY the German text — no explanation, no quotes, no labels.\n\n"
     "Key Eurocode term mappings:\n"
+    # General structural terms
     "  design value → Bemessungswert\n"
     "  characteristic value → charakteristischer Wert\n"
-    "  shear modulus → Schubmodul\n"
-    "  elastic modulus / modulus of elasticity → Elastizitätsmodul\n"
-    "  yield strength → Streckgrenze\n"
     "  partial factor / partial safety factor → Teilsicherheitsbeiwert\n"
     "  load combination → Lastkombination\n"
-    "  dynamic amplification factor → Schwingbeiwert\n"
+    "  combination value → Kombinationswert\n"
+    "  frequent value → häufiger Wert\n"
+    "  quasi-permanent value → quasi-ständiger Wert\n"
+    "  ultimate limit state (ULS) → Grenzzustand der Tragfähigkeit\n"
+    "  serviceability limit state (SLS) → Grenzzustand der Gebrauchstauglichkeit\n"
+    "  National Annex → Nationaler Anhang\n"
+    "  nationally determined parameter (NDP) → national bestimmter Parameter\n"
+    # Loads
+    "  dead load / self-weight → Eigengewicht\n"
+    "  live load / imposed load → Nutzlast\n"
+    "  wind load → Windlast\n"
+    "  snow load → Schneelast\n"
+    "  traffic load → Verkehrslast\n"
+    "  temperature action → Temperatureinwirkung\n"
+    "  accidental action → außergewöhnliche Einwirkung\n"
+    "  seismic action → Erdbebeneinwirkung\n"
+    # Materials
     "  steel → Stahl\n"
     "  concrete → Beton\n"
-    "  bridge → Brücke\n"
-    "  material constant → Materialkonstante\n"
+    "  reinforcement → Bewehrung\n"
+    "  timber → Holz\n"
+    "  masonry → Mauerwerk\n"
+    "  elastic modulus / modulus of elasticity → Elastizitätsmodul\n"
+    "  shear modulus → Schubmodul\n"
+    "  yield strength → Streckgrenze\n"
+    "  tensile strength → Zugfestigkeit\n"
     "  Poisson's ratio → Querdehnzahl\n"
     "  coefficient of thermal expansion → Wärmeausdehnungskoeffizient\n"
     "  density → Wichte / Rohdichte\n"
+    "  material constant → Materialkonstante\n"
+    # Steel-specific
+    "  buckling → Knicken\n"
+    "  lateral torsional buckling → Biegedrillknicken\n"
+    "  fatigue → Ermüdung\n"
+    "  notch case / notch category → Kerbfall\n"
+    "  weld / welding → Schweißnaht\n"
+    "  cross-section class → Querschnittsklasse\n"
+    "  dynamic amplification factor → Schwingbeiwert\n"
+    # Concrete-specific
+    "  crack width → Rissbreite\n"
+    "  creep → Kriechen\n"
+    "  shrinkage → Schwinden\n"
+    "  prestress / prestressed → Vorspannung\n"
+    "  anchorage → Verankerung\n"
+    # Structural elements
+    "  bridge → Brücke\n"
+    "  road bridge → Straßenbrücke\n"
+    "  railway bridge → Eisenbahnbrücke\n"
+    "  column → Stütze\n"
+    "  beam → Träger\n"
     "  section → Abschnitt"
 )
-
-_KEYWORD_SYSTEM = (
-    "You are a search query optimizer for a Eurocode structural engineering knowledge base. "
-    "Extract 3-6 key technical search terms from the query below.\n\n"
-    "Rules:\n"
-    "- Include specific Eurocode terms, load types, material names, norm numbers, "
-    "  numeric values (e.g. 71, 8.3), and abbreviations (e.g. EC3, ψ0, γQ)\n"
-    "- Keep the original German spelling exactly — do NOT translate or modify terms\n"
-    "- Exclude question words (welche, was, wie), prepositions, articles, "
-    "  conjunctions, and generic verbs (berücksichtigen, bestimmen, etc.)\n"
-    "- Return ONLY a space-separated list of terms — no explanation, no punctuation, no quotes\n\n"
-    "Examples:\n"
-    "  Query: 'Welche Kombinationswerte sind für Temperatur bei einer Straßenbrücke zu berücksichtigen?'\n"
-    "  Output: Kombinationswerte Temperatur Straßenbrücke\n\n"
-    "  Query: 'Kerbfall 71 Kerbdetail Kategorie'\n"
-    "  Output: Kerbfall 71 Kerbdetail Kategorie\n\n"
-    "  Query: 'Welche Lastmodelle gibt es für Eisenbahnbrücken nach EN 1991-2?'\n"
-    "  Output: Lastmodelle Eisenbahnbrücken EN 1991-2\n\n"
-    "  Query: 'Was ist der Teilsicherheitsbeiwert γQ für veränderliche Einwirkungen?'\n"
-    "  Output: Teilsicherheitsbeiwert γQ veränderliche Einwirkungen"
-)
-
 
 def _translate_to_german(question: str, llm: Any) -> str:
     """Translate *question* to German for graph search.  If already German, returns as-is."""
@@ -367,46 +401,6 @@ async def _atranslate_to_german(question: str, llm: Any) -> str:
     except Exception as e:
         logger.warning("Translation failed, using original query: %s", e)
     return question
-
-
-def _extract_keywords(question: str, llm: Any) -> str:
-    """Extract key technical search terms from *question* using the LLM.
-
-    Returns a space-separated string of keywords (e.g. "Kombinationswerte
-    Temperatur Straßenbrücke").  Returns an empty string on failure so the
-    caller can fall back to the static stopword filter in GraphQuerier.
-    """
-    try:
-        resp = llm.invoke([
-            SystemMessage(content=_KEYWORD_SYSTEM),
-            HumanMessage(content=question.strip()),
-        ])
-        keywords = (resp.content if hasattr(resp, "content") else str(resp)).strip()
-        # Sanity: reject multi-line responses (model returned an explanation)
-        keywords = keywords.splitlines()[0].strip() if keywords else ""
-        if keywords:
-            logger.info("Keywords extracted: '%s' → '%s'", question[:60], keywords[:80])
-            return keywords
-    except Exception as e:
-        logger.warning("Keyword extraction failed, falling back to stopword filter: %s", e)
-    return ""
-
-
-async def _aextract_keywords(question: str, llm: Any) -> str:
-    """Async version of _extract_keywords."""
-    try:
-        resp = await llm.ainvoke([
-            SystemMessage(content=_KEYWORD_SYSTEM),
-            HumanMessage(content=question.strip()),
-        ])
-        keywords = (resp.content if hasattr(resp, "content") else str(resp)).strip()
-        keywords = keywords.splitlines()[0].strip() if keywords else ""
-        if keywords:
-            logger.info("Keywords extracted: '%s' → '%s'", question[:60], keywords[:80])
-            return keywords
-    except Exception as e:
-        logger.warning("Keyword extraction failed, falling back to stopword filter: %s", e)
-    return ""
 
 
 def _classify_query(question: str, llm: Any) -> str:
@@ -477,25 +471,25 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
     # ── Node: graph search ───────────────────────────────────────────
     def graph_search(state: AgentState) -> AgentState:
         question = state["question"]
-        keywords = _extract_keywords(question, llm)
+        german_query = _translate_to_german(question, llm)
         tools_used: List[Dict[str, Any]] = []
 
         try:
             pages = querier.search_hybrid(
-                question,
+                question,                            # original → embedding paths
                 limit=settings.hybrid_candidates_per_path,
-                keywords=keywords,
+                bm25_query=german_query,             # German → BM25 path
             )
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": question, "keywords": keywords, "pages": len(pages)},
+                "arguments": {"query": question, "bm25_query": german_query, "pages": len(pages)},
             })
         except Exception as e:
             logger.error("Hybrid search failed for '%s': %s", question[:80], e)
             pages = []
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": question, "keywords": keywords},
+                "arguments": {"query": question, "bm25_query": german_query},
                 "error": str(e),
             })
 
@@ -571,6 +565,14 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
         question = state["question"]
         context = state.get("ranked_context", "") or "(Keine relevanten Ergebnisse im Wissensgraphen gefunden.)"
         img_mapping = state.get("img_mapping", {})
+
+        # Hard hallucination gate: skip LLM when context is empty or trivially short.
+        _no_results_marker = "(Keine relevanten"
+        if (context.startswith(_no_results_marker)
+                or len(context) < settings.hallucination_min_context_chars):
+            refusal = "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+            logger.info("Hallucination gate triggered — context too short (%d chars), skipping LLM.", len(context))
+            return {**state, "answer": refusal}
 
         user_prompt = (
             f"CONTEXT:\n{context}\n\n"
@@ -740,30 +742,48 @@ class EurocodeAgent:
             return
 
         # ── Eurocode path ─────────────────────────────────────────────
-        # Step 2: translate → extract keywords → 3-path hybrid search
+        # Step 2: translate to German for BM25 only, then run 4-path hybrid search
         yield {"type": "status", "step": "searching", "message": "Suche im Wissensgraphen…"}
 
-        keywords = await _aextract_keywords(question, self.llm)
+        # bge-m3 is multilingual — embed the original question unchanged.
+        # The German translation is passed separately and used ONLY by the BM25 path.
+        german_query = await _atranslate_to_german(question, self.llm)
 
         tools_used: List[Dict[str, Any]] = []
         pages: List[Dict[str, Any]] = []
+        search_debug: Dict[str, Any] = {}
         try:
             pages = self.querier.search_hybrid(
-                question,
+                question,                               # original → embedding paths
                 limit=settings.hybrid_candidates_per_path,
-                keywords=keywords,
+                bm25_query=german_query,                # German → BM25 path
+                _debug=search_debug,
             )
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": question, "keywords": keywords, "pages": len(pages)},
+                "arguments": {"query": question, "bm25_query": german_query, "pages": len(pages)},
             })
         except Exception as e:
             logger.error("Hybrid search failed in stream: %s", e)
             tools_used.append({
                 "tool": "search_hybrid",
-                "arguments": {"query": question, "keywords": keywords},
+                "arguments": {"query": question, "bm25_query": german_query},
                 "error": str(e),
             })
+
+        # Snapshot page order before reranking for debug comparison
+        def _pg_snap(p_list: List[Dict], score_key: str = "score") -> List[Dict]:
+            return [
+                {
+                    "pg": p.get("page_number"),
+                    "doc": (p.get("document") or "")[-50:],
+                    "ch": (p.get("chapter") or "")[:40],
+                    score_key: round(float(p.get(score_key) or 0), 3),
+                }
+                for p in p_list
+            ]
+
+        pages_before_rerank = _pg_snap(pages)
 
         # Step 2b: cross-encoder reranking
         yield {"type": "status", "step": "reranking", "message": "Bewerte Relevanz…"}
@@ -784,7 +804,10 @@ class EurocodeAgent:
             except Exception as e:
                 logger.warning("Reranker failed, using unranked pages: %s", e)
 
+        pages_after_rerank = _pg_snap(pages, "rerank_score")
+
         # Step 2c: graph enrichment (adjacent pages, figures, formulas)
+        pages_before_enrich = len(pages)
         extra_figures_raw: List[Dict[str, Any]] = []
         extra_formulas: List[Dict[str, Any]] = []
         try:
@@ -800,11 +823,26 @@ class EurocodeAgent:
         except Exception as e:
             logger.debug("Graph enrichment failed: %s", e)
 
-        # Step 3: format pages as context (replace images with placeholders)
+        adjacent_added = _pg_snap(pages[pages_before_enrich:])
+
+        # Step 3: apply context budget, then format pages as context
         yield {"type": "status", "step": "ranking", "message": "Bereite Kontext vor…"}
+        budget = settings.total_context_budget
+        pages_for_context = pages
+        if budget > 0:
+            trimmed: List[Dict[str, Any]] = []
+            used_chars = 0
+            for p in pages:
+                plen = len(p.get("content", ""))
+                if used_chars + plen > budget and trimmed:
+                    break
+                trimmed.append(p)
+                used_chars += plen
+            pages_for_context = trimmed
+
         img_mapping: Dict[str, str] = {}
         img_counter: List[int] = [1]
-        context = _format_pages_as_context(pages, img_mapping, img_counter)
+        context = _format_pages_as_context(pages_for_context, img_mapping, img_counter)
 
         # Build extra_figures markdown from enrichment results
         extra_figures: List[str] = []
@@ -823,20 +861,38 @@ class EurocodeAgent:
 
         tools_used.append({
             "tool": "build_context",
-            "arguments": {"pages": len(pages), "chars": len(context)},
-        })
-
-        # ── Debug log ─────────────────────────────────────────────────
-        _write_debug({
-            "ts": datetime.utcnow().isoformat(),
-            "question": question,
-            "pages_found": len(pages),
-            "page_titles": [f"p{p.get('page_number','?')} {p.get('chapter','')}" for p in pages],
-            "context": context,
+            "arguments": {"pages": len(pages_for_context), "chars": len(context)},
         })
 
         # Step 4: stream LLM answer
         yield {"type": "status", "step": "answering", "message": "Generiere Antwort…"}
+
+        # Hard hallucination gate: if no meaningful context, skip LLM entirely.
+        _no_results_marker = "(Keine relevanten"
+        if (context.startswith(_no_results_marker)
+                or len(context) < settings.hallucination_min_context_chars):
+            refusal = "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+            logger.info("Hallucination gate triggered — context too short (%d chars), skipping LLM.", len(context))
+            _write_debug({
+                "ts": datetime.utcnow().isoformat(),
+                "question": question,
+                "german_query": german_query,
+                "search": search_debug,
+                "rerank": {"before": pages_before_rerank, "after": [], "gate": "hallucination_gate"},
+                "enrichment": {"adjacent_added": adjacent_added, "figures": 0, "formulas": 0},
+                "budget": {"pages_input": len(pages), "pages_used": 0, "budget_chars": budget, "context_chars": 0},
+                "context": "",
+                "answer": refusal,
+            })
+            yield {"type": "token", "content": refusal}
+            yield {
+                "type": "done",
+                "answer": refusal,
+                "tools_used": tools_used,
+                "route": "eurocode",
+                "sources": [],
+            }
+            return
 
         user_prompt = (
             f"CONTEXT:\n{context}\n\n"
@@ -893,15 +949,45 @@ class EurocodeAgent:
                 "chapter":     p.get("chapter", ""),
                 "preview":     (p.get("content") or "")[:600].strip(),
             }
-            for p in pages
+            for p in pages_for_context
             if p.get("page_number") is not None and p.get("document")
         ]
 
-        # ── Debug log: final answer (for hallucination checking) ──────
+        # ── Single comprehensive debug entry ──────────────────────────
+        # Captures every step of the pipeline so accuracy problems can be
+        # diagnosed by reading debug_raw.jsonl without touching logs.
         _write_debug({
             "ts": datetime.utcnow().isoformat(),
             "question": question,
-            "final_answer": full_answer,
+            "german_query": german_query,
+            "search": search_debug,
+            "rerank": {
+                "before_n": len(pages_before_rerank),
+                "before": pages_before_rerank,
+                "after_n": len(pages_after_rerank),
+                "after": pages_after_rerank,
+                "dropped": [
+                    p for p in pages_before_rerank
+                    if (p["pg"], p["doc"]) not in
+                    {(q["pg"], q["doc"]) for q in pages_after_rerank}
+                ],
+            },
+            "enrichment": {
+                "pages_before": pages_before_enrich,
+                "adjacent_added": adjacent_added,
+                "figures": len(extra_figures_raw),
+                "formulas": len(extra_formulas),
+                "pages_after": len(pages),
+            },
+            "budget": {
+                "pages_input": len(pages),
+                "pages_used": len(pages_for_context),
+                "dropped_by_budget": len(pages) - len(pages_for_context),
+                "budget_chars": budget,
+                "context_chars": len(context),
+            },
+            "context": context,
+            "answer": full_answer,
         })
 
         yield {"type": "done", "answer": full_answer, "tools_used": tools_used, "route": "eurocode", "sources": sources}
