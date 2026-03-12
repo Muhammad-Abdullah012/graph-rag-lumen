@@ -1,100 +1,143 @@
 """Graph Management Routes - Build & inspect the Graph-RAG knowledge graph"""
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
 
 from backend.app.modules.graph_builder import get_graph_builder
+from backend.app.modules.graph_jobs_db import (
+    fail_job,
+    finish_job,
+    get_job_history,
+    get_latest_job,
+    get_running_job,
+    start_job,
+)
 from backend.app.modules.graph_querier import get_graph_querier
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/graph", tags=["graph"])
 
+# One worker so only one heavy job runs at a time.
+_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="graph_worker")
+
+
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class GraphBuildResponse(BaseModel):
-    """Response after building the graph"""
     status: str
     stats: Dict[str, Any]
 
 
 class GraphStatsResponse(BaseModel):
-    """Graph statistics response"""
     stats: Dict[str, Any]
 
 
-@router.post("/build", response_model=GraphBuildResponse)
-async def build_graph() -> GraphBuildResponse:
-    """
-    Build the knowledge graph from all JSON files in backend/json/.
-    Creates the full Graph-RAG schema: Document → Chapter → Page → Section,
-    plus Tables, Figures, Formulas, Concepts with MENTIONS & RELATED_TO edges.
-    Idempotent (uses MERGE).
-    """
-    try:
-        builder = get_graph_builder()
-        stats = builder.build_all()
-        logger.info(f"Graph built: {stats}")
-        return GraphBuildResponse(status="success", stats=stats)
-    except Exception as e:
-        logger.error(f"Graph build failed: {str(e)}")
-        return GraphBuildResponse(status=f"error: {str(e)}", stats={})
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _assert_idle() -> None:
+    """Raise 409 if a graph job is already running."""
+    running = get_running_job()
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job '{running['job_name']}' is already running (id={running['id']}). "
+                   "Poll GET /api/graph/job-status for progress.",
+        )
 
 
-@router.post("/rebuild", response_model=GraphBuildResponse)
-async def rebuild_graph() -> GraphBuildResponse:
-    """Clear the graph and rebuild from scratch."""
-    try:
-        builder = get_graph_builder()
+async def _dispatch(name: str, fn: Callable, *args) -> Dict[str, Any]:
+    """Persist a job row, run *fn* in the thread executor, return 202 immediately."""
+    job_id = start_job(name)
+
+    def _run():
+        try:
+            result = fn(*args)
+            finish_job(job_id, result if isinstance(result, dict) else {"count": result})
+            logger.info("Job '%s' (id=%d) finished: %s", name, job_id, result)
+        except Exception as exc:
+            logger.error("Job '%s' (id=%d) failed: %s", name, job_id, exc)
+            fail_job(job_id, str(exc))
+
+    asyncio.get_event_loop().run_in_executor(_executor, _run)
+    return {"status": "started", "job": name, "job_id": job_id}
+
+
+# ── Job status endpoints ──────────────────────────────────────────────────────
+
+@router.get("/job-status")
+async def job_status():
+    """Return the most recent graph job (running or finished)."""
+    job = get_latest_job()
+    if not job:
+        return {"status": "no_jobs"}
+    return job
+
+
+@router.get("/job-history")
+async def job_history(limit: int = 20):
+    """Return the last *limit* graph jobs ordered newest-first."""
+    return {"jobs": get_job_history(limit=limit)}
+
+
+# ── Long-running jobs (202 Accepted) ─────────────────────────────────────────
+
+@router.post("/build", status_code=202)
+async def build_graph():
+    """Full pipeline: build graph nodes → summaries → embeddings. Returns immediately."""
+    _assert_idle()
+    builder = get_graph_builder()
+    return await _dispatch("build", builder.build_pipeline)
+
+
+@router.post("/rebuild", status_code=202)
+async def rebuild_graph():
+    """Clear the graph then run the full pipeline: build → summaries → embeddings. Returns immediately."""
+    _assert_idle()
+    builder = get_graph_builder()
+
+    def _rebuild():
         builder.clear_graph()
-        stats = builder.build_all()
-        logger.info(f"Graph rebuilt: {stats}")
-        return GraphBuildResponse(status="success", stats=stats)
-    except Exception as e:
-        logger.error(f"Graph rebuild failed: {str(e)}")
-        return GraphBuildResponse(status=f"error: {str(e)}", stats={})
+        return builder.build_pipeline()
+
+    return await _dispatch("rebuild", _rebuild)
 
 
-@router.post("/generate-embeddings")
+@router.post("/generate-embeddings", status_code=202)
 async def generate_embeddings():
-    """Generate embeddings for all Section and Concept nodes that lack them."""
-    try:
-        builder = get_graph_builder()
-        count = builder.generate_embeddings()
-        return {"status": "success", "embeddings_created": count}
-    except Exception as e:
-        logger.error(f"Embedding generation failed: {str(e)}")
-        return {"status": f"error: {str(e)}", "embeddings_created": 0}
+    """Generate embeddings for all nodes that lack them. Returns immediately."""
+    _assert_idle()
+    builder = get_graph_builder()
+    return await _dispatch("generate-embeddings", builder.generate_embeddings)
 
 
-@router.post("/generate-summaries")
+@router.post("/generate-summaries", status_code=202)
 async def generate_summaries():
-    """Generate rich chapter and document summaries for top-down retrieval.
-
-    Must run after graph build (sections, formulas, tables exist) and
-    before embedding generation (so summaries can be embedded).
-    """
-    try:
-        builder = get_graph_builder()
-        count = builder.generate_summaries()
-        return {"status": "success", "summaries_created": count}
-    except Exception as e:
-        logger.error(f"Summary generation failed: {str(e)}")
-        return {"status": f"error: {str(e)}", "summaries_created": 0}
+    """Generate rich chapter/document summaries for top-down retrieval. Returns immediately."""
+    _assert_idle()
+    builder = get_graph_builder()
+    return await _dispatch("generate-summaries", builder.generate_summaries)
 
 
-@router.post("/compute-similarity")
+@router.post("/compute-similarity", status_code=202)
 async def compute_similarity(threshold: float = 0.80, top_k: int = 5):
-    """Compute SEMANTICALLY_SIMILAR edges between sections across documents."""
-    try:
-        builder = get_graph_builder()
-        count = builder.compute_semantic_similarity(threshold=threshold, top_k=top_k)
-        return {"status": "success", "similarity_links_created": count}
-    except Exception as e:
-        logger.error(f"Similarity computation failed: {str(e)}")
-        return {"status": f"error: {str(e)}", "similarity_links_created": 0}
+    """Compute SEMANTICALLY_SIMILAR edges between sections. Returns immediately."""
+    _assert_idle()
+    builder = get_graph_builder()
+    return await _dispatch(
+        "compute-similarity",
+        builder.compute_semantic_similarity,
+        threshold,
+        top_k,
+    )
 
+
+# ── Fast read-only endpoints ──────────────────────────────────────────────────
 
 @router.get("/stats", response_model=GraphStatsResponse)
 async def graph_stats() -> GraphStatsResponse:
@@ -104,7 +147,7 @@ async def graph_stats() -> GraphStatsResponse:
         stats = querier.get_graph_stats()
         return GraphStatsResponse(stats=stats)
     except Exception as e:
-        logger.error(f"Could not get graph stats: {str(e)}")
+        logger.error("Could not get graph stats: %s", e)
         return GraphStatsResponse(stats={"error": str(e)})
 
 
@@ -140,9 +183,7 @@ async def search_concepts(q: str, limit: int = 15):
 
 @router.post("/process-document/{filename}")
 async def process_document_manually(filename: str):
-    """
-    Manually trigger OCR pipeline for a document already in the documents folder.
-    """
+    """Manually trigger OCR pipeline for a document already in the documents folder."""
     from config.settings import settings
     docs_dir = Path(settings.documents_path)
 
@@ -158,7 +199,7 @@ async def process_document_manually(filename: str):
         process_document_background(str(file_path), file_path.name)
         return {"status": "processing_started", "filename": file_path.name}
     except Exception as e:
-        logger.error(f"Failed to start processing: {e}")
+        logger.error("Failed to start processing: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -172,20 +213,19 @@ async def process_all_documents():
     if not pdf_files:
         return {"status": "no_documents", "message": "No PDF files found."}
 
-    started = []
+    started: List[str] = []
     try:
         from backend.app.modules.ocr_pipeline import process_document_background
         for pdf_path in pdf_files:
             process_document_background(str(pdf_path), pdf_path.name)
             started.append(pdf_path.name)
     except Exception as e:
-        logger.error(f"Failed to start batch processing: {e}")
+        logger.error("Failed to start batch processing: %s", e)
 
     return {"status": "processing_started", "documents": started, "count": len(started)}
 
 
 class SemanticSearchResponse(BaseModel):
-    """Semantic search results"""
     query: str
     results: list
 
@@ -198,5 +238,5 @@ async def semantic_search_endpoint(query: str, top_k: int = 10):
         results = querier.semantic_search(query, top_k=top_k)
         return SemanticSearchResponse(query=query, results=results)
     except Exception as e:
-        logger.error(f"Semantic search failed: {str(e)}")
+        logger.error("Semantic search failed: %s", e)
         return SemanticSearchResponse(query=query, results=[])

@@ -1,10 +1,11 @@
 #!/bin/bash
 # Rebuild the Neo4j knowledge graph from scratch.
-# Connects directly to Neo4j to wipe the graph, then calls the backend API to rebuild it.
+# Calls POST /api/graph/rebuild which runs the full pipeline:
+#   clear → build nodes → summaries → embeddings → semantic similarity
+# Then polls /api/graph/job-status until the job completes.
 
 set -e
 
-# ── Config (reads from .env if present) ────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 if [ -f "$ENV_FILE" ]; then
@@ -12,77 +13,15 @@ if [ -f "$ENV_FILE" ]; then
     source "$ENV_FILE"
 fi
 
-NEO4J_CONTAINER="${NEO4J_CONTAINER:-graphrag-neo4j}"
-NEO4J_USERNAME="${NEO4J_USERNAME:-neo4j}"
-NEO4J_PASSWORD="${NEO4J_PASSWORD:-neo4jpassword}"
 BACKEND_URL="${BACKEND_URL:-http://localhost:9000}"
+POLL_INTERVAL="${POLL_INTERVAL:-15}"  # seconds between status checks
 
-SKIP_EMBEDDINGS=false
-if [[ "$1" == "--no-embeddings" ]]; then
-    SKIP_EMBEDDINGS=true
-fi
-
-echo "=== Graph Rebuild ==="
+echo "=== Graph Rebuild Pipeline ==="
+echo "  Backend: ${BACKEND_URL}"
 echo ""
 
-# ── Step 1: Verify Neo4j container is running ──────────────────────────────────
-echo "Step 1: Checking Neo4j container..."
-if ! docker ps --format '{{.Names}}' | grep -q "^${NEO4J_CONTAINER}$"; then
-    echo "  ERROR: Container '${NEO4J_CONTAINER}' is not running."
-    echo "         Start services first: docker compose up -d"
-    exit 1
-fi
-echo "  OK: ${NEO4J_CONTAINER} is running"
-
-# ── Step 2: Wait for Neo4j to accept connections ───────────────────────────────
-echo ""
-echo "Step 2: Waiting for Neo4j to be ready..."
-MAX_WAIT=60
-WAITED=0
-until docker exec "$NEO4J_CONTAINER" \
-    cypher-shell -u "$NEO4J_USERNAME" -p "$NEO4J_PASSWORD" \
-    "RETURN 1" > /dev/null 2>&1; do
-    if [ "$WAITED" -ge "$MAX_WAIT" ]; then
-        echo "  ERROR: Neo4j did not become ready within ${MAX_WAIT}s."
-        exit 1
-    fi
-    echo -n "."
-    sleep 2
-    WAITED=$((WAITED + 2))
-done
-echo ""
-echo "  OK: Neo4j is ready"
-
-# ── Step 3: Delete the graph ───────────────────────────────────────────────────
-echo ""
-echo "Step 3: Deleting all nodes and relationships..."
-NODE_COUNT=$(docker exec "$NEO4J_CONTAINER" \
-    cypher-shell -u "$NEO4J_USERNAME" -p "$NEO4J_PASSWORD" \
-    "MATCH (n) RETURN count(n) AS c" --format plain 2>/dev/null | tail -1 || echo "0")
-echo "  Found ${NODE_COUNT} nodes — deleting..."
-
-docker exec "$NEO4J_CONTAINER" \
-    cypher-shell -u "$NEO4J_USERNAME" -p "$NEO4J_PASSWORD" \
-    "MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 5000 ROWS"
-
-echo "  OK: Graph cleared"
-
-# ── Step 3b: Drop vector indexes so they are recreated with the correct dimension ──
-echo ""
-echo "Step 3b: Dropping vector indexes..."
-docker exec "$NEO4J_CONTAINER" \
-    cypher-shell -u "$NEO4J_USERNAME" -p "$NEO4J_PASSWORD" \
-    "DROP INDEX page_embedding_index IF EXISTS;
-     DROP INDEX section_embedding_index IF EXISTS;
-     DROP INDEX concept_embedding_index IF EXISTS;
-     DROP INDEX formula_embedding_index IF EXISTS;
-     DROP INDEX table_embedding_index IF EXISTS;
-     DROP INDEX figure_embedding_index IF EXISTS;" 2>/dev/null || true
-echo "  OK: Vector indexes dropped"
-
-# ── Step 4: Verify backend is reachable ────────────────────────────────────────
-echo ""
-echo "Step 4: Checking backend API..."
+# ── Step 1: Verify backend is reachable ────────────────────────────────────────
+echo "Step 1: Checking backend API..."
 if ! curl -sf "${BACKEND_URL}/api/health/" > /dev/null 2>&1; then
     echo "  ERROR: Backend not reachable at ${BACKEND_URL}"
     echo "         Is the backend container running?"
@@ -90,57 +29,61 @@ if ! curl -sf "${BACKEND_URL}/api/health/" > /dev/null 2>&1; then
 fi
 echo "  OK: Backend is reachable"
 
-# ── Step 5: Rebuild the graph ──────────────────────────────────────────────────
+# ── Step 2: Trigger rebuild (returns 202 immediately) ─────────────────────────
 echo ""
-echo "Step 5: Rebuilding graph from JSON files..."
-REBUILD_RESPONSE=$(curl -sf -X POST "${BACKEND_URL}/api/graph/build" \
+echo "Step 2: Triggering full rebuild pipeline..."
+RESPONSE=$(curl -sf -X POST "${BACKEND_URL}/api/graph/rebuild" \
     -H "Content-Type: application/json" 2>&1)
 
 if [ $? -ne 0 ]; then
-    echo "  ERROR: Graph build request failed."
-    echo "         Response: ${REBUILD_RESPONSE}"
+    echo "  ERROR: Rebuild request failed."
+    echo "         Response: ${RESPONSE}"
     exit 1
 fi
 
-STATUS=$(echo "$REBUILD_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','unknown'))" 2>/dev/null || echo "unknown")
-if [[ "$STATUS" != "success" ]]; then
-    echo "  ERROR: Graph build returned status: ${STATUS}"
-    echo "         Full response: ${REBUILD_RESPONSE}"
-    exit 1
-fi
+JOB_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('job_id','?'))" 2>/dev/null || echo "?")
+echo "  OK: Job started (id=${JOB_ID})"
+echo "  Pipeline: clear → build nodes → summaries → embeddings → similarity"
 
-echo "  OK: Graph built"
-echo "  Stats: $(echo "$REBUILD_RESPONSE" | python3 -c "
+# ── Step 3: Poll until job finishes ───────────────────────────────────────────
+echo ""
+echo "Step 3: Waiting for pipeline to complete (polling every ${POLL_INTERVAL}s)..."
+echo "        Monitor logs: docker compose logs -f backend"
+echo ""
+
+ELAPSED=0
+while true; do
+    STATUS_JSON=$(curl -sf "${BACKEND_URL}/api/graph/job-status" 2>/dev/null || echo "{}")
+    STATUS=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))" 2>/dev/null || echo "unknown")
+
+    if [ "$STATUS" = "success" ]; then
+        echo ""
+        echo "  OK: Pipeline completed successfully after ${ELAPSED}s"
+        echo "  Result: $(echo "$STATUS_JSON" | python3 -c "
 import sys, json
-d = json.load(sys.stdin).get('stats', {})
-print(', '.join(f'{k}={v}' for k, v in d.items()))
+r = json.load(sys.stdin).get('result', {})
+print(', '.join(f'{k}={v}' for k, v in r.items()))
 " 2>/dev/null)"
-
-# ── Step 6: Generate embeddings (optional) ────────────────────────────────────
-if [ "$SKIP_EMBEDDINGS" = false ]; then
-    echo ""
-    echo "Step 6: Generating embeddings..."
-    echo "  (pass --no-embeddings to skip this step)"
-    EMB_RESPONSE=$(curl -sf -X POST "${BACKEND_URL}/api/graph/generate-embeddings" \
-        -H "Content-Type: application/json" 2>&1)
-    if [ $? -eq 0 ]; then
-        EMB_COUNT=$(echo "$EMB_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('embeddings_created',0))" 2>/dev/null || echo "?")
-        echo "  OK: ${EMB_COUNT} embeddings created"
+        break
+    elif [ "$STATUS" = "failed" ]; then
+        ERROR=$(echo "$STATUS_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown error'))" 2>/dev/null || echo "unknown error")
+        echo ""
+        echo "  ERROR: Pipeline failed after ${ELAPSED}s"
+        echo "         Error: ${ERROR}"
+        exit 1
     else
-        echo "  WARNING: Embedding generation failed (non-fatal)"
-        echo "           Run manually: curl -X POST ${BACKEND_URL}/api/graph/generate-embeddings"
+        printf "  [%ds] Running... (status=%s)\r" "$ELAPSED" "$STATUS"
+        sleep "$POLL_INTERVAL"
+        ELAPSED=$((ELAPSED + POLL_INTERVAL))
     fi
-else
-    echo ""
-    echo "Step 6: Skipping embeddings (--no-embeddings)"
-fi
+done
 
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Rebuild Complete ==="
 echo ""
 echo "Useful commands:"
-echo "  Graph stats:  curl ${BACKEND_URL}/api/graph/stats"
-echo "  Embeddings:   curl -X POST ${BACKEND_URL}/api/graph/generate-embeddings"
-echo "  Similarity:   curl -X POST ${BACKEND_URL}/api/graph/compute-similarity"
+echo "  Graph stats:   curl ${BACKEND_URL}/api/graph/stats"
+echo "  Job history:   curl ${BACKEND_URL}/api/graph/job-history"
+echo "  Job status:    curl ${BACKEND_URL}/api/graph/job-status"
 echo ""

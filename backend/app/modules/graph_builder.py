@@ -378,10 +378,90 @@ class GraphBuilder:
         logger.info("Graph build complete: %s", total)
         return total
 
+    def build_pipeline(self) -> Dict[str, Any]:
+        """Full pipeline: build nodes → summaries → embeddings → semantic similarity.
+
+        Phases run in sequence. Returns a combined stats dict.
+        """
+        logger.info("═" * 60)
+        logger.info("PIPELINE: Phase 1/4 — building graph nodes …")
+        logger.info("═" * 60)
+        stats = self.build_all()
+
+        logger.info("═" * 60)
+        logger.info("PIPELINE: Phase 2/4 — generating chapter/document summaries …")
+        logger.info("═" * 60)
+        summaries_created = self.generate_summaries()
+        stats["summaries_created"] = summaries_created
+
+        logger.info("═" * 60)
+        logger.info("PIPELINE: Phase 3/4 — generating embeddings …")
+        logger.info("═" * 60)
+        embeddings_created = self.generate_embeddings()
+        stats["embeddings_created"] = embeddings_created
+
+        logger.info("═" * 60)
+        logger.info("PIPELINE: Phase 4/4 — computing semantic similarity …")
+        logger.info("═" * 60)
+        similarity_links = self.compute_semantic_similarity()
+        stats["similarity_links"] = similarity_links
+
+        logger.info("═" * 60)
+        logger.info("PIPELINE COMPLETE: %s", stats)
+        logger.info("═" * 60)
+        return stats
+
     def clear_graph(self):
-        """Remove **all** nodes and relationships."""
+        """Remove all nodes, relationships, indexes and constraints."""
         self.db.execute_query("MATCH (n) DETACH DELETE n")
-        logger.info("Graph cleared")
+
+        # Drop vector indexes (must go before constraints that back them)
+        for idx in (
+            "section_embedding_index", "concept_embedding_index",
+            "formula_embedding_index", "table_embedding_index",
+            "figure_embedding_index", "page_embedding_index",
+            "chapter_embedding_index", "document_embedding_index",
+        ):
+            try:
+                self.db.execute_query(f"DROP INDEX {idx} IF EXISTS")
+            except Exception:
+                pass
+
+        # Drop fulltext indexes
+        for idx in (
+            "section_fulltext", "table_fulltext", "formula_fulltext",
+            "figure_fulltext", "page_fulltext",
+        ):
+            try:
+                self.db.execute_query(f"DROP INDEX {idx} IF EXISTS")
+            except Exception:
+                pass
+
+        # Drop property indexes
+        for idx in (
+            "section_number_idx", "chapter_number_idx",
+            "page_number_idx", "doc_type_idx",
+        ):
+            try:
+                self.db.execute_query(f"DROP INDEX {idx} IF EXISTS")
+            except Exception:
+                pass
+
+        # Drop unique constraints
+        for constraint in (
+            "doc_id_unique", "volume_id_unique", "chapter_id_unique",
+            "page_id_unique", "section_id_unique", "table_id_unique",
+            "figure_id_unique", "formula_id_unique",
+        ):
+            try:
+                self.db.execute_query(f"DROP CONSTRAINT {constraint} IF EXISTS")
+            except Exception:
+                pass
+
+        # Reset cached embedding dimension so it's re-detected on next build
+        self._embedding_dim = None
+
+        logger.info("Graph cleared (nodes, indexes, constraints)")
 
     # ----------------------------------------------------------------- #
     #  Main ingestion
