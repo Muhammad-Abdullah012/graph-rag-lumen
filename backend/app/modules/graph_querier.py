@@ -56,13 +56,19 @@ class GraphQuerier:
     )
 
     @classmethod
-    def _escape_lucene(cls, query: str) -> str:
+    def _escape_lucene(cls, query: str, fuzzy: bool = False) -> str:
         """Escape Lucene fulltext query special characters.
 
         Norm references (EN 1993-1-1, DIN 1045-1, etc.) are converted to
         Lucene phrase queries so BM25 matches them as a unit rather than
         splitting on hyphens.  All other special characters are escaped with
         backslash to avoid ParseException.
+
+        When *fuzzy* is True, individual tokens longer than
+        ``settings.bm25_fuzzy_min_length`` characters get a ``~1`` edit-
+        distance suffix appended.  This handles German morphological
+        inflections (e.g. dative "Kopfbolzendübeln" vs nominative
+        "Kopfbolzendübel" in the index) without a stemmer dependency.
         """
         # 1. Extract and protect norm references as Lucene phrase queries
         protected_phrases: list[str] = []
@@ -79,7 +85,17 @@ class GraphQuerier:
         escaped = re.sub(specials, r'\\\1', remaining)
         escaped = escaped.strip()
 
-        # 3. Combine: protected phrase queries + escaped remainder
+        # 3. Optionally apply fuzzy matching to long individual tokens
+        if fuzzy and escaped:
+            min_len = settings.bm25_fuzzy_min_length
+            tokens = escaped.split()
+            tokens = [
+                f"{t}~1" if len(t) >= min_len and not t.startswith('"') else t
+                for t in tokens
+            ]
+            escaped = " ".join(tokens)
+
+        # 4. Combine: protected phrase queries + escaped remainder
         parts = protected_phrases + ([escaped] if escaped else [])
         return ' '.join(parts) or '*'
 
@@ -141,12 +157,6 @@ class GraphQuerier:
         keywords = [
             w for w in words
             if w.lower().rstrip(".,?!:") not in cls._DE_STOPWORDS
-            and (
-                w in cls._DOMAIN_TERMS               # protected domain abbrevs
-                or len(w) >= 4                        # normal words
-                or re.match(r'^\d[\d.,]*$', w)        # numbers: 71, 8.3, 1.5
-                or (len(w) >= 2 and w[0].isupper())   # abbrevs / variables: EC, ψ, G
-            )
         ]
         return ' '.join(keywords) if keywords else sanitized
 
@@ -827,7 +837,7 @@ class GraphQuerier:
                       score,
                       section_titles, section_ids
                ORDER BY score DESC LIMIT $limit""",
-            {"query": self._escape_lucene(search_terms), "limit": limit * 2, "content_limit": settings.page_content_limit},
+            {"query": self._escape_lucene(search_terms, fuzzy=True), "limit": limit * 2, "content_limit": settings.page_content_limit},
         ) or []
 
     @staticmethod
@@ -1038,59 +1048,77 @@ class GraphQuerier:
 
         doc_ids = [r["doc_id"] for r in doc_rows]
 
-        # Step 2: top chapters within those documents
-        try:
-            chapter_rows = self.db.execute_query(
-                """CALL db.index.vector.queryNodes(
-                       'chapter_embedding_index', $candidates, $embedding
-                   ) YIELD node, score
-                   WHERE score >= $vector_threshold
-                   MATCH (d:Document)-[:HAS_CHAPTER]->(node)
-                   WHERE d.id IN $doc_ids
-                   RETURN node.id AS chapter_id, score
-                   ORDER BY score DESC
-                   LIMIT $max_chapters""",
-                {
-                    "candidates": settings.topdown_max_chapters * 3,
-                    "embedding": embedding,
-                    "doc_ids": doc_ids,
-                    "max_chapters": settings.topdown_max_chapters,
-                    "vector_threshold": settings.vector_doc_threshold,
-                },
-            ) or []
-        except Exception as e:
-            logger.debug("Top-down chapter search unavailable: %s", e)
+        # Step 2: top sections within those documents.
+        # Sections are more granular than chapters — their focused embeddings discriminate
+        # specific technical content far better than averaged chapter-level embeddings.
+        # Query per document so that large documents (many sections) cannot monopolise
+        # the global ANN result pool and starve smaller but more relevant documents.
+        sections_per_doc = max(settings.topdown_max_chapters, 1)
+        section_rows: list = []
+        for doc_id in doc_ids:
+            try:
+                rows = self.db.execute_query(
+                    """CALL db.index.vector.queryNodes(
+                           'section_embedding_index', $candidates, $embedding
+                       ) YIELD node, score
+                       WHERE score >= $vector_threshold
+                       MATCH (p:Page)-[:HAS_SECTION]->(node)
+                       MATCH (d:Document {id: $doc_id})-[:HAS_CHAPTER]->(ch:Chapter)-[:CONTAINS_PAGE]->(p)
+                       RETURN DISTINCT node.id AS section_id, score
+                       ORDER BY score DESC
+                       LIMIT $max_sections""",
+                    {
+                        "candidates": sections_per_doc * 20,
+                        "embedding": embedding,
+                        "doc_id": doc_id,
+                        "max_sections": sections_per_doc,
+                        "vector_threshold": settings.vector_doc_threshold,
+                    },
+                ) or []
+                section_rows.extend(rows)
+            except Exception as e:
+                logger.debug("Top-down section search failed for doc %s: %s", doc_id, e)
+        section_rows.sort(key=lambda r: r["score"], reverse=True)
+        section_rows = section_rows[: settings.topdown_max_chapters * len(doc_ids)]
+
+        if not section_rows:
             return []
 
-        if not chapter_rows:
-            return []
+        section_ids = [r["section_id"] for r in section_rows]
 
-        chapter_ids = [r["chapter_id"] for r in chapter_rows]
-
-        # Step 3: fetch all pages from those chapters
-        pages = self.db.execute_query(
-            """UNWIND $chapter_ids AS cid
-               MATCH (ch:Chapter {id: cid})-[:CONTAINS_PAGE]->(p:Page)
+        # Step 3: fetch the pages that contain those sections.
+        # Group by page to collapse duplicates from the multi-chapter mapping issue.
+        pages_raw = self.db.execute_query(
+            """UNWIND $section_ids AS sid
+               MATCH (p:Page)-[:HAS_SECTION]->(s:Section {id: sid})
                WHERE p.content IS NOT NULL AND trim(p.content) <> ''
-               MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
-               OPTIONAL MATCH (p)-[:HAS_SECTION]->(s:Section)
-               WITH p, ch, d,
-                    collect(DISTINCT s.title) AS section_titles,
-                    collect(DISTINCT s.id)    AS section_ids
+               MATCH (d:Document)-[:HAS_CHAPTER]->(ch:Chapter)-[:CONTAINS_PAGE]->(p)
+               WITH p, d, collect(DISTINCT ch.title)[0] AS chapter
+               OPTIONAL MATCH (p)-[:HAS_SECTION]->(s_all:Section)
                RETURN p.id          AS page_id,
                       p.page_number  AS page_number,
                       substring(p.content, 0, $content_limit) AS content,
                       p.header       AS header,
-                      ch.title       AS chapter,
+                      chapter,
                       d.filename     AS document,
                       0.0            AS score,
-                      section_titles, section_ids""",
-            {"chapter_ids": chapter_ids, "content_limit": settings.page_content_limit},
+                      collect(DISTINCT s_all.title) AS section_titles,
+                      collect(DISTINCT s_all.id)    AS section_ids""",
+            {"section_ids": section_ids, "content_limit": settings.page_content_limit},
         ) or []
 
-        logger.debug("Top-down search: %d docs → %d chapters → %d pages",
-                      len(doc_ids), len(chapter_ids), len(pages))
-        return pages[:limit]
+        # Deduplicate pages (same page may be reached via multiple sections)
+        seen: set = set()
+        unique_pages = []
+        for p in pages_raw:
+            key = (p.get("page_id") or p.get("page_number"), p.get("document"))
+            if key not in seen:
+                seen.add(key)
+                unique_pages.append(p)
+
+        logger.debug("Top-down search: %d docs → %d sections → %d pages",
+                      len(doc_ids), len(section_ids), len(unique_pages))
+        return unique_pages[:limit]
 
     def _dense_vector_search(
         self, embedding: list, limit: int
@@ -1108,29 +1136,38 @@ class GraphQuerier:
         except Exception as e:
             logger.debug("Dense page vector search failed: %s", e)
 
-        # Sub-path B: section-level vector search → resolve to pages
+        # Sub-path B: section-level vector search → resolve to pages.
+        # For each matched section, select the single most content-rich page
+        # (by content length) while excluding table-of-contents chapter pages.
+        # This prevents TOC entries from crowding out the actual content pages
+        # when multiple pages share the same section (e.g. pg=5 TOC vs pg=82
+        # formula page for "C.2 Ermüdungsfestigkeit").
         section_page_results: List[Dict[str, Any]] = []
         try:
             section_page_results = self.db.execute_query(
                 """CALL db.index.vector.queryNodes(
                        'section_embedding_index', $limit, $embedding
-                   ) YIELD node, score
+                   ) YIELD node AS section, score
                    WHERE score >= $vector_threshold
-                   MATCH (p:Page)-[:HAS_SECTION]->(node)
+                   MATCH (p:Page)-[:HAS_SECTION]->(section)
                    WHERE p.content IS NOT NULL AND trim(p.content) <> ''
-                   OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(p)
-                   OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
-                   WITH p, score,
-                        collect(DISTINCT ch.title)[0]   AS chapter,
-                        collect(DISTINCT d.filename)[0] AS document,
-                        collect(DISTINCT node.title)     AS section_titles,
-                        collect(DISTINCT node.id)        AS section_ids
-                   RETURN p.id          AS page_id,
-                          p.page_number  AS page_number,
-                          substring(p.content, 0, $content_limit) AS content,
-                          p.header       AS header,
+                   MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(p)
+                   WHERE ch.chapter_type <> 'table_of_contents'
+                   MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
+                   WITH section, score, p, ch.title AS ch_title, d.filename AS doc_filename
+                   ORDER BY score DESC, size(p.content) DESC
+                   WITH section.id AS section_key, score,
+                        collect(p)[0]          AS best_page,
+                        collect(ch_title)[0]   AS chapter,
+                        collect(doc_filename)[0] AS document,
+                        section.title          AS section_title
+                   RETURN best_page.id         AS page_id,
+                          best_page.page_number AS page_number,
+                          substring(best_page.content, 0, $content_limit) AS content,
+                          best_page.header      AS header,
                           chapter, document, score,
-                          section_titles, section_ids
+                          [section_title]       AS section_titles,
+                          [section_key]         AS section_ids
                    ORDER BY score DESC""",
                 {"limit": limit * 2, "embedding": embedding, "content_limit": settings.page_content_limit, "vector_threshold": settings.vector_page_threshold},
             ) or []
@@ -1312,7 +1349,8 @@ class GraphQuerier:
                    WHERE p.content IS NOT NULL AND trim(p.content) <> ''
                    OPTIONAL MATCH (ch:Chapter)-[:CONTAINS_PAGE]->(p)
                    OPTIONAL MATCH (d:Document)-[:HAS_CHAPTER]->(ch)
-                   WITH p, sim, r,
+                   WITH p,
+                        max(r.score)                     AS score,
                         collect(DISTINCT ch.title)[0]   AS chapter,
                         collect(DISTINCT d.filename)[0] AS document,
                         collect(DISTINCT sim.title)      AS section_titles,
@@ -1322,9 +1360,9 @@ class GraphQuerier:
                           substring(p.content, 0, $content_limit) AS content,
                           p.header       AS header,
                           chapter, document,
-                          r.score        AS score,
+                          score,
                           section_titles, section_ids
-                   ORDER BY r.score DESC
+                   ORDER BY score DESC
                    LIMIT $limit""",
                 {
                     "sids": section_ids,

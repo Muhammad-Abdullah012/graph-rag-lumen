@@ -182,8 +182,13 @@ async def search_concepts(q: str, limit: int = 15):
 
 
 @router.post("/process-document/{filename}")
-async def process_document_manually(filename: str):
-    """Manually trigger OCR pipeline for a document already in the documents folder."""
+async def process_document_manually(filename: str, reparse_only: bool = False):
+    """Manually trigger OCR pipeline for a document already in the documents folder.
+
+    Set ``reparse_only=true`` to skip the Mistral OCR call and re-parse from
+    the cached ``.md`` file.  Use this when only the parsing logic has changed
+    (e.g. heading normalisation) and the raw OCR output is still valid.
+    """
     from config.settings import settings
     docs_dir = Path(settings.documents_path)
 
@@ -196,8 +201,8 @@ async def process_document_manually(filename: str):
 
     try:
         from backend.app.modules.ocr_pipeline import process_document_background
-        process_document_background(str(file_path), file_path.name)
-        return {"status": "processing_started", "filename": file_path.name}
+        process_document_background(str(file_path), file_path.name, reparse_only=reparse_only)
+        return {"status": "processing_started", "filename": file_path.name, "reparse_only": reparse_only}
     except Exception as e:
         logger.error("Failed to start processing: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

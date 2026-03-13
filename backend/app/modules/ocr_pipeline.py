@@ -264,6 +264,69 @@ def _run_mistral_ocr(pdf_path: str, api_key: str) -> Tuple[str, List[Dict[str, A
 
 
 # ---------------------------------------------------------------------------
+#  Heading level normalisation
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# Matches Eurocode-style numbered headings at the start of a heading title:
+#   "6 Grenzzustände …"        → depth 1 (single digit, e.g. chapter)
+#   "6.1 Träger"               → depth 2
+#   "6.1.1 Allgemeines"        → depth 3
+#   "A.1 …" / "NA.1 …"        → depth 2 (lettered annexes)
+_NUMBERED_HEADING_RE = _re.compile(
+    r'^(?P<num>(?:[A-Z]{0,3}\.?)?\d+(?:\.\d+)*)(?:\s|$)'
+)
+
+# H1 headings that are genuine document-level divisions (not numbered).
+# These create a new chapter even without a leading section number.
+_DOCUMENT_CHAPTER_RE = _re.compile(
+    r'^(Vorwort|Inhalt|Abkürzungen?|Stichwort(?:verzeichnis)?'
+    r'|Anhang\s+[A-Za-z0-9]|Kapitel\s+\w+|Handbuch\s+)',
+    _re.IGNORECASE,
+)
+
+# H1 headings that are inline National-Annex provisions inserted into the
+# middle of a numbered chapter.  These must NOT start a new chapter —
+# they should continue to be attributed to the current numbered chapter.
+_INLINE_PROVISION_RE = _re.compile(
+    r'^(NDP\s+zu|NCI\s+zu|Anlage\s+\d|Bild\s+NA\.|'
+    r'Legende|NCI$|NDP$)',
+    _re.IGNORECASE,
+)
+
+
+def _normalize_heading_levels(tokens: List[Dict]) -> List[Dict]:
+    """Re-assign heading levels based on Eurocode section-number depth.
+
+    Mistral OCR assigns heading levels from visual formatting (font size),
+    which is unreliable for complex Handbuch layouts where National Annex
+    captions may appear larger than main chapter headings.
+
+    Rules applied to *every* heading token whose text starts with a section
+    number (digit or letter+digit prefix):
+
+      depth 1  →  level 1   (e.g. "6 Grenzzustände …")
+      depth 2  →  level 2   (e.g. "6.1 Träger", "NA.1 …")
+      depth 3+ →  level 3   (e.g. "6.1.1 Allgemeines")
+
+    Headings without a number prefix keep their original level so that
+    unnumbered sections ("Vorwort", "Anhang C", "Legende", table-of-contents
+    entries) continue to behave as before.
+    """
+    for token in tokens:
+        if token.get("type") != "heading":
+            continue
+        title = _inline_text(token.get("children", []))
+        m = _NUMBERED_HEADING_RE.match(title)
+        if not m:
+            continue
+        depth = m.group("num").count(".") + 1
+        token.setdefault("attrs", {})["level"] = min(depth, 3)
+    return tokens
+
+
+# ---------------------------------------------------------------------------
 #  Markdown → structured JSON   (mistune AST — no regex)
 # ---------------------------------------------------------------------------
 
@@ -386,6 +449,7 @@ def _parse_markdown_to_structured(
 
     doc_name = Path(source_filename).stem
     tokens: List[Dict] = _get_md_parser()(full_markdown) or []
+    tokens = _normalize_heading_levels(tokens)
 
     # Pre-index annotations by page number for later attachment
     annotations_by_page = {
@@ -446,11 +510,19 @@ def _parse_markdown_to_structured(
                 sections.append(current)
             current = _new_section(title, level)
             if level == 1:
-                chapters.append({
-                    "title": title,
-                    "number": str(len(chapters) + 1),
-                    "section_refs": [],
-                })
+                is_inline_provision = bool(_INLINE_PROVISION_RE.match(title))
+                is_numbered = bool(_NUMBERED_HEADING_RE.match(title))
+                is_doc_chapter = bool(_DOCUMENT_CHAPTER_RE.match(title))
+                # Only open a new chapter for genuine chapter boundaries.
+                # Inline NA provisions (NDP zu …, Bild NA.X, Legende …) must
+                # stay inside the current chapter so their sections don't
+                # hijack the following content.
+                if not is_inline_provision and (is_numbered or is_doc_chapter or not chapters):
+                    chapters.append({
+                        "title": title,
+                        "number": str(len(chapters) + 1),
+                        "section_refs": [],
+                    })
             if chapters:
                 chapters[-1]["section_refs"].append(title)
 
@@ -635,11 +707,18 @@ def _parse_markdown_to_structured(
 #  Main pipeline
 # ---------------------------------------------------------------------------
 
-def process_document(pdf_path: str, filename: str) -> Dict[str, Any]:
+def process_document(pdf_path: str, filename: str, reparse_only: bool = False) -> Dict[str, Any]:
     """Full pipeline: OCR → structured JSON → Neo4j graph → embeddings.
 
     Processing status is updated in PostgreSQL at every stage so the
     front-end can poll ``GET /api/documents/processing-status/<filename>``.
+
+    Args:
+        reparse_only: If True and a cached ``.md`` file already exists for
+            this document, skip the Mistral OCR call and re-parse directly
+            from the cached markdown.  Useful when only the parsing logic
+            (e.g. heading normalisation) has changed but the raw OCR output
+            is still valid.
     """
     from config.settings import settings
 
@@ -647,13 +726,33 @@ def process_document(pdf_path: str, filename: str) -> Dict[str, Any]:
     _set_status(filename, "processing", "starting", started_at=started_at)
 
     try:
-        # 1. OCR
-        _set_status(filename, "processing", "ocr_extraction", started_at=started_at)
-        api_key = settings.mistral_api_key or os.getenv("MISTRAL_API_KEY", "")
-        if not api_key:
-            raise ValueError("MISTRAL_API_KEY is not configured.")
+        # 1. OCR (or load from cache)
+        json_dir = Path(__file__).parent.parent.parent / "json"
+        stem = Path(filename).stem
+        md_path = json_dir / f"{stem}.md"
+        json_path = json_dir / f"{stem}.json"
 
-        combined_md, page_data = _run_mistral_ocr(pdf_path, api_key)
+        if reparse_only and md_path.exists() and json_path.exists():
+            _set_status(filename, "processing", "loading_cached_markdown", started_at=started_at)
+            logger.info("reparse_only=True: loading cached markdown from %s", md_path)
+            combined_md = md_path.read_text(encoding="utf-8")
+            # Reconstruct page_data from the saved JSON pages list
+            cached = json.loads(json_path.read_text(encoding="utf-8"))
+            page_data = [
+                {
+                    "page_num": p["page_num"],
+                    "markdown": p.get("content", ""),
+                    "header": p.get("header", ""),
+                    "footer": p.get("footer", ""),
+                }
+                for p in cached.get("pages", [])
+            ]
+        else:
+            _set_status(filename, "processing", "ocr_extraction", started_at=started_at)
+            api_key = settings.mistral_api_key or os.getenv("MISTRAL_API_KEY", "")
+            if not api_key:
+                raise ValueError("MISTRAL_API_KEY is not configured.")
+            combined_md, page_data = _run_mistral_ocr(pdf_path, api_key)
         logger.info("OCR done: %d chars, %d pages", len(combined_md), len(page_data))
 
         # 2. Parse Markdown → structured dict
@@ -662,12 +761,7 @@ def process_document(pdf_path: str, filename: str) -> Dict[str, Any]:
 
         # 3. Save JSON + Markdown
         _set_status(filename, "processing", "saving_json", started_at=started_at)
-        json_dir = Path(__file__).parent.parent.parent / "json"
         json_dir.mkdir(parents=True, exist_ok=True)
-
-        stem = Path(filename).stem
-        json_path = json_dir / f"{stem}.json"
-        md_path   = json_dir / f"{stem}.md"
 
         # Add per-page OCR content for graph builder (page-level embeddings)
         structured["pages"] = [
@@ -730,16 +824,16 @@ def process_document(pdf_path: str, filename: str) -> Dict[str, Any]:
         raise
 
 
-def process_document_background(pdf_path: str, filename: str) -> None:
+def process_document_background(pdf_path: str, filename: str, reparse_only: bool = False) -> None:
     """Fire-and-forget: run the pipeline in a daemon thread."""
 
     def _run() -> None:
         try:
-            process_document(pdf_path, filename)
+            process_document(pdf_path, filename, reparse_only=reparse_only)
         except Exception as exc:
             logger.debug("Background thread finished with error for %s: %s", filename, exc)
 
     threading.Thread(
         target=_run, name=f"ocr-pipeline-{filename}", daemon=True
     ).start()
-    logger.info("Background OCR pipeline started for %s", filename)
+    logger.info("Background OCR pipeline started for %s (reparse_only=%s)", filename, reparse_only)

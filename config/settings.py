@@ -51,12 +51,15 @@ class Settings(BaseSettings):
 
     # Hybrid retrieval
     hybrid_rrf_k: int = int(os.getenv("HYBRID_RRF_K", "60"))
-    hybrid_candidates_per_path: int = int(os.getenv("HYBRID_CANDIDATES_PER_PATH", "15"))
+    hybrid_candidates_per_path: int = int(os.getenv("HYBRID_CANDIDATES_PER_PATH", "20"))
     query_intent_enabled: bool = os.getenv("QUERY_INTENT_ENABLED", "true").lower() in ("true", "1", "yes")
     vector_page_threshold: float = float(os.getenv("VECTOR_PAGE_THRESHOLD", "0.45"))
     vector_doc_threshold: float = float(os.getenv("VECTOR_DOC_THRESHOLD", "0.35"))
     semantic_similar_enabled: bool = os.getenv("SEMANTIC_SIMILAR_ENABLED", "true").lower() in ("true", "1", "yes")
     semantic_similar_min_score: float = float(os.getenv("SEMANTIC_SIMILAR_MIN_SCORE", "0.80"))
+    # Chapter types excluded from top-down chapter selection (navigation/non-content chapters)
+    search_excluded_chapter_types: str = os.getenv("SEARCH_EXCLUDED_CHAPTER_TYPES", "table_of_contents,other")
+    bm25_fuzzy_min_length: int = int(os.getenv("BM25_FUZZY_MIN_LENGTH", "8"))
 
     # Context window budget — total chars across all pages sent to the LLM
     total_context_budget: int = int(os.getenv("TOTAL_CONTEXT_BUDGET", "80000"))

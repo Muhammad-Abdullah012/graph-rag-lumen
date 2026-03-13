@@ -103,42 +103,48 @@ GREETING_SYSTEM = (
 
 ANSWER_SYSTEM = """You are a Eurocode structural engineering assistant.
 You are given CONTEXT pages retrieved from official Eurocode documents.
-Answer the user's question using ONLY what is in the CONTEXT.
+Answer the user's QUESTION using ONLY what is in the CONTEXT.
+
+STEP 1 — EXTRACT (do this silently before writing your answer):
+Scan every CONTEXT page and find all sentences, values, or formulas
+that are relevant to the QUESTION. If the question asks for a value
+or factor, look for it under ALL possible names.
+
+STEP 2 — ANSWER:
+Write your answer based ONLY on what you found in STEP 1.
+- If STEP 1 found values/formulas → report them directly. Do NOT
+  describe how they are calculated. Just state what the context says.
+- If STEP 1 found nothing → use the fallback below.
+
+READING ORDER:
+- Read ALL context pages before forming your answer.
+- Every page has relevance score in brackets (e.g. [Relevanz: 95.3]) — higher means more relevant.
+- Supporting details, definitions, and cross-references may appear on later pages.
 
 FORMULAS:
-- In the CONTEXT, block formulas are wrapped in $$...$$ and inline variables in $...$.
-- When the user asks for a formula, find the relevant $$...$$ block(s) and copy the EXACT characters between and including the $$ markers — letter for letter, symbol for symbol.
-- The formula in your answer MUST be identical to the formula in the CONTEXT. Do not change notation, subscripts, operators, or structure in any way.
-- Do NOT rewrite, simplify, rearrange, or paraphrase any formula — not even slightly.
-- Do NOT write a formula that is not present in the CONTEXT.
+- Copy $...$ and $$...$$ blocks EXACTLY as they appear in the CONTEXT.
+- Do NOT write any formula or symbol not literally present in the CONTEXT.
+- Do NOT rewrite, simplify, rearrange, or paraphrase any formula.
 
 TABLES:
-- The CONTEXT contains markdown tables using pipe syntax (| col1 | col2 |).
-- ALWAYS include the relevant table in your answer by copying the pipe-delimited markdown table EXACTLY as it appears in the CONTEXT.
-- NEVER summarize, paraphrase, or convert a table to bullet points or prose. ALWAYS output it as a markdown table.
-- NEVER say "see Table X.Y", "refer to the table", or "as shown in the table" — the user cannot see the table unless you copy it.
-- You may filter to only the relevant rows, but ALWAYS keep the header row and the separator row (| --- | --- |).
-- Example — if the CONTEXT has:
-  | Kerbfall | Beschreibung | Anforderungen |
-  | --- | --- | --- |
-  | 71 | Detail 1 | R ≥ 150 |
-  | 80 | Detail 2 | l ≤ 50mm |
-  then your answer MUST include:
-  | Kerbfall | Beschreibung | Anforderungen |
-  | --- | --- | --- |
-  | 71 | Detail 1 | R ≥ 150 |
+- Copy pipe-delimited markdown tables EXACTLY.
+- Always keep the header row and separator row (| --- | --- |).
+
+NOTATION:
+- Questions may use shorthand (e.g. "λ-Werte") that appears in the
+  context as symbolic notation (e.g. $\\lambda_{\\mathrm{v},1}$).
+- Treat these as the same topic. Do NOT require an exact string match.
 
 LANGUAGE:
-- Reply in the same language as the user's question.
+- Reply in the same language as the QUESTION.
 
 IF NOT IN CONTEXT:
-- If the answer is not in the CONTEXT, reply in the SAME LANGUAGE as the user's question with ONLY:
-  - German: "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
-  - English: "This information is not available in the provided context."
-  - For other languages, translate the same meaning.
-- Do NOT write anything else. Do NOT add general knowledge, suggestions, or explanations from your training data.
-- Do NOT say "generally speaking", "in Eurocode...", "typically...", or anything similar.
-- Silence is better than a wrong answer.
+- Only use this fallback if STEP 1 found ZERO relevant content.
+  German: "Diese Information ist im bereitgestellten Kontext nicht vorhanden."
+  English: "This information is not available in the provided context."
+- Do NOT use this fallback if ANY value, formula, or condition was found.
+- Do NOT add general knowledge. Do NOT describe calculation procedures
+  unless the context itself describes them.
 """
 
 
@@ -574,18 +580,6 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
             logger.info("Hallucination gate triggered — context too short (%d chars), skipping LLM.", len(context))
             return {**state, "answer": refusal}
 
-        user_prompt = (
-            f"CONTEXT:\n{context}\n\n"
-            "REMINDER:\n"
-            "- TABLES: If the CONTEXT contains a markdown table (lines with | ), "
-            "you MUST copy it into your answer as a markdown table. "
-            "Do NOT convert tables to bullet points or prose.\n"
-            "- FORMULAS: If the CONTEXT contains formulas in $$...$$ or $...$, "
-            "copy them EXACTLY into your answer — do not rewrite or omit them.\n\n"
-            f"QUESTION: {question}"
-        )
-
-        # Append enriched formulas from graph enrichment
         extra_formulas = state.get("_extra_formulas", [])
         if extra_formulas:
             formula_lines = [
@@ -594,7 +588,14 @@ def _build_graph(querier: GraphQuerier, llm: ChatOllama) -> StateGraph:
                 if f.get("latex") or f.get("unicode")
             ]
             if formula_lines:
-                user_prompt += "\n\nRELATED FORMULAS:\n" + "\n".join(formula_lines)
+                context += "\n\nRELATED FORMULAS:\n" + "\n".join(formula_lines)
+
+        user_prompt = (
+            "=== BEGIN RETRIEVED CONTEXT ===\n"
+            f"{context}\n"
+            "=== END RETRIEVED CONTEXT ===\n\n"
+            f"QUESTION: {question}"   # ← question is the LAST thing the model reads
+        )
 
         try:
             messages = [
@@ -894,18 +895,6 @@ class EurocodeAgent:
             }
             return
 
-        user_prompt = (
-            f"CONTEXT:\n{context}\n\n"
-            "REMINDER:\n"
-            "- TABLES: If the CONTEXT contains a markdown table (lines with | ), "
-            "you MUST copy it into your answer as a markdown table. "
-            "Do NOT convert tables to bullet points or prose.\n"
-            "- FORMULAS: If the CONTEXT contains formulas in $$...$$ or $...$, "
-            "copy them EXACTLY into your answer — do not rewrite or omit them.\n\n"
-            f"QUESTION: {question}"
-        )
-
-        # Append enriched formulas from graph enrichment
         if extra_formulas:
             formula_lines = [
                 f"- {f.get('section', '')}: $${f.get('latex') or f.get('unicode', '')}$$"
@@ -913,7 +902,14 @@ class EurocodeAgent:
                 if f.get("latex") or f.get("unicode")
             ]
             if formula_lines:
-                user_prompt += "\n\nRELATED FORMULAS:\n" + "\n".join(formula_lines)
+                context += "\n\nRELATED FORMULAS:\n" + "\n".join(formula_lines)
+
+        user_prompt = (
+            "=== BEGIN RETRIEVED CONTEXT ===\n"
+            f"{context}\n"
+            "=== END RETRIEVED CONTEXT ===\n\n"
+            f"QUESTION: {question}"   # ← question is the LAST thing the model reads
+        )
 
         full_answer = ""
         try:
@@ -986,7 +982,7 @@ class EurocodeAgent:
                 "budget_chars": budget,
                 "context_chars": len(context),
             },
-            "context": context,
+            "user_prompt": user_prompt,
             "answer": full_answer,
         })
 
