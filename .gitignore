@@ -49,11 +49,11 @@ logs/
 documents/*
 !documents/.gitkeep
 
-images/*
-!images/.gitkeep
+backend/images/*
+!backend/images/.gitkeep
 
-json/*
-!json/.gitkeep
+backend/json/*
+!backend/json/.gitkeep
 
 # Docker
 .dockerignore

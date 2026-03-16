@@ -1,15 +1,16 @@
 """Document Processing Routes"""
 import logging
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import List
 from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
 import aiofiles
 import asyncio
 
-from backend.app.modules.extraction import get_pdf_extractor
-from backend.app.modules.splitting import TextSplitter
+from backend.app.modules.ocr_pipeline import get_ocr_pipeline
 from backend.app.modules.graph_builder import GraphBuilder
 from config.settings import settings
 
@@ -38,76 +39,97 @@ class ProcessingStatus(BaseModel):
     message: str
 
 
+class DocumentInfo(BaseModel):
+    """Uploaded document file info"""
+    document_id: str
+    stored_filename: str
+    filename: str
+    size_bytes: int
+    uploaded_at: str
+    url: str
+
+
 # Store processing status in memory (in production, use database)
 processing_status = {}
 
 
-@router.post("/upload", response_model=DocumentUploadResponse)
-async def upload_document(
-    file: UploadFile = File(...),
+@router.get("")
+async def list_documents():
+    """List all uploaded PDF files with their metadata."""
+    docs_dir = Path(settings.documents_path)
+    result = []
+    for pdf_file in sorted(docs_dir.glob("*.pdf"), key=lambda f: f.stat().st_mtime, reverse=True):
+        stat = pdf_file.stat()
+        parts = pdf_file.name.split("_", 1)
+        document_id = parts[0]
+        filename = parts[1] if len(parts) == 2 else pdf_file.name
+        result.append(DocumentInfo(
+            document_id=document_id,
+            stored_filename=pdf_file.name,
+            filename=filename,
+            size_bytes=stat.st_size,
+            uploaded_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            url=f"{settings.documents_base_url}/{pdf_file.name}",
+        ))
+    return {"documents": result}
+
+
+@router.post("/upload", response_model=List[DocumentUploadResponse])
+async def upload_documents(
+    files: List[UploadFile] = File(...),
     background_tasks: BackgroundTasks = BackgroundTasks()
-) -> DocumentUploadResponse:
-    """
-    Upload and process PDF document
-    
-    Args:
-        file: PDF file
-        background_tasks: Background task queue
-        
-    Returns:
-        Upload response with document ID
-    """
-    try:
-        # Validate file
-        if not file.filename.endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-        
-        if file.size > settings.max_upload_size:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Maximum size: {settings.max_upload_size} bytes"
+) -> List[DocumentUploadResponse]:
+    """Upload and process one or more PDF documents."""
+    responses = []
+    for file in files:
+        try:
+            if not file.filename.lower().endswith('.pdf'):
+                raise HTTPException(status_code=400, detail=f"{file.filename}: only PDF files are allowed")
+
+            if file.size > settings.max_upload_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{file.filename}: file too large (max {settings.max_upload_size} bytes)"
+                )
+
+            document_id = str(uuid.uuid4())
+            file_path = Path(settings.documents_path) / f"{document_id}_{file.filename}"
+
+            async with aiofiles.open(file_path, 'wb') as f:
+                content = await file.read()
+                await f.write(content)
+
+            logger.info(f"Saved uploaded file: {file_path}")
+
+            document_url = f"documents/{document_id}_{file.filename}"
+
+            background_tasks.add_task(
+                process_document,
+                document_id=document_id,
+                file_path=str(file_path),
+                filename=file.filename,
+                document_url=document_url,
             )
-        
-        # Generate document ID
-        document_id = str(uuid.uuid4())
-        
-        # Save file
-        file_path = Path(settings.documents_path) / f"{document_id}_{file.filename}"
-        async with aiofiles.open(file_path, 'wb') as f:
-            content = await file.read()
-            await f.write(content)
-        
-        logger.info(f"Saved uploaded file: {file_path}")
-        
-        # Create relative URL for document
-        document_url = f"documents/{document_id}_{file.filename}"
-        
-        # Queue background task to process document
-        background_tasks.add_task(
-            process_document,
-            document_id=document_id,
-            file_path=str(file_path),
-            filename=file.filename,
-            document_url=document_url
-        )
-        
-        processing_status[document_id] = {
-            "status": "pending",
-            "message": "Document queued for processing"
-        }
-        
-        return DocumentUploadResponse(
-            document_id=document_id,
-            filename=file.filename,
-            message="Document uploaded successfully and queued for processing",
-            status="pending"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error uploading document: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+
+            processing_status[document_id] = {
+                "status": "pending",
+                "message": "Document queued for processing",
+            }
+
+            responses.append(DocumentUploadResponse(
+                document_id=document_id,
+                filename=file.filename,
+                message="Uploaded successfully and queued for processing",
+                status="pending",
+            ))
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error uploading {file.filename}: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    return responses
 
 
 def _process_document_sync(
@@ -128,35 +150,33 @@ def _process_document_sync(
     try:
         processing_status[document_id] = {
             "status": "processing",
-            "message": "Extracting text from PDF..."
+            "message": "Running OCR on PDF..."
         }
-        
+
         logger.info(f"Processing document {document_id}: {filename}")
-        
-        # Extract text from PDF
-        extractor = get_pdf_extractor()
-        extracted_text = extractor.extract(file_path)
-        
-        processing_status[document_id]["message"] = "Splitting text into chunks..."
-        
-        # Split text
-        splitter = TextSplitter()
-        chunks = splitter.split(extracted_text)
-        
+
+        # Run Mistral Batch OCR
+        ocr = get_ocr_pipeline()
+        pages = ocr.process(
+            pdf_path=file_path,
+            document_id=document_id,
+            filename=filename,
+        )
+
         processing_status[document_id]["message"] = "Building knowledge graph..."
-        
-        # Build graph
+
+        # Build graph (Document + Page nodes)
         builder = GraphBuilder()
         builder.build_graph(
-            chunks=chunks,
+            pages=pages,
             document_id=document_id,
             document_name=filename,
-            document_url=document_url
+            document_url=document_url,
         )
-        
+
         processing_status[document_id] = {
             "status": "completed",
-            "message": f"Successfully processed {len(chunks)} chunks"
+            "message": f"Successfully processed {len(pages)} pages"
         }
         
         logger.info(f"Successfully processed document {document_id}")

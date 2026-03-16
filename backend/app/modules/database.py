@@ -1,9 +1,10 @@
 """Neo4j Database Connection and Management"""
 import logging
+import time
 from typing import Optional, Any, Dict, List
 
-from neo4j import GraphDatabase, Session
-from neo4j.exceptions import ServiceUnavailable
+from neo4j import GraphDatabase
+from neo4j.exceptions import ServiceUnavailable, TransientError
 
 from config.settings import settings
 
@@ -84,7 +85,7 @@ class Neo4jConnection:
             # Create the index
             create_query = f"""
                 CREATE VECTOR INDEX {settings.vector_index_name}
-                FOR (n:DocumentChunk) ON (n.embedding)
+                FOR (n:Page) ON (n.embedding)
                 OPTIONS {{
                     indexConfig: {{
                         `vector.dimensions`: {settings.vector_dimension},
@@ -103,7 +104,7 @@ class Neo4jConnection:
         """Create database constraints"""
         constraints = [
             "CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
-            "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT page_id_unique IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE",
         ]
         
         try:
@@ -119,10 +120,23 @@ _neo4j_connection = None
 
 
 def get_neo4j_connection() -> Neo4jConnection:
-    """Get or create Neo4j connection"""
+    """Get or create Neo4j connection, retrying until the database is ready."""
     global _neo4j_connection
     if _neo4j_connection is None:
-        _neo4j_connection = Neo4jConnection()
-        _neo4j_connection.create_constraints()
-        _neo4j_connection.create_vector_index()
+        max_attempts = 10
+        delay = 3  # seconds
+        for attempt in range(1, max_attempts + 1):
+            try:
+                conn = Neo4jConnection()
+                conn.create_constraints()
+                conn.create_vector_index()
+                _neo4j_connection = conn
+                break
+            except (ServiceUnavailable, TransientError) as e:
+                if attempt == max_attempts:
+                    raise
+                logger.warning(
+                    f"Neo4j not ready (attempt {attempt}/{max_attempts}): {e} — retrying in {delay}s"
+                )
+                time.sleep(delay)
     return _neo4j_connection

@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     vector_index_name: str = os.getenv("VECTOR_INDEX_NAME", "document_embeddings")
     vector_dimension: int = int(os.getenv("VECTOR_DIMENSION", "768"))
     
+    # Mistral OCR
+    mistral_api_key: str = os.getenv("MISTRAL_API_KEY", "")
+    json_output_path: str = os.getenv("JSON_OUTPUT_PATH", "/backend/json")
+    images_path: str = os.getenv("IMAGES_PATH", "/backend/images")
+    batch_poll_interval: int = int(os.getenv("BATCH_POLL_INTERVAL", "5"))
+
     # Application
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", "52428800"))  # 50MB
     pdf_extract_timeout: int = int(os.getenv("PDF_EXTRACT_TIMEOUT", "300"))
@@ -41,6 +47,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"
 
 
 settings = Settings()

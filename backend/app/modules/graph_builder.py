@@ -1,201 +1,137 @@
-"""Graph Building Module using LLMGraphTransformer"""
+"""Graph Building Module — Document and Page nodes"""
 import json
 import logging
-from typing import List, Tuple, Dict, Any
-import uuid
-
-from langchain_experimental.graph_transformers import LLMGraphTransformer
-from langchain_core.documents import Document
-from langchain_ollama import ChatOllama
+from datetime import datetime, timezone
 
 from backend.app.modules.database import get_neo4j_connection
 from backend.app.modules.ollama_client import get_ollama_client
-from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class GraphBuilder:
-    """Build knowledge graph from text chunks"""
-    
+    """Build a Neo4j graph with Document and Page nodes from OCR page data"""
+
     def __init__(self):
-        """Initialize graph builder with LLM"""
         self.db = get_neo4j_connection()
         self.ollama = get_ollama_client()
-        
-        # Initialize LLM for graph transformation
-        self.llm = ChatOllama(
-            base_url=settings.ollama_base_url.rstrip('/'),
-            model=settings.ollama_graph_model,
-            temperature=0.3,
-        )
-        
-        self.transformer = LLMGraphTransformer(llm=self.llm)
-    
+
     def build_graph(
         self,
-        chunks: List[Tuple[str, dict]],
+        pages: list[dict],
         document_id: str,
         document_name: str,
         document_url: str,
     ):
         """
-        Build knowledge graph from text chunks
-        
+        Create Document + Page nodes and link them.
+
         Args:
-            chunks: List of (text, metadata) tuples
+            pages: List of page dicts from MistralOCRPipeline.process()
             document_id: Unique document identifier
-            document_name: Human-readable document name
-            document_url: Relative URL to document
+            document_name: Original filename (without UUID prefix)
+            document_url: Relative URL to the PDF
         """
-        try:
-            logger.info(f"Building graph for document: {document_name}")
-            
-            # Create or update document node
-            self._create_document_node(document_id, document_name, document_url)
-            
-            # Process each chunk
-            for idx, (chunk_text, metadata) in enumerate(chunks):
-                if not chunk_text.strip():
-                    continue
-                
-                logger.info(f"Processing chunk {idx + 1}/{len(chunks)}")
-                
-                chunk_id = str(uuid.uuid4())
-                
-                # Generate embedding
-                embedding = self.ollama.generate_embedding(chunk_text)
-                
-                # Create chunk node
-                self._create_chunk_node(
-                    chunk_id=chunk_id,
-                    document_id=document_id,
-                    text=chunk_text,
-                    embedding=embedding,
-                    metadata=metadata,
-                    page_number=idx  # Approximate page for now
-                )
-                
-                # Transform text to graph
-                try:
-                    doc = Document(page_content=chunk_text, metadata={"chunk_id": chunk_id})
-                    graph_documents = self.transformer.convert_to_graph_documents([doc])
-                    
-                    # Store graph entities and relationships
-                    self._store_graph_entities(
-                        graph_documents=graph_documents,
-                        chunk_id=chunk_id,
-                        document_id=document_id
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not extract entities from chunk {chunk_id}: {str(e)}")
-            
-            logger.info(f"Successfully built graph for document: {document_name}")
-            
-        except Exception as e:
-            logger.error(f"Error building graph: {str(e)}")
-            raise
-    
-    def _create_document_node(self, doc_id: str, name: str, url: str):
-        """Create document node in graph"""
+        logger.info(f"Building graph for document: {document_name} ({len(pages)} pages)")
+
+        self._create_document_node(
+            document_id=document_id,
+            name=document_name,
+            source_file=document_name,
+            url=document_url,
+            page_count=len(pages),
+        )
+
+        for page in pages:
+            self._create_page_node(page, document_id)
+
+        self._create_next_page_links(document_id, len(pages))
+
+        logger.info(f"Graph built for document: {document_name}")
+
+    # ------------------------------------------------------------------
+
+    def _create_document_node(
+        self,
+        document_id: str,
+        name: str,
+        source_file: str,
+        url: str,
+        page_count: int,
+    ):
         query = """
             MERGE (d:Document {id: $id})
             SET d.name = $name,
+                d.source_file = $source_file,
                 d.url = $url,
-                d.created_at = datetime()
-            RETURN d
+                d.page_count = $page_count,
+                d.processed_at = $processed_at
         """
-        
         self.db.execute_query(query, {
-            "id": doc_id,
+            "id": document_id,
             "name": name,
-            "url": url
+            "source_file": source_file,
+            "url": url,
+            "page_count": page_count,
+            "processed_at": datetime.now(timezone.utc).isoformat(),
         })
-        
-        logger.info(f"Created/updated document node: {doc_id}")
-    
-    def _create_chunk_node(
-        self,
-        chunk_id: str,
-        document_id: str,
-        text: str,
-        embedding: list,
-        metadata: dict,
-        page_number: int
-    ):
-        """Create document chunk node with embedding"""
+        logger.debug(f"Created/updated Document node: {document_id}")
+
+    def _create_page_node(self, page: dict, document_id: str):
+        page_index = page.get("index", 0)
+        page_id = f"{document_id}_p{page_index}"
+        markdown = page.get("markdown") or ""
+
+        # Strip base64 from images (should already be done by pipeline, but be safe)
+        images = [
+            {k: v for k, v in img.items() if k != "image_base64"}
+            for img in (page.get("images") or [])
+        ]
+
+        embedding = self.ollama.generate_embedding(markdown) if markdown.strip() else []
+
         query = """
             MATCH (d:Document {id: $document_id})
-            CREATE (c:DocumentChunk {
-                id: $chunk_id,
-                text: $text,
-                embedding: $embedding,
-                page_number: $page_number,
-                metadata: $metadata
-            })
-            CREATE (c)-[:FROM_DOCUMENT]->(d)
-            RETURN c
+            MERGE (p:Page {id: $id})
+            SET p.document_id   = $document_id,
+                p.page_number   = $page_number,
+                p.markdown      = $markdown,
+                p.images_json   = $images_json,
+                p.tables_json   = $tables_json,
+                p.hyperlinks_json = $hyperlinks_json,
+                p.header        = $header,
+                p.footer        = $footer,
+                p.dimensions_json = $dimensions_json,
+                p.embedding     = $embedding
+            MERGE (p)-[:BELONGS_TO]->(d)
         """
-        
         self.db.execute_query(query, {
-            "chunk_id": chunk_id,
+            "id": page_id,
             "document_id": document_id,
-            "text": text,
+            "page_number": page_index,
+            "markdown": markdown,
+            "images_json": json.dumps(images, ensure_ascii=False),
+            "tables_json": json.dumps(page.get("tables") or [], ensure_ascii=False),
+            "hyperlinks_json": json.dumps(page.get("hyperlinks") or [], ensure_ascii=False),
+            "header": page.get("header") or "",
+            "footer": page.get("footer") or "",
+            "dimensions_json": json.dumps(page.get("dimensions") or {}, ensure_ascii=False),
             "embedding": embedding,
-            "page_number": page_number,
-            "metadata": json.dumps(metadata)
         })
-    
-    def _store_graph_entities(self, graph_documents, chunk_id: str, document_id: str):
-        """Store entities and relationships from graph documents"""
-        for graph_doc in graph_documents:
-            # Create nodes
-            for node in graph_doc.nodes:
-                self._create_entity_node(node, chunk_id, document_id)
-            
-            # Create relationships
-            for rel in graph_doc.relationships:
-                self._create_relationship(rel, chunk_id)
-    
-    def _create_entity_node(self, node: Any, chunk_id: str, document_id: str):
-        """Create entity node from extracted entity"""
+        logger.debug(f"Created/updated Page node: {page_id}")
+
+    def _create_next_page_links(self, document_id: str, page_count: int):
+        """Chain consecutive pages with NEXT_PAGE relationships."""
+        if page_count < 2:
+            return
         query = """
-            MATCH (c:DocumentChunk {id: $chunk_id})
-            MERGE (e {id: $node_id})
-            SET e:Entity,
-                e.name = $name,
-                e.type = $node_type
-            CREATE (e)-[:MENTIONED_IN]->(c)
-            RETURN e
+            MATCH (p1:Page {id: $id1})
+            MATCH (p2:Page {id: $id2})
+            MERGE (p1)-[:NEXT_PAGE]->(p2)
         """
-        
-        try:
+        for i in range(page_count - 1):
             self.db.execute_query(query, {
-                "chunk_id": chunk_id,
-                "node_id": f"{node.id}_{document_id}",
-                "name": str(node.id),
-                "node_type": node.type if hasattr(node, 'type') else "UNKNOWN"
+                "id1": f"{document_id}_p{i}",
+                "id2": f"{document_id}_p{i + 1}",
             })
-        except Exception as e:
-            logger.debug(f"Could not create entity node: {str(e)}")
-    
-    def _create_relationship(self, rel: Any, chunk_id: str):
-        """Create relationship between entities"""
-        query = """
-            MATCH (e1 {id: $source_id})
-            MATCH (e2 {id: $target_id})
-            CREATE (e1)-[r:RELATED]->(e2)
-            SET r.type = $rel_type,
-                r.found_in_chunk = $chunk_id
-            RETURN r
-        """
-        
-        try:
-            self.db.execute_query(query, {
-                "source_id": str(rel.source.id),
-                "target_id": str(rel.target.id),
-                "rel_type": rel.type,
-                "chunk_id": chunk_id
-            })
-        except Exception as e:
-            logger.debug(f"Could not create relationship: {str(e)}")
+        logger.debug(f"Created NEXT_PAGE chain for document {document_id}")
