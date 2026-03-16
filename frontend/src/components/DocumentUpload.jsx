@@ -1,44 +1,46 @@
 import React, { useState } from 'react';
 import './DocumentUpload.css';
 
-function DocumentUpload({ onUpload }) {
-  const [file, setFile] = useState(null);
+function DocumentUpload({ onUploadComplete }) {
+  const [files, setFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
-  const [status, setStatus] = useState('');
-  const [documentId, setDocumentId] = useState(null);
-  const [processingStatus, setProcessingStatus] = useState(null);
+  const [fileStatuses, setFileStatuses] = useState({}); // filename → status string
 
   const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
   const handleFileSelect = (e) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      if (!selectedFile.name.toLowerCase().endsWith('.pdf')) {
-        setStatus('❌ Please select a PDF file');
-        return;
+    const selected = Array.from(e.target.files || []);
+    const valid = [];
+    const errors = {};
+
+    for (const f of selected) {
+      if (!f.name.toLowerCase().endsWith('.pdf')) {
+        errors[f.name] = 'Not a PDF';
+      } else if (f.size > 50 * 1024 * 1024) {
+        errors[f.name] = 'Too large (max 50 MB)';
+      } else {
+        valid.push(f);
       }
-      if (selectedFile.size > 50 * 1024 * 1024) {
-        setStatus('❌ File too large (max 50MB)');
-        return;
-      }
-      setFile(selectedFile);
-      setStatus('');
     }
+
+    setFiles(valid);
+    setFileStatuses(errors);
   };
 
   const handleUpload = async (e) => {
     e.preventDefault();
-    if (!file) {
-      setStatus('❌ Please select a file first');
-      return;
-    }
+    if (files.length === 0) return;
 
     setUploading(true);
-    setStatus('⏳ Uploading...');
+
+    // Mark all valid files as pending
+    const pending = {};
+    files.forEach(f => { pending[f.name] = 'Uploading…'; });
+    setFileStatuses(pending);
 
     try {
       const formData = new FormData();
-      formData.append('file', file);
+      files.forEach(f => formData.append('files', f));
 
       const response = await fetch(`${API_BASE_URL}/api/documents/upload`, {
         method: 'POST',
@@ -46,55 +48,38 @@ function DocumentUpload({ onUpload }) {
       });
 
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.detail || 'Upload failed');
+        let detail = 'Upload failed';
+        try { detail = (await response.json()).detail || detail; } catch (_) {}
+        throw new Error(detail);
       }
 
-      const data = await response.json();
-      setDocumentId(data.document_id);
-      setStatus('✅ Uploaded! Processing...');
+      const results = await response.json(); // List[DocumentUploadResponse]
+      const statuses = {};
+      results.forEach(doc => {
+        statuses[doc.filename] = doc.message || 'Uploaded';
+      });
+      setFileStatuses(statuses);
+      setFiles([]);
 
-      // Poll for processing status
-      pollProcessingStatus(data.document_id);
-
-      onUpload(data);
-      setFile(null);
-      setUploading(false);
+      if (typeof onUploadComplete === 'function') {
+        onUploadComplete();
+      }
     } catch (error) {
-      setStatus(`❌ Upload failed: ${error.message}`);
+      const errStatuses = {};
+      files.forEach(f => { errStatuses[f.name] = error.message || 'Upload failed'; });
+      setFileStatuses(errStatuses);
+    } finally {
       setUploading(false);
     }
   };
 
-  const pollProcessingStatus = (docId) => {
-    const interval = setInterval(async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/api/documents/status/${docId}`);
-        const data = await response.json();
-        
-        setProcessingStatus(data);
-
-        if (data.status === 'completed') {
-          setStatus('✅ Processing completed!');
-          clearInterval(interval);
-        } else if (data.status === 'failed') {
-          setStatus(`❌ Processing failed: ${data.message}`);
-          clearInterval(interval);
-        } else {
-          setStatus(`⏳ ${data.message}`);
-        }
-      } catch (error) {
-        console.error('Error checking status:', error);
-      }
-    }, 2000);
-  };
+  const hasFiles = files.length > 0;
+  const statusEntries = Object.entries(fileStatuses);
 
   return (
     <div className="document-upload">
-      <h2>Upload PDF Document</h2>
-      <p className="description">
-        Upload a PDF document to extract text and build a knowledge graph
-      </p>
+      <h2>Upload PDF</h2>
+      <p className="description">Select one or more PDF files to process and add to the knowledge graph.</p>
 
       <form onSubmit={handleUpload} className="upload-form">
         <div className="file-input-wrapper">
@@ -102,42 +87,32 @@ function DocumentUpload({ onUpload }) {
             type="file"
             id="file-input"
             accept=".pdf"
+            multiple
             onChange={handleFileSelect}
             disabled={uploading}
           />
           <label htmlFor="file-input" className="file-label">
-            {file ? `📄 ${file.name}` : '📁 Choose PDF file'}
+            {hasFiles
+              ? `${files.length} file${files.length > 1 ? 's' : ''} selected`
+              : 'Choose PDF file(s)'}
           </label>
         </div>
 
-        <button type="submit" className="btn-upload" disabled={!file || uploading}>
-          {uploading ? '⏳ Uploading...' : '📤 Upload & Process'}
+        <button type="submit" className="btn-upload" disabled={!hasFiles || uploading}>
+          {uploading ? 'Uploading…' : `Upload${files.length > 1 ? ` (${files.length})` : ''}`}
         </button>
       </form>
 
-      {status && <div className="status-message">{status}</div>}
-
-      {processingStatus && (
-        <div className="processing-details">
-          <h3>Processing Status</h3>
-          <div className="status-info">
-            <p><strong>Status:</strong> {processingStatus.status}</p>
-            <p><strong>Message:</strong> {processingStatus.message}</p>
-          </div>
-        </div>
-      )}
-
-      <div className="upload-info">
-        <h3>Supported Features:</h3>
-        <ul>
-          <li>✓ Text extraction with OCR</li>
-          <li>✓ Table structure preservation</li>
-          <li>✓ Code enrichment</li>
-          <li>✓ Image classification</li>
-          <li>✓ Knowledge graph creation</li>
-          <li>✓ Vector embeddings</li>
+      {statusEntries.length > 0 && (
+        <ul className="file-status-list">
+          {statusEntries.map(([name, msg]) => (
+            <li key={name}>
+              <span className="file-status-name">{name}</span>
+              <span className="file-status-msg">{msg}</span>
+            </li>
+          ))}
         </ul>
-      </div>
+      )}
     </div>
   );
 }

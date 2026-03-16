@@ -10,7 +10,7 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: #f5f5f5;
   min-height: 100vh;
 }
 
@@ -31,10 +31,12 @@ code {
 }
 
 .app-header {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  color: black;
   padding: 2rem;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 .app-header h1 {
@@ -80,14 +82,21 @@ code {
 }
 
 .nav-tab.active {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  background: #dcdcdc;
+  color: #111;
 }
 
 .app-content {
   flex: 1;
   overflow: auto;
   padding: 2rem;
+}
+
+.files-layout {
+  display: grid;
+  grid-template-columns: 420px 1fr;
+  gap: 1.5rem;
+  align-items: flex-start;
 }
 
 @media (max-width: 768px) {
@@ -105,5 +114,9 @@ code {
 
   .app-header h1 {
     font-size: 1.8rem;
+  }
+
+  .files-layout {
+    grid-template-columns: 1fr;
   }
 }

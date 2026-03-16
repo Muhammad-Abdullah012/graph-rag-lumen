@@ -38,14 +38,26 @@
 }
 
 .example-questions li {
-  padding: 0.5rem 0;
-  color: #666;
+  padding: 0.5rem 0.75rem;
+  color: #555;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: background 0.2s ease;
+}
+
+.example-questions li:hover {
+  background: #e8e8e8;
 }
 
 .example-questions li:before {
   content: "→ ";
   margin-right: 0.5rem;
-  color: #667eea;
+  color: #888;
+}
+
+.source-name {
+  font-weight: 500;
+  color: #333;
 }
 
 .chat-messages {
@@ -80,8 +92,8 @@
 }
 
 .message.user .message-content {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  background: #f0f0f0;
+  color: #333;
   padding: 0.75rem 1rem;
   border-radius: 12px;
   max-width: 80%;
@@ -100,12 +112,117 @@
   border-radius: 12px;
   max-width: 80%;
   word-wrap: break-word;
-  white-space: pre-wrap;
+  white-space: normal;
+}
+
+/* ── Markdown / KaTeX inside assistant messages ─────────────── */
+.message.assistant .message-content p {
+  margin: 0.4em 0;
+  line-height: 1.6;
+}
+
+.message.assistant .message-content ul,
+.message.assistant .message-content ol {
+  margin: 0.4em 0;
+  padding-left: 1.5em;
+}
+
+.message.assistant .message-content li {
+  margin: 0.2em 0;
+}
+
+.message.assistant .message-content h1,
+.message.assistant .message-content h2,
+.message.assistant .message-content h3 {
+  margin: 0.6em 0 0.3em;
+  font-size: 1.05em;
+  font-weight: 600;
+}
+
+.message.assistant .message-content code {
+  background: #e0e0e0;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.message.assistant .message-content pre {
+  background: #e0e0e0;
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+
+.message.assistant .message-content pre code {
+  background: none;
+  padding: 0;
+}
+
+/* KaTeX display-mode formulas */
+.message.assistant .message-content .katex-display {
+  margin: 0.8em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.4em 0;
+}
+
+/* KaTeX inline formulas */
+.message.assistant .message-content .katex {
+  font-size: 1.05em;
+}
+
+.message.assistant .message-content strong {
+  font-weight: 600;
+}
+
+.message.assistant .message-content blockquote {
+  border-left: 3px solid #999;
+  margin: 0.5em 0;
+  padding: 0.25em 0.75em;
+  color: #555;
+}
+
+/* ── Images / Figures inside assistant messages ──────────── */
+.message.assistant .message-content img {
+  max-width: 100%;
+  height: auto;
+  margin: 0.6em 0;
+  border-radius: 4px;
+  border: 1px solid #ddd;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+/* ── Tables inside assistant messages ─────────────────────── */
+.message.assistant .message-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.6em 0;
+  font-size: 0.88em;
+  overflow-x: auto;
+  display: block;
+}
+
+.message.assistant .message-content th,
+.message.assistant .message-content td {
+  border: 1px solid #ccc;
+  padding: 0.35em 0.6em;
+  text-align: left;
+}
+
+.message.assistant .message-content th {
+  background: #e8e8e8;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.message.assistant .message-content tr:nth-child(even) {
+  background: #f5f5f5;
 }
 
 .sources {
   background: #f9f9f9;
-  border-left: 4px solid #667eea;
+  border-left: 4px solid #bbb;
   padding: 0.75rem 1rem;
   border-radius: 4px;
   margin-top: 0.5rem;
@@ -113,35 +230,120 @@
 }
 
 .sources h4 {
-  margin-bottom: 0.5rem;
-  color: #333;
-  font-size: 0.9rem;
+  margin: 0 0 0.5rem;
+  color: #555;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
 }
 
 .sources ul {
   list-style: none;
-  gap: 0.5rem;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
 }
 
 .sources li {
-  padding: 0.25rem 0;
-  font-size: 0.9rem;
+  font-size: 0.85rem;
+  line-height: 1.4;
 }
 
 .sources a {
-  color: #667eea;
+  color: #444;
   text-decoration: none;
+  border-bottom: 1px dotted #aaa;
 }
 
 .sources a:hover {
-  text-decoration: underline;
+  color: #111;
+  border-bottom-color: #555;
+}
+
+.source-name {
+  font-weight: 500;
+  color: #333;
 }
 
 .sources small {
   display: block;
   color: #999;
-  font-size: 0.8rem;
-  margin-top: 0.25rem;
+  font-size: 0.78rem;
+  margin-top: 0.1rem;
+  padding-left: 0.5rem;
+}
+
+.source-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.source-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.78rem;
+  color: #888;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.source-toggle:hover {
+  color: #444;
+}
+
+.source-preview {
+  margin: 0.4rem 0 0.2rem;
+  padding: 0.6rem 0.75rem;
+  background: #f0f0f0;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  word-break: break-word;
+  max-height: 250px;
+  overflow-y: auto;
+  color: #333;
+}
+
+.source-preview table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.4em 0;
+  font-size: 0.9em;
+}
+
+.source-preview th,
+.source-preview td {
+  border: 1px solid #ccc;
+  padding: 0.25em 0.5em;
+  text-align: left;
+}
+
+.source-preview th {
+  background: #e0e0e0;
+  font-weight: 600;
+}
+
+.source-preview img {
+  max-width: 100%;
+  max-height: 120px;
+  height: auto;
+}
+
+.source-preview p {
+  margin: 0.3em 0;
+}
+
+.source-preview h1, .source-preview h2, .source-preview h3,
+.source-preview h4, .source-preview h5, .source-preview h6 {
+  margin: 0.3em 0;
+  font-size: 0.95em;
 }
 
 .confidence {
@@ -200,13 +402,13 @@
 }
 
 .chat-input:focus {
-  border-color: #667eea;
+  border-color: #9a9a9a;
 }
 
 .chat-send-btn {
   padding: 0.75rem 1.5rem;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
+  background: #f0f0f0;
+  color: #333;
   border: none;
   border-radius: 8px;
   cursor: pointer;
@@ -221,4 +423,71 @@
 .chat-send-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ── Streaming state ─────────────────────────────────────────── */
+
+/* Status pill shown before tokens arrive */
+.stream-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #777;
+  font-size: 0.85rem;
+  padding: 0.4rem 0;
+}
+
+.stream-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #999;
+  flex-shrink: 0;
+  animation: typing 1.4s infinite;
+}
+
+/* Blinking cursor appended while tokens are streaming */
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: #555;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 0.8s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+.tools-info {
+  background: #f5f5f5;
+  border-left: 3px solid #888;
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  margin-top: 0.25rem;
+  max-width: 80%;
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.tools-info summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: #888;
+}
+
+.tools-info ul {
+  list-style: none;
+  margin-top: 0.5rem;
+  padding: 0;
+}
+
+.tools-info li {
+  padding: 0.2rem 0;
+  font-family: monospace;
+  font-size: 0.8rem;
+  word-break: break-all;
 }

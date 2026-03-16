@@ -1,45 +1,47 @@
-import React, { useState, useEffect } from 'react';
-// import './App.css';
+import React, { useState } from 'react';
+import DocumentList from './components/DocumentList';
 import DocumentUpload from './components/DocumentUpload';
-import QAChat from './components/QAChat';
 import HealthStatus from './components/HealthStatus';
+import QAChat from './components/QAChat';
 
 function App() {
-  const [documents, setDocuments] = useState([]);
-  const [activeTab, setActiveTab] = useState('qa');
+  const [activeTab, setActiveTab] = useState('chat');
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  const handleDocumentUpload = (newDoc) => {
-    setDocuments([...documents, newDoc]);
-  };
+  const handleUploadComplete = () => setRefreshKey((prev) => prev + 1);
 
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Graph RAG System</h1>
+        <h1>Lumen IT POC Eurocode Betonbau</h1>
         <p>Knowledge Base Question & Answering</p>
         <HealthStatus />
       </header>
 
       <div className="app-container">
         <nav className="nav-tabs">
-          <button 
-            className={`nav-tab ${activeTab === 'qa' ? 'active' : ''}`}
-            onClick={() => setActiveTab('qa')}
+          <button
+            className={`nav-tab ${activeTab === 'files' ? 'active' : ''}`}
+            onClick={() => setActiveTab('files')}
           >
-            💬 Ask Questions
+            Dateien
           </button>
-          <button 
-            className={`nav-tab ${activeTab === 'upload' ? 'active' : ''}`}
-            onClick={() => setActiveTab('upload')}
+          <button
+            className={`nav-tab ${activeTab === 'chat' ? 'active' : ''}`}
+            onClick={() => setActiveTab('chat')}
           >
-            📄 Upload Documents
+            Chat
           </button>
         </nav>
 
         <main className="app-content">
-          {activeTab === 'qa' && <QAChat />}
-          {activeTab === 'upload' && (
-            <DocumentUpload onUpload={handleDocumentUpload} />
+          {activeTab === 'files' ? (
+            <div className="files-layout">
+              <DocumentUpload onUploadComplete={handleUploadComplete} />
+              <DocumentList refreshKey={refreshKey} />
+            </div>
+          ) : (
+            <QAChat />
           )}
         </main>
       </div>

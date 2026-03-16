@@ -9,24 +9,23 @@
 .status-badge {
   padding: 0.5rem 1rem;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.2);
-  color: white;
+  background: rgba(0, 0, 0, 0.06);
+  color: #111;
   font-weight: 500;
 }
 
 .status-badge.green {
-  background: rgba(76, 175, 80, 0.3);
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .status-badge.red {
-  background: rgba(244, 67, 54, 0.3);
+  background: rgba(0, 0, 0, 0.06);
 }
 
 .health-details {
   display: flex;
   gap: 1.5rem;
-  color: white;
-  opacity: 0.9;
+  opacity: 0.95;
 }
 
 .health-details span {
