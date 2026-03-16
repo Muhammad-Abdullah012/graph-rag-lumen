@@ -46,8 +46,14 @@ logs/
 *.log
 
 # Documents (local uploads)
-documents/
+documents/*
 !documents/.gitkeep
+
+images/*
+!images/.gitkeep
+
+json/*
+!json/.gitkeep
 
 # Docker
 .dockerignore
