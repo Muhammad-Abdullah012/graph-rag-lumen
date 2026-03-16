@@ -96,6 +96,22 @@ class MistralOCRPipeline:
             page["images"] = updated_images
         return pages
 
+    def load_existing(self, filename: str) -> list[dict] | None:
+        """
+        Return pages from an existing JSON file if it exists, else None.
+
+        Args:
+            filename: Stored filename (with or without UUID prefix)
+        """
+        source_file = self._strip_uuid_prefix(filename)
+        json_path = Path(settings.json_output_path) / f"{Path(source_file).stem}.json"
+        if not json_path.exists():
+            return None
+        with open(json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info(f"Loaded existing OCR JSON: {json_path}")
+        return data["pages"]
+
     def _save_json(self, pages: list[dict], document_id: str, source_file: str):
         """Persist the full page data to a JSON file."""
         output = {

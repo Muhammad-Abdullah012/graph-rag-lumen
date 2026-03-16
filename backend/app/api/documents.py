@@ -155,13 +155,16 @@ def _process_document_sync(
 
         logger.info(f"Processing document {document_id}: {filename}")
 
-        # Run Mistral Batch OCR
         ocr = get_ocr_pipeline()
-        pages = ocr.process(
-            pdf_path=file_path,
-            document_id=document_id,
-            filename=filename,
-        )
+        pages = ocr.load_existing(filename)
+        if pages is None:
+            pages = ocr.process(
+                pdf_path=file_path,
+                document_id=document_id,
+                filename=filename,
+            )
+        else:
+            logger.info(f"Skipping OCR for {filename}: using cached JSON")
 
         processing_status[document_id]["message"] = "Building knowledge graph..."
 
@@ -199,6 +202,37 @@ async def process_document(document_id, file_path, filename, document_url):
         filename,
         document_url
     )
+
+@router.post("/process-all")
+async def process_all_documents(background_tasks: BackgroundTasks = BackgroundTasks()):
+    """Queue all PDFs in the documents directory for OCR processing."""
+    docs_dir = Path(settings.documents_path)
+    pdf_files = list(docs_dir.glob("*.pdf"))
+
+    if not pdf_files:
+        return {"message": "No PDF files found", "queued": 0}
+
+    queued = []
+    for pdf_file in pdf_files:
+        parts = pdf_file.name.split("_", 1)
+        document_id = parts[0]
+        filename = parts[1] if len(parts) == 2 else pdf_file.name
+
+        if processing_status.get(document_id, {}).get("status") == "processing":
+            continue
+
+        processing_status[document_id] = {"status": "pending", "message": "Queued for processing"}
+        background_tasks.add_task(
+            process_document,
+            document_id=document_id,
+            file_path=str(pdf_file),
+            filename=pdf_file.name,
+            document_url=f"documents/{pdf_file.name}",
+        )
+        queued.append(filename)
+
+    return {"message": "Processing started", "queued": len(queued), "files": queued}
+
 
 @router.get("/status/{document_id}", response_model=ProcessingStatus)
 async def get_processing_status(document_id: str) -> ProcessingStatus:

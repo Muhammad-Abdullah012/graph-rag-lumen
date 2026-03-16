@@ -128,6 +128,7 @@ class GraphBuilder:
             MATCH (p1:Page {id: $id1})
             MATCH (p2:Page {id: $id2})
             MERGE (p1)-[:NEXT_PAGE]->(p2)
+            MERGE (p2)-[:PREV_PAGE]->(p1)
         """
         for i in range(page_count - 1):
             self.db.execute_query(query, {
