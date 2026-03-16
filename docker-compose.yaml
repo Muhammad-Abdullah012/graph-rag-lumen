@@ -1,6 +1,6 @@
 services:
   neo4j:
-    image: neo4j:5.26.1-enterprise
+    image: neo4j:5.26.1
     env_file:
       - ./.env.neo
     volumes:
