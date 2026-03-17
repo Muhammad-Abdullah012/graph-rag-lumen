@@ -50,8 +50,6 @@ class Settings(BaseSettings):
 
     # Application
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", "52428800"))  # 50MB
-    pdf_extract_timeout: int = int(os.getenv("PDF_EXTRACT_TIMEOUT", "300"))
-    graph_build_timeout: int = int(os.getenv("GRAPH_BUILD_TIMEOUT", "600"))
     
     class Config:
         env_file = ".env"

@@ -192,8 +192,6 @@ All settings are loaded from environment variables. Defaults are in `config/sett
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MAX_UPLOAD_SIZE` | `52428800` | Max file size in bytes (50 MB) |
-| `PDF_EXTRACT_TIMEOUT` | `300` | OCR timeout in seconds |
-| `GRAPH_BUILD_TIMEOUT` | `600` | Graph build timeout in seconds |
 
 ---
 
