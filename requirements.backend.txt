@@ -26,3 +26,6 @@ python-json-logger==2.0.7
 # Utilities
 python-dotenv==1.0.0
 json-repair
+
+# Mistral AI
+mistralai>=1.0.0
