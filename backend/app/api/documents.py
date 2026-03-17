@@ -60,7 +60,7 @@ async def list_documents():
     loop = asyncio.get_running_loop()
 
     def _scan():
-        files = list(docs_dir.glob("*.pdf"))
+        files = [f for f in docs_dir.iterdir() if f.is_file() and f.suffix.lower() == ".pdf"]
         files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
         result = []
         for pdf_file in files:
