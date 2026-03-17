@@ -93,7 +93,12 @@ OLLAMA_EMBEDDING_MODEL=bge-m3:latest
 NEO4J_PASSWORD=neo4jpassword
 ```
 
-Also configure `.env.neo` for Neo4j container settings (auth, advertised addresses).
+Also configure `.env.neo`:
+
+```bash
+cp .env.neo.example .env.neo
+# Edit .env.neo: set NEO4J_AUTH and your server's advertised address
+```
 
 ### 2. Create directories
 
