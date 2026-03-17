@@ -97,6 +97,24 @@ class Neo4jConnection:
         except Exception as e:
             logger.warning(f"Could not create vector index: {str(e)}")
     
+    def create_fulltext_index(self):
+        """Create fulltext index on Page.markdown for keyword search"""
+        try:
+            result = self.execute_query(
+                "SHOW INDEXES WHERE name = $index_name",
+                {"index_name": settings.fulltext_index_name},
+            )
+            if result:
+                logger.info(f"Fulltext index '{settings.fulltext_index_name}' already exists")
+                return
+            self.execute_query(
+                f"CREATE FULLTEXT INDEX {settings.fulltext_index_name} "
+                f"FOR (n:Page) ON EACH [n.markdown]"
+            )
+            logger.info(f"Created fulltext index: {settings.fulltext_index_name}")
+        except Exception as e:
+            logger.warning(f"Could not create fulltext index: {str(e)}")
+
     def create_constraints(self):
         """Create database constraints"""
         constraints = [
@@ -127,6 +145,7 @@ def get_neo4j_connection() -> Neo4jConnection:
                 conn = Neo4jConnection()
                 conn.create_constraints()
                 conn.create_vector_index()
+                conn.create_fulltext_index()
                 _neo4j_connection = conn
                 break
             except (ServiceUnavailable, TransientError) as e:

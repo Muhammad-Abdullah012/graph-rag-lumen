@@ -109,15 +109,11 @@ class QASystem:
             return self._retrieve_pages_by_keyword(question, top_k)
 
     def _retrieve_pages_by_keyword(self, query_text: str, top_k: int) -> List[Dict[str, Any]]:
-        """Fallback: retrieve pages by keyword matching"""
-        words = [w for w in query_text.lower().split()[:5] if len(w) > 2]
-        if not words:
-            return []
-
-        conditions = " OR ".join([f"p.markdown CONTAINS '{word}'" for word in words])
-        cypher = f"""
-            MATCH (p:Page)-[:BELONGS_TO]->(doc:Document)
-            WHERE {conditions}
+        """Fallback: retrieve pages using fulltext index"""
+        cypher = """
+            CALL db.index.fulltext.queryNodes($index_name, $query)
+            YIELD node AS p, score
+            MATCH (p)-[:BELONGS_TO]->(doc:Document)
             RETURN
                 p.page_number  AS page_number,
                 p.markdown     AS markdown,
@@ -125,11 +121,15 @@ class QASystem:
                 p.header       AS header,
                 doc.id         AS document_id,
                 doc.name       AS document_name,
-                0.5            AS score
-            LIMIT {top_k}
+                score
+            LIMIT $top_k
         """
         try:
-            return self.db.execute_query(cypher)
+            return self.db.execute_query(cypher, {
+                "index_name": settings.fulltext_index_name,
+                "query": query_text,
+                "top_k": top_k,
+            })
         except Exception as e:
             logger.warning(f"Keyword search failed: {str(e)}")
             return []

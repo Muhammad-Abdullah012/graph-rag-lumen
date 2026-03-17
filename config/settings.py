@@ -29,8 +29,9 @@ class Settings(BaseSettings):
     documents_path: str = os.getenv("DOCUMENTS_PATH", "/tmp/documents")
     documents_base_url: str = os.getenv("DOCUMENTS_BASE_URL", "http://localhost:8080/documents")
     
-    # Vector Index
+    # Indexes
     vector_index_name: str = os.getenv("VECTOR_INDEX_NAME", "page_embeddings")
+    fulltext_index_name: str = os.getenv("FULLTEXT_INDEX_NAME", "page_fulltext")
     
     # Mistral OCR
     mistral_api_key: str = os.getenv("MISTRAL_API_KEY", "")
