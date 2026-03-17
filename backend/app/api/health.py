@@ -16,6 +16,7 @@ class HealthStatus(BaseModel):
     status: str
     neo4j: str
     ollama: str
+    graph_loaded: bool
 
 
 @router.get("/", response_model=HealthStatus)
@@ -28,10 +29,13 @@ async def health_check() -> HealthStatus:
     """
     neo4j_status = "ok"
     ollama_status = "ok"
-    
+    graph_loaded = False
+
     try:
         db = get_neo4j_connection()
         db.execute_query("RETURN 1")
+        result = db.execute_query("MATCH (n) RETURN count(n) AS count LIMIT 1")
+        graph_loaded = result[0]["count"] > 0
     except Exception as e:
         logger.error(f"Neo4j health check failed: {str(e)}")
         neo4j_status = "error"
@@ -48,5 +52,6 @@ async def health_check() -> HealthStatus:
     return HealthStatus(
         status=overall_status,
         neo4j=neo4j_status,
-        ollama=ollama_status
+        ollama=ollama_status,
+        graph_loaded=graph_loaded,
     )
