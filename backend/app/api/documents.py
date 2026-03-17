@@ -57,20 +57,28 @@ processing_status = {}
 async def list_documents():
     """List all uploaded PDF files with their metadata."""
     docs_dir = Path(settings.documents_path)
-    result = []
-    for pdf_file in sorted(docs_dir.glob("*.pdf"), key=lambda f: f.stat().st_mtime, reverse=True):
-        stat = pdf_file.stat()
-        parts = pdf_file.name.split("_", 1)
-        document_id = parts[0]
-        filename = parts[1] if len(parts) == 2 else pdf_file.name
-        result.append(DocumentInfo(
-            document_id=document_id,
-            stored_filename=pdf_file.name,
-            filename=filename,
-            size_bytes=stat.st_size,
-            uploaded_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-            url=f"{settings.documents_base_url}/{pdf_file.name}",
-        ))
+    loop = asyncio.get_running_loop()
+
+    def _scan():
+        files = list(docs_dir.glob("*.pdf"))
+        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        result = []
+        for pdf_file in files:
+            stat = pdf_file.stat()
+            parts = pdf_file.name.split("_", 1)
+            document_id = parts[0]
+            filename = parts[1] if len(parts) == 2 else pdf_file.name
+            result.append(DocumentInfo(
+                document_id=document_id,
+                stored_filename=pdf_file.name,
+                filename=filename,
+                size_bytes=stat.st_size,
+                uploaded_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                url=f"{settings.documents_base_url}/{pdf_file.name}",
+            ))
+        return result
+
+    result = await loop.run_in_executor(task_executor, _scan)
     return {"documents": result}
 
 
