@@ -50,6 +50,7 @@ class Settings(BaseSettings):
 
     # Application
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", "52428800"))  # 50MB
+    upload_chunk_size: int = int(os.getenv("UPLOAD_CHUNK_SIZE", "1048576"))  # 1MB
     
     class Config:
         env_file = ".env"

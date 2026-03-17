@@ -96,8 +96,8 @@ async def upload_documents(
             file_path = Path(settings.documents_path) / f"{document_id}_{file.filename}"
 
             async with aiofiles.open(file_path, 'wb') as f:
-                content = await file.read()
-                await f.write(content)
+                while chunk := await file.read(settings.upload_chunk_size):
+                    await f.write(chunk)
 
             logger.info(f"Saved uploaded file: {file_path}")
 
