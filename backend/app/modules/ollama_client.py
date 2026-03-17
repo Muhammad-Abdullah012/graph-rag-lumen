@@ -1,6 +1,7 @@
 """Ollama LLM Integration"""
+import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Generator
 import requests
 
 from config.settings import settings
@@ -96,6 +97,41 @@ class OllamaClient:
             logger.error(f"Error generating text: {str(e)}")
             raise
     
+    def chat_stream(
+        self,
+        messages: list,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+    ) -> Generator[str, None, None]:
+        """Stream chat response token by token using /api/chat."""
+        if model is None:
+            model = settings.ollama_llm_model
+
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "stream": True,
+                },
+                stream=True,
+                timeout=300,
+            )
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    token = data.get("message", {}).get("content", "")
+                    if token:
+                        yield token
+                    if data.get("done"):
+                        break
+        except Exception as e:
+            logger.error(f"Error in chat stream: {str(e)}")
+            raise
+
     def list_models(self) -> list:
         """List available models in Ollama"""
         try:

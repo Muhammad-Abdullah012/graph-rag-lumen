@@ -30,14 +30,16 @@ class Settings(BaseSettings):
     documents_base_url: str = os.getenv("DOCUMENTS_BASE_URL", "http://localhost:8080/documents")
     
     # Vector Index
-    vector_index_name: str = os.getenv("VECTOR_INDEX_NAME", "document_embeddings")
-    vector_dimension: int = int(os.getenv("VECTOR_DIMENSION", "768"))
+    vector_index_name: str = os.getenv("VECTOR_INDEX_NAME", "page_embeddings")
     
     # Mistral OCR
     mistral_api_key: str = os.getenv("MISTRAL_API_KEY", "")
     json_output_path: str = os.getenv("JSON_OUTPUT_PATH", "/backend/json")
     images_path: str = os.getenv("IMAGES_PATH", "/backend/images")
     batch_poll_interval: int = int(os.getenv("BATCH_POLL_INTERVAL", "5"))
+
+    # Debug
+    debug_log_path: str = os.getenv("DEBUG_LOG_PATH", "/app/debug_raw.jsonl")
 
     # Application
     max_upload_size: int = int(os.getenv("MAX_UPLOAD_SIZE", "52428800"))  # 50MB

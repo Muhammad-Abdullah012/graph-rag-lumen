@@ -68,35 +68,32 @@ class Neo4jConnection:
     def create_vector_index(self):
         """Create vector similarity index for embeddings"""
         try:
-            # Check if index already exists
-            check_query = """
-                SHOW INDEXES WHERE name = $index_name
-            """
-            
             result = self.execute_query(
-                check_query,
-                {"index_name": settings.vector_index_name}
+                "SHOW INDEXES WHERE name = $index_name",
+                {"index_name": settings.vector_index_name},
             )
-            
             if result:
                 logger.info(f"Vector index '{settings.vector_index_name}' already exists")
                 return
-            
-            # Create the index
+
+            # Auto-detect embedding dimension from the model
+            from backend.app.modules.ollama_client import get_ollama_client
+            dimension = len(get_ollama_client().generate_embedding("dimension probe"))
+            logger.info(f"Detected embedding dimension: {dimension}")
+
             create_query = f"""
                 CREATE VECTOR INDEX {settings.vector_index_name}
                 FOR (n:Page) ON (n.embedding)
                 OPTIONS {{
                     indexConfig: {{
-                        `vector.dimensions`: {settings.vector_dimension},
+                        `vector.dimensions`: {dimension},
                         `vector.similarity_function`: 'cosine'
                     }}
                 }}
             """
-            
             self.execute_query(create_query)
             logger.info(f"Created vector index: {settings.vector_index_name}")
-            
+
         except Exception as e:
             logger.warning(f"Could not create vector index: {str(e)}")
     
