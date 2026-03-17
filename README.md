@@ -75,8 +75,8 @@ A production-ready Knowledge Graph RAG (Retrieval-Augmented Generation) system t
 ```bash
 cp .env.example .env
 # Edit .env and update:
-# - OLLAMA_BASE_URL (your Ollama ngrok URL)
-# - NEO4J_PASSWORD (secure password)
+# - OLLAMA_BASE_URL
+# - NEO4J_PASSWORD
 ```
 
 ### 2. Create Required Directories
