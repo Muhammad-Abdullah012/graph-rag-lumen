@@ -54,12 +54,14 @@ class QASystem:
         self.db = get_neo4j_connection()
         self.ollama = get_ollama_client()
 
-    def answer_question_stream(self, question: str, top_k: int = 5) -> Generator[str, None, None]:
+    def answer_question_stream(self, question: str, top_k: int = None) -> Generator[str, None, None]:
         """Stream answer as SSE events: status → token… → done"""
         yield f"data: {json.dumps({'type': 'status', 'message': 'Searching knowledge graph...'})}\n\n"
 
         question_embedding = self.ollama.generate_embedding(question)
-        relevant_pages = self._retrieve_relevant_pages(question, question_embedding, top_k)
+        relevant_pages = self._retrieve_relevant_pages(
+            question, question_embedding, top_k or settings.retrieval_top_k
+        )
 
         if not relevant_pages:
             yield f"data: {json.dumps({'type': 'done', 'answer': 'I could not find relevant information to answer this question.', 'sources': [], 'tools_used': []})}\n\n"

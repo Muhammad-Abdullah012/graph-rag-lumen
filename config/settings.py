@@ -35,6 +35,9 @@ class Settings(BaseSettings):
 
     # LLM context window
     ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
+
+    # Retrieval
+    retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
     
     # Mistral OCR
     mistral_api_key: str = os.getenv("MISTRAL_API_KEY", "")
