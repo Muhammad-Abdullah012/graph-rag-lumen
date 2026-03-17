@@ -10,10 +10,14 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+CHARS_PER_TOKEN = 4
+CONTEXT_RESERVED_TOKENS = 500  # budget for system prompt + question + answer headroom
 
-def _write_debug_log(prompt: str, answer: str, retrieved_pages: List[Dict[str, Any]]) -> None:
+
+def _write_debug_log(system_message: str, prompt: str, answer: str, retrieved_pages: List[Dict[str, Any]]) -> None:
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "system_message": system_message,
         "retrieved_pages": retrieved_pages,
         "prompt": prompt,
         "answer": answer,
@@ -37,9 +41,10 @@ STRICT RULES — follow exactly:
 7. If the context does not contain the answer, reply only: "Die angegebenen Dokumente enthalten keine relevanten Informationen zu dieser Frage.\""""
 
 USER_TEMPLATE = """Question: {question}
-
-Context:
-{context}"""
+==========CONTEXT START=============
+{context}
+===========CONTEXT END==============
+"""
 
 
 class QASystem:
@@ -75,7 +80,7 @@ class QASystem:
             full_answer += token
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-        _write_debug_log(user_message, full_answer, relevant_pages)
+        _write_debug_log(SYSTEM_PROMPT, user_message, full_answer, relevant_pages)
         yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'sources': sources, 'tools_used': []})}\n\n"
 
     def _retrieve_relevant_pages(
@@ -135,13 +140,20 @@ class QASystem:
             return []
 
     def _build_context(self, pages: List[Dict[str, Any]]) -> str:
+        budget_chars = (settings.ollama_num_ctx - CONTEXT_RESERVED_TOKENS) * CHARS_PER_TOKEN
+
         parts = []
+        used = 0
         for page in pages:
             doc_name = page.get("document_name", "Unknown")
             page_num = (page.get("page_number") or 0) + 1
             text = page.get("markdown", "")
             text = self._inline_tables(text, page.get("tables_json") or "[]")
-            parts.append(f"[From {doc_name}, page {page_num}]\n{text}")
+            entry = f"[From {doc_name}, page {page_num}]\n{text}"
+            if used + len(entry) > budget_chars:
+                break
+            parts.append(entry)
+            used += len(entry)
         return "\n\n---\n\n".join(parts)
 
     def _inline_tables(self, markdown: str, tables_json: str) -> str:

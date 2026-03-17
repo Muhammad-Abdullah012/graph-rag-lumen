@@ -113,8 +113,11 @@ class OllamaClient:
                 json={
                     "model": model,
                     "messages": messages,
-                    "temperature": temperature,
                     "stream": True,
+                    "options": {
+                        "temperature": temperature,
+                        "num_ctx": settings.ollama_num_ctx,
+                    },
                 },
                 stream=True,
                 timeout=300,

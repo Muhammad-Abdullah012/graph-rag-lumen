@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # Indexes
     vector_index_name: str = os.getenv("VECTOR_INDEX_NAME", "page_embeddings")
     fulltext_index_name: str = os.getenv("FULLTEXT_INDEX_NAME", "page_fulltext")
+
+    # LLM context window
+    ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
     
     # Mistral OCR
     mistral_api_key: str = os.getenv("MISTRAL_API_KEY", "")
