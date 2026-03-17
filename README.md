@@ -1,242 +1,357 @@
-# Graph RAG System
+# Graph RAG Lumen
 
-A production-ready Knowledge Graph RAG (Retrieval-Augmented Generation) system that processes PDF documents locally using Docling, builds a knowledge graph with Neo4j, and answers questions using local LLMs (Ollama).
+A document Q&A system that processes PDF files using Mistral OCR, stores structured page data in a Neo4j knowledge graph, and answers questions using locally hosted LLMs via Ollama with semantic vector search.
 
-## Features
-
-- 📄 **PDF Processing**: Extract text from PDFs with OCR, table structure detection, and code enrichment using Docling
-- 🔗 **Knowledge Graph**: Automatically build knowledge graphs from extracted text using LLMGraphTransformer
-- 🧠 **Vector Embeddings**: Generate and store embeddings using Nomic embed model
-- 🤖 **Local LLMs**: Use locally hosted Ollama models (llama3.4 for graph building, llama3.2 for Q&A)
-- ❓ **Q&A System**: Answer questions with source attribution and confidence scores
-- 🌐 **Web UI**: Modern React frontend for document upload and Q&A
-- 🐳 **Docker**: Production-ready Docker Compose setup
-- 🇩🇪 **German Language**: Optimized for German language documents
+---
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│   React UI      │
-└────────┬────────┘
-         │
-      nginx:8080
-         │
-    ┌────┴────────────────┐
-    │                     │
-┌───▼───────┐   ┌────────▼──────┐
-│  Backend  │   │   Frontend    │
-│FastAPI   │   │   (Static)    │
-└───┬───────┘   └───────────────┘
+PDF Upload
     │
-    ├────► Neo4j (Graph DB + Vector Index)
-    ├────► Ollama (Local LLMs)
-    └────► File System (PDFs)
+    ▼
+Mistral OCR API
+(page markdown + images + tables)
+    │
+    ▼
+Neo4j Graph
+  [Document] ──CONTAINS──► [Page] ──NEXT_PAGE──► [Page] ──► ...
+                              │
+                         embedding (bge-m3)
+                         markdown (with tables inlined)
+                         images, header, footer, dimensions
+    │
+    ▼
+Vector Search (HNSW) + Fulltext Index fallback (Lucene)
+    │
+    ▼
+Ollama LLM (mistral-nemo / any chat model)
+    │
+    ▼
+Streamed Answer + Source Attribution
 ```
 
-### Components
+### Services
 
-1. **Backend (Python/FastAPI)**
-   - Document upload and processing
-   - PDF text extraction (Docling)
-   - Text splitting (MarkdownHeaderTextSplitter)
-   - Graph building (LLMGraphTransformer)
-   - Q&A system with vector search
+| Service | Image | Host Port | Purpose |
+|---------|-------|-----------|---------|
+| `backend` | Custom (FastAPI) | `9000` | API server, OCR pipeline, graph builder, Q&A |
+| `frontend` | Custom (React) | `3006` | Web UI |
+| `nginx` | nginx:alpine | `8089` | Reverse proxy + static document serving |
+| `neo4j` | neo4j:5.26.1 | `8475` (HTTP), `8688` (Bolt) | Graph database + vector index |
 
-2. **Frontend (React)**
-   - Document upload interface
-   - Q&A chat interface
-   - Source attribution display
-   - Health status monitoring
+Ollama runs externally (not managed by this Compose stack).
 
-3. **Database (Neo4j)**
-   - Knowledge graph storage
-   - Vector index for semantic search
-   - Document metadata
-
-4. **LLMs (Ollama)**
-   - `llama3.4`: Graph transformation
-   - `llama3.2`: Q&A
-   - `nomic-embed-text:latest`: Embeddings
+---
 
 ## Prerequisites
 
-- Docker & Docker Compose
-- Ollama running with models:
-  - `llama3.4`
-  - `llama3.2`
-  - `nomic-embed-text:latest`
-- Ngrok tunnel to Ollama (or local access if on same network)
+- Docker with Compose v2 (`docker compose`)
+- NVIDIA GPU with CUDA (recommended — used by backend and Ollama)
+- **Ollama** running with:
+  - An LLM model, e.g. `mistral-nemo:12b`
+  - An embedding model: `bge-m3:latest`
+- **Mistral API key** (for PDF OCR via `mistral-ocr-latest`)
+
+---
 
 ## Quick Start
 
-### 1. Setup Environment
+```bash
+./QUICKSTART.sh
+```
+
+The script will:
+1. Create `.env` from `.env.example`
+2. Create required directories
+3. Build and start all Docker services
+4. Wait for the backend to be healthy
+5. Print access URLs
+
+---
+
+## Manual Setup
+
+### 1. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env and update:
-# - OLLAMA_BASE_URL
-# - NEO4J_PASSWORD
 ```
 
-### 2. Create Required Directories
+Edit `.env` — required values:
 
 ```bash
-mkdir -p documents logs
+# Mistral OCR (get key at console.mistral.ai)
+MISTRAL_API_KEY=your_key_here
+
+# Ollama (must be reachable from inside Docker)
+OLLAMA_BASE_URL=http://your-ollama-host:11434
+OLLAMA_LLM_MODEL=mistral-nemo:12b
+OLLAMA_EMBEDDING_MODEL=bge-m3:latest
+
+# Neo4j credentials (must match .env.neo)
+NEO4J_PASSWORD=neo4jpassword
 ```
 
-### 3. Start Services
+Also configure `.env.neo` for Neo4j container settings (auth, advertised addresses).
+
+### 2. Create directories
 
 ```bash
-docker-compose up -d
+mkdir -p documents logs backend/json backend/images
 ```
 
-### 4. Access Application
-
-- **Frontend**: http://localhost:8080
-- **API Docs**: http://localhost:8000/docs
-- **Health Check**: http://localhost:8000/api/health
-
-### 5. Upload Documents
-
-1. Go to "Upload Documents" tab
-2. Select a PDF file
-3. Wait for processing to complete
-4. Ask questions about your documents
-
-## Configuration
-
-### Environment Variables
-
-See `.env.example` for all available options:
+### 3. Start services
 
 ```bash
-# Neo4j
-NEO4J_URI=bolt://neo4j:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your_secure_password
-
-# Ollama
-OLLAMA_BASE_URL=https://your-ngrok-url/
-OLLAMA_EMBEDDING_MODEL=nomic-embed-text:latest
-OLLAMA_LLM_MODEL=llama3.2
-OLLAMA_GRAPH_MODEL=llama3.4
-
-# Documents
-DOCUMENTS_PATH=/documents
-DOCUMENTS_BASE_URL=http://localhost:8080/documents
+docker compose up -d --build
 ```
 
-## API Endpoints
+### 4. Access
 
-### Health Check
+| Interface | URL |
+|-----------|-----|
+| Web UI | http://localhost:8089 |
+| API Docs (Swagger) | http://localhost:9000/docs |
+| Health Check | http://localhost:9000/api/health/ |
+| Neo4j Browser | http://localhost:8475 |
+
+---
+
+## Usage
+
+### Upload & Process Documents
+
+1. Open the web UI → **Dateien** tab
+2. Drag & drop or select PDF files (max 50 MB each)
+3. Click **Process All Documents** to run OCR and build the graph
+4. Processing runs in the background — the status updates automatically
+
+### Ask Questions
+
+1. Switch to the **Chat** tab
+2. Type your question (German and English both supported)
+3. The system retrieves the most relevant pages and streams the answer
+4. Sources show document name and page number
+
+---
+
+## Configuration Reference
+
+All settings are loaded from environment variables. Defaults are in `config/settings.py`.
+
+### Neo4j
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NEO4J_URI` | `bolt://neo4j:7687` | Bolt connection URI |
+| `NEO4J_USERNAME` | `neo4j` | Username |
+| `NEO4J_PASSWORD` | `password` | Password |
+| `NEO4J_DATABASE` | `neo4j` | Database name |
+
+### Ollama
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API base URL |
+| `OLLAMA_LLM_MODEL` | `llama3.2` | Chat model for Q&A |
+| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text:latest` | Embedding model |
+| `OLLAMA_NUM_CTX` | `16384` | LLM context window (tokens) |
+
+### Mistral OCR
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MISTRAL_API_KEY` | *(required)* | Mistral API key |
+| `BATCH_POLL_INTERVAL` | `5` | Seconds between batch status checks |
+
+### File Paths
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOCUMENTS_PATH` | `/tmp/documents` | Where PDFs are stored |
+| `JSON_OUTPUT_PATH` | `/backend/json` | OCR result JSON files |
+| `IMAGES_PATH` | `/backend/images` | Extracted page images |
+| `DEBUG_LOG_PATH` | `/app/debug_raw.jsonl` | Debug log (prompt + answer per query) |
+
+### Retrieval & Search
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RETRIEVAL_TOP_K` | `5` | Number of pages to retrieve per query |
+| `VECTOR_INDEX_NAME` | `page_embeddings` | Neo4j vector index name |
+| `FULLTEXT_INDEX_NAME` | `page_fulltext` | Neo4j fulltext index name |
+
+### Upload Limits
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_UPLOAD_SIZE` | `52428800` | Max file size in bytes (50 MB) |
+| `PDF_EXTRACT_TIMEOUT` | `300` | OCR timeout in seconds |
+| `GRAPH_BUILD_TIMEOUT` | `600` | Graph build timeout in seconds |
+
+---
+
+## API Reference
+
+### Health
+
 ```
 GET /api/health/
+→ { status, neo4j, ollama, graph_loaded }
 ```
 
-### Document Operations
+### Documents
+
 ```
+GET  /api/documents
+→ [ { document_id, filename, size_mb, upload_date } ]
+
 POST /api/documents/upload
-- Upload a PDF document
-- Returns: { document_id, filename, status }
+     multipart: files[]
+→ [ { document_id, filename, status } ]
 
-GET /api/documents/status/{document_id}
-- Check processing status
-- Returns: { status, message }
+POST /api/documents/process-all
+→ { message: "Processing started" }
+
+GET  /api/documents/status/{document_id}
+→ { status, message }   # status: pending | processing | completed | failed
 ```
 
-### Question Answering
+### Q&A
+
 ```
-POST /api/qa/ask
-- Body: { "question": "...", "top_k": 5 }
-- Returns: { answer, sources, confidence }
+POST /api/qa/stream
+     { "question": "...", "top_k": 5 }
+→ Server-Sent Events stream:
+     data: { type: "status",  message: "..." }
+     data: { type: "token",   content: "..." }
+     data: { type: "done",    answer: "...", sources: [...] }
 ```
+
+Each source item: `{ document, page_number, chapter, preview }`.
+
+---
+
+## Graph Schema
+
+```
+(:Document {
+  id, name, source_file, url, page_count, processed_at
+})
+
+(:Page {
+  id,           # {document_id}_p{index}
+  document_id,
+  page_number,  # 0-based index
+  markdown,     # full page text with table placeholders
+  tables_json,  # JSON array of { id, content (markdown table) }
+  images_json,  # JSON array of { id, file_path, bbox coords }
+  hyperlinks_json,
+  header, footer,
+  dimensions_json,
+  embedding     # float[] from bge-m3
+})
+
+(:Page)-[:BELONGS_TO]->(:Document)
+(:Page)-[:NEXT_PAGE]->(:Page)
+```
+
+**Indexes:**
+- Vector index on `Page.embedding` (HNSW, cosine similarity)
+- Fulltext index on `Page.markdown` (Lucene, fallback keyword search)
+- Unique constraints on `Document.id` and `Page.id`
+
+---
+
+## Processing Pipeline
+
+```
+1. Upload PDF  →  saved to DOCUMENTS_PATH with UUID prefix
+2. OCR         →  Mistral batch API (mistral-ocr-latest)
+                  pages: markdown + images + tables + header/footer
+                  images decoded and saved to IMAGES_PATH
+                  result cached as JSON in JSON_OUTPUT_PATH
+3. Graph Build →  Document node created/merged
+                  Page nodes created with embeddings (bge-m3)
+                  NEXT_PAGE links chained in order
+4. Done        →  document status → "completed"
+```
+
+If a JSON file for the document already exists, OCR is skipped and the graph is rebuilt from cache.
+
+---
+
+## Retrieval Pipeline
+
+```
+1. Embed question  →  bge-m3 via Ollama
+2. Vector search   →  db.index.vector.queryNodes (HNSW, top-k pages)
+   Fallback        →  db.index.fulltext.queryNodes if vector fails
+3. Build context   →  inline tables into markdown, truncate to OLLAMA_NUM_CTX budget
+4. LLM generation  →  /api/chat with system + user messages, streamed
+5. Return          →  token stream + source list
+```
+
+---
+
+## Troubleshooting
+
+**Neo4j database offline after restart**
+```bash
+docker compose down -v   # wipe volumes
+docker compose up -d     # fresh start
+```
+
+**Ollama model not loading on GPU**
+
+Check if another model is already occupying VRAM:
+```bash
+docker exec <ollama-container> ollama ps
+docker exec <ollama-container> ollama stop <model-name>
+```
+
+**Context window too small (bad/truncated answers)**
+
+Increase `OLLAMA_NUM_CTX` in `.env`. Default is `16384`. `mistral-nemo:12b` supports up to `128000`. Requires sufficient VRAM.
+
+**mistralai import error**
+```
+ImportError: cannot import name 'Mistral' from 'mistralai'
+```
+Use `from mistralai.client import Mistral` — the package is a namespace package without `__init__.py` in some installations.
+
+**OCR returns 402 (batch too large)**
+
+Free Mistral tier limits batch size. Use single-document processing or upgrade your Mistral plan.
+
+---
 
 ## Development
 
-### Backend Development
+### Backend
 
 ```bash
-cd backend
-pip install -r ../requirements.backend.txt
-export PYTHONPATH=/path/to/project
-python -m uvicorn main:app --reload
+cd /path/to/graph-rag-lumen
+export PYTHONPATH=$(pwd)
+pip install -r requirements.backend.txt
+uvicorn backend.main:app --reload --port 8000
 ```
 
-### Frontend Development
+### Frontend
 
 ```bash
 cd frontend
 npm install
-npm start
+REACT_APP_API_URL=http://localhost:9000 npm start
 ```
 
-## Processing Pipeline
+---
 
-1. **Upload**: User uploads PDF
-2. **Extraction**: Docling extracts text with OCR, tables, code
-3. **Splitting**: MarkdownHeaderTextSplitter splits by headers
-4. **Embedding**: Generate vector embeddings for each chunk
-5. **Graph Building**: LLMGraphTransformer creates entities/relationships
-6. **Storage**: Store in Neo4j with vector index
+## Production Notes
 
-## Query Pipeline
-
-1. **Embedding**: Generate embedding for question
-2. **Retrieval**: Vector similarity search in Neo4j
-3. **Context**: Gather top-k chunks as context
-4. **Generation**: LLM generates answer with context
-5. **Attribution**: Return answer with source documents
-
-## Performance Tuning
-
-### For Large Documents
-- Increase `pdf_extract_timeout` in `.env`
-- Increase `graph_build_timeout` in `.env`
-- Consider chunk_size and overlap in settings
-
-### For Better Accuracy
-- Use larger models (llama3.4, not 3.2)
-- Increase `top_k` in Q&A requests
-- Fine-tune chunk overlap settings
-
-## Troubleshooting
-
-### Neo4j Connection Failed
-```
-Check: NEO4J_URI and credentials
-Wait: Neo4j container takes 30s+ to fully start
-```
-
-### Ollama Connection Failed
-```
-Check: OLLAMA_BASE_URL is correct and accessible
-Verify: Ngrok tunnel is active
-Test: curl https://your-ngrok-url/api/tags
-```
-
-### GPU Not Used
-```
-Set: OLLAMA environment variable device='auto'
-Or: Manually set device in Ollama
-```
-
-## Production Deployment
-
-For production deployment:
-
-1. Use secure database credentials
-2. Set `ENVIRONMENT=production` in `.env`
-3. Configure proper CORS origins in backend
-4. Use reverse proxy (nginx) with SSL/TLS
-5. Set up monitoring and logging
-6. Use managed databases for Neo4j
-7. Scale Ollama separately if needed
-
-## License
-
-MIT
-
-## Support
-
-For issues and questions, check the documentation or create an issue.
+- Set `ENVIRONMENT=production` in `.env`
+- The stack integrates with **Traefik** via `traefik-net` external network
+- Configure proper hostnames in `docker-compose.yaml` labels
+- Neo4j is **Community Edition** — `START DATABASE` is not supported; restart the container to recover an offline database
+- Ollama port `11434` should **not** be published (`ports:`) in production — use `expose:` only to prevent unauthorized external access
