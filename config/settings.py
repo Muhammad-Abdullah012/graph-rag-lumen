@@ -38,6 +38,9 @@ class Settings(BaseSettings):
 
     # Retrieval
     retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+    retrieval_neighbor_pages: int = int(os.getenv("RETRIEVAL_NEIGHBOR_PAGES", "2"))
+    retrieval_neighbor_expand_top: int = int(os.getenv("RETRIEVAL_NEIGHBOR_EXPAND_TOP", "3"))
+    rrf_k: int = int(os.getenv("RRF_K", "60"))
     
     # Mistral OCR
     mistral_api_key: str = os.getenv("MISTRAL_API_KEY", "")

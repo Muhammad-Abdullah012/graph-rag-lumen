@@ -18,7 +18,9 @@ def _write_debug_log(system_message: str, prompt: str, answer: str, retrieved_pa
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "system_message": system_message,
-        "retrieved_pages": retrieved_pages,
+        "vector_hits": retrieved_pages.get("vector_hits", []),
+        "fulltext_hits": retrieved_pages.get("fulltext_hits", []),
+        "merged_pages": retrieved_pages.get("merged_pages", []),
         "prompt": prompt,
         "answer": answer,
     }
@@ -59,9 +61,10 @@ class QASystem:
         yield f"data: {json.dumps({'type': 'status', 'message': 'Searching knowledge graph...'})}\n\n"
 
         question_embedding = self.ollama.generate_embedding(question)
-        relevant_pages = self._retrieve_relevant_pages(
+        retrieval = self._retrieve_relevant_pages(
             question, question_embedding, top_k or settings.retrieval_top_k
         )
+        relevant_pages = retrieval["merged_pages"]
 
         if not relevant_pages:
             yield f"data: {json.dumps({'type': 'done', 'answer': 'I could not find relevant information to answer this question.', 'sources': [], 'tools_used': []})}\n\n"
@@ -82,18 +85,36 @@ class QASystem:
             full_answer += token
             yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
-        _write_debug_log(SYSTEM_PROMPT, user_message, full_answer, relevant_pages)
+        _write_debug_log(SYSTEM_PROMPT, user_message, full_answer, retrieval)
         yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'sources': sources, 'tools_used': []})}\n\n"
 
     def _retrieve_relevant_pages(
         self, question: str, question_embedding: list, top_k: int
-    ) -> List[Dict[str, Any]]:
-        """Retrieve most similar pages using vector index"""
+    ) -> Dict[str, Any]:
+        """Run vector + fulltext search, merge with RRF, expand with neighbors.
+        Returns a dict with all intermediate results for debugging."""
+        vector_hits = self._vector_search(question_embedding, top_k)
+        fulltext_hits = self._fulltext_search(question, top_k)
+
+        merged = self._rrf_merge(vector_hits, fulltext_hits, top_k)
+        logger.info(f"RRF merge: {len(vector_hits)} vector + {len(fulltext_hits)} fulltext → {len(merged)} merged")
+
+        final = self._expand_with_neighbors(merged) if merged and settings.retrieval_neighbor_pages > 0 else merged
+
+        return {
+            "vector_hits": vector_hits,
+            "fulltext_hits": fulltext_hits,
+            "merged_pages": final,
+        }
+
+    def _vector_search(self, embedding: list, top_k: int) -> List[Dict[str, Any]]:
+        """Retrieve pages via vector similarity index."""
         query = """
             CALL db.index.vector.queryNodes($index_name, $top_k, $embedding)
             YIELD node, score
             MATCH (node)-[:BELONGS_TO]->(doc:Document)
             RETURN
+                node.id           AS page_id,
                 node.page_number  AS page_number,
                 node.markdown     AS markdown,
                 node.tables_json  AS tables_json,
@@ -104,24 +125,23 @@ class QASystem:
             ORDER BY score DESC
         """
         try:
-            results = self.db.execute_query(query, {
+            return self.db.execute_query(query, {
                 "index_name": settings.vector_index_name,
                 "top_k": top_k,
-                "embedding": question_embedding,
+                "embedding": embedding,
             })
-            logger.info(f"Retrieved {len(results)} relevant pages")
-            return results
         except Exception as e:
-            logger.warning(f"Vector search failed: {str(e)}. Falling back to keyword search.")
-            return self._retrieve_pages_by_keyword(question, top_k)
+            logger.warning(f"Vector search failed: {e}")
+            return []
 
-    def _retrieve_pages_by_keyword(self, query_text: str, top_k: int) -> List[Dict[str, Any]]:
-        """Fallback: retrieve pages using fulltext index"""
+    def _fulltext_search(self, query_text: str, top_k: int) -> List[Dict[str, Any]]:
+        """Retrieve pages via fulltext (BM25) index."""
         cypher = """
             CALL db.index.fulltext.queryNodes($index_name, $query)
             YIELD node AS p, score
             MATCH (p)-[:BELONGS_TO]->(doc:Document)
             RETURN
+                p.id           AS page_id,
                 p.page_number  AS page_number,
                 p.markdown     AS markdown,
                 p.tables_json  AS tables_json,
@@ -138,8 +158,69 @@ class QASystem:
                 "top_k": top_k,
             })
         except Exception as e:
-            logger.warning(f"Keyword search failed: {str(e)}")
+            logger.warning(f"Fulltext search failed: {e}")
             return []
+
+    def _rrf_merge(
+        self, vector_hits: List[Dict], fulltext_hits: List[Dict], top_k: int
+    ) -> List[Dict[str, Any]]:
+        """Merge two ranked lists using Reciprocal Rank Fusion."""
+        k = settings.rrf_k
+        rrf_scores: Dict[str, float] = {}
+        page_data: Dict[str, Dict] = {}
+
+        for rank, hit in enumerate(vector_hits):
+            pid = hit.get("page_id")
+            if not pid:
+                continue
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (k + rank + 1)
+            page_data[pid] = hit
+
+        for rank, hit in enumerate(fulltext_hits):
+            pid = hit.get("page_id")
+            if not pid:
+                continue
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (k + rank + 1)
+            if pid not in page_data:
+                page_data[pid] = hit
+
+        sorted_ids = sorted(rrf_scores, key=lambda p: rrf_scores[p], reverse=True)
+        return [page_data[pid] for pid in sorted_ids]
+
+    def _expand_with_neighbors(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Append following pages (via NEXT_PAGE) for the top N hits."""
+        depth = settings.retrieval_neighbor_pages
+        neighbor_query = f"""
+            MATCH (start:Page {{id: $page_id}})-[:NEXT_PAGE*1..{depth}]->(nb:Page)
+            MATCH (nb)-[:BELONGS_TO]->(doc:Document)
+            RETURN
+                nb.id           AS page_id,
+                nb.page_number  AS page_number,
+                nb.markdown     AS markdown,
+                nb.tables_json  AS tables_json,
+                nb.header       AS header,
+                doc.id          AS document_id,
+                doc.name        AS document_name,
+                $base_score     AS score
+        """
+        seen_ids = {h["page_id"] for h in hits}
+        extra = []
+        for hit in hits[:settings.retrieval_neighbor_expand_top]:
+            try:
+                neighbors = self.db.execute_query(neighbor_query, {
+                    "page_id": hit["page_id"],
+                    "base_score": hit["score"],
+                })
+                for nb in neighbors:
+                    if nb["page_id"] not in seen_ids:
+                        seen_ids.add(nb["page_id"])
+                        extra.append(nb)
+            except Exception as e:
+                logger.warning(f"Neighbor expansion failed for page {hit.get('page_id')}: {e}")
+
+        results = hits + extra
+        logger.info(f"Neighbor expansion: {len(hits)} hits + {len(extra)} neighbors = {len(results)} total")
+        return results
 
     def _build_context(self, pages: List[Dict[str, Any]]) -> str:
         budget_chars = (settings.ollama_num_ctx - CONTEXT_RESERVED_TOKENS) * CHARS_PER_TOKEN
