@@ -1,6 +1,7 @@
 """Question Answering Module with Source Attribution"""
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Generator, Tuple
 
@@ -10,17 +11,23 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-CHARS_PER_TOKEN = 4
-CONTEXT_RESERVED_TOKENS = 500  # budget for system prompt + question + answer headroom
 
-
-def _write_debug_log(system_message: str, prompt: str, answer: str, retrieved_pages: List[Dict[str, Any]]) -> None:
+def _write_debug_log(
+    system_message: str,
+    prompt: str,
+    answer: str,
+    retrieved_pages: Dict[str, Any],
+    draft_answer: str = "",
+    extracted_refs: List[str] = None,
+) -> None:
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "system_message": system_message,
         "vector_hits": retrieved_pages.get("vector_hits", []),
         "fulltext_hits": retrieved_pages.get("fulltext_hits", []),
         "merged_pages": retrieved_pages.get("merged_pages", []),
+        "draft_answer": draft_answer,
+        "extracted_refs": extracted_refs or [],
         "resolved_references": retrieved_pages.get("resolved_references", []),
         "reference_pages": retrieved_pages.get("reference_pages", []),
         "prompt": prompt,
@@ -31,7 +38,6 @@ def _write_debug_log(system_message: str, prompt: str, answer: str, retrieved_pa
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"Failed to write debug log: {str(e)}")
-
 
 
 SYSTEM_PROMPT = """You are a technical assistant for engineering standards and norms.
@@ -51,6 +57,36 @@ USER_TEMPLATE = """Question: {question}
 ===========CONTEXT END==============
 """
 
+REFERENCE_EXTRACTION_PROMPT = """You are analyzing a technical draft answer about engineering standards.
+
+Look at the draft answer below. Identify any norm sections or standards that are:
+- Mentioned or cited (e.g. "DIN EN 1993-2:2010-12, 9.5.2", "EC 3-2 9.5.2")
+- But whose specific content (formulas, values, tables) is NOT included in the answer
+
+Return ONLY a JSON array of SECTION-LEVEL search strings (do NOT include sub-paragraph numbers like (3) or (4)).
+Group all sub-paragraphs of the same section into a single entry.
+Example: ["DIN EN 1993-2 9.5.2"] — NOT ["DIN EN 1993-2 9.5.2(3)", "DIN EN 1993-2 9.5.2(4)"]
+Return [] if nothing is missing or the answer is already complete.
+
+Draft answer:
+{draft}"""
+
+
+FINAL_USER_TEMPLATE = """Question: {question}
+
+A draft answer was produced from initial search results:
+--- DRAFT ANSWER START ---
+{draft}
+--- DRAFT ANSWER END ---
+
+Additional reference pages were retrieved via cross-references. Use ALL relevant information from both the draft and the context below to produce a complete final answer.
+Do NOT omit formulas, values, or norm references that appear in the draft.
+
+==========CONTEXT START=============
+{context}
+===========CONTEXT END==============
+"""
+
 
 class QASystem:
     """Answer questions using knowledge graph and retrieval"""
@@ -61,6 +97,14 @@ class QASystem:
 
     def answer_question_stream(self, question: str, top_k: int = None) -> Generator[str, None, None]:
         """Stream answer as SSE events: status → token… → done"""
+        try:
+            yield from self._answer_question_stream_inner(question, top_k)
+        except Exception as e:
+            logger.error(f"Unhandled error in answer_question_stream: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    def _answer_question_stream_inner(self, question: str, top_k: int = None) -> Generator[str, None, None]:
+        """Inner generator — all exceptions propagate to answer_question_stream."""
         yield f"data: {json.dumps({'type': 'status', 'message': 'Searching knowledge graph...'})}\n\n"
 
         question_embedding = self.ollama.generate_embedding(question)
@@ -73,52 +117,66 @@ class QASystem:
             yield f"data: {json.dumps({'type': 'done', 'answer': 'I could not find relevant information to answer this question.', 'sources': [], 'tools_used': []})}\n\n"
             return
 
-        # --- Agentic reference expansion (question-aware, graph-based) ---
-        top_k_pages = retrieval["top_k_pages"]
-        seen_ids: set = {p["page_id"] for p in relevant_pages if p.get("page_id")}
-        retrieved_page_ids = [p["page_id"] for p in top_k_pages if p.get("page_id")]
-        all_ref_pages: List[Dict[str, Any]] = []
-        all_resolved: List[Dict[str, Any]] = []
-
-        for _iter in range(settings.agentic_max_iterations):
-            if not retrieved_page_ids:
-                break
-            new_pages, resolved = self._follow_references(
-                question_embedding, retrieved_page_ids, seen_ids
-            )
-            if not new_pages:
-                break
-            yield f"data: {json.dumps({'type': 'status', 'message': f'Following {len(resolved)} reference(s) → {len(new_pages)} page(s)...'})}\n\n"
-            seen_ids.update(p["page_id"] for p in new_pages if p.get("page_id"))
-            all_ref_pages.extend(new_pages)
-            all_resolved.extend(resolved)
-            retrieved_page_ids = [p["page_id"] for p in new_pages if p.get("page_id")]
-
-        # Context order: top-K (question relevance) → references (graph-resolved) → neighbors (absorb cuts)
-        top_k_ids = {p["page_id"] for p in top_k_pages if p.get("page_id")}
-        neighbor_pages = [p for p in relevant_pages if p.get("page_id") not in top_k_ids]
-        ordered_pages = top_k_pages + all_ref_pages + neighbor_pages
-
-        retrieval["resolved_references"] = all_resolved
-        retrieval["reference_pages"] = all_ref_pages
-        # --- End agentic expansion ---
-
-        context = self._build_context(ordered_pages)
-        sources = self._extract_sources(ordered_pages)
-
-        yield f"data: {json.dumps({'type': 'status', 'message': 'Generating answer...'})}\n\n"
-
+        # --- Step 2: First LLM call — draft answer (streamed internally, not shown to user) ---
+        # Stream tokens from Ollama and accumulate them as the draft.
+        # Emit a keepalive status event every N tokens so proxies/browsers don't
+        # close the SSE connection while waiting for the slow LLM.
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Generating draft answer...'})}\n\n"
+        context = self._build_context(relevant_pages)
         user_message = USER_TEMPLATE.format(question=question, context=context)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ]
-        full_answer = ""
-        for token in self.ollama.chat_stream(messages=messages):
-            full_answer += token
-            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+        draft = ""
+        token_count = 0
+        for token in self.ollama.chat_stream(messages, temperature=0.0, think=False):
+            draft += token
+            token_count += 1
+            if token_count % settings.draft_keepalive_interval == 0:
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Generating draft answer...'})}\n\n"
+        draft = draft.strip()
 
-        _write_debug_log(SYSTEM_PROMPT, user_message, full_answer, retrieval)
+        # --- Step 3: Extract missing references from draft ---
+        extracted_refs = self._extract_references_from_draft(draft)
+
+        ref_pages: List[Dict[str, Any]] = []
+        resolved_refs: List[Dict[str, Any]] = []
+
+        if extracted_refs:
+            yield f"data: {json.dumps({'type': 'status', 'message': f'Following {len(extracted_refs)} reference(s)...'})}\n\n"
+            seen_ids = {p["page_id"] for p in relevant_pages if p.get("page_id")}
+            ref_pages, resolved_refs = self._fetch_reference_pages(extracted_refs, seen_ids)
+            if ref_pages:
+                logger.info(f"Reference expansion: {len(extracted_refs)} ref(s) → {len(ref_pages)} new page(s)")
+
+        retrieval["resolved_references"] = resolved_refs
+        retrieval["reference_pages"] = ref_pages
+
+        # --- Step 4/5: Final answer ---
+        if ref_pages:
+            # Regenerate: pass draft + only reference pages as context
+            # (original pages are already summarised in the draft; adding them again would dilute with noise)
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Regenerating with additional references...'})}\n\n"
+            ref_context = self._build_context(ref_pages)
+            final_user_message = FINAL_USER_TEMPLATE.format(
+                question=question, draft=draft, context=ref_context
+            )
+            final_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": final_user_message},
+            ]
+            full_answer = ""
+            for token in self.ollama.chat_stream(messages=final_messages):
+                full_answer += token
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+        else:
+            # No new references found — stream the draft as the final answer
+            full_answer = draft
+            yield f"data: {json.dumps({'type': 'token', 'content': draft})}\n\n"
+
+        sources = self._extract_sources(relevant_pages + ref_pages)
+        _write_debug_log(SYSTEM_PROMPT, user_message, full_answer, retrieval, draft, extracted_refs)
         yield f"data: {json.dumps({'type': 'done', 'answer': full_answer, 'sources': sources, 'tools_used': []})}\n\n"
 
     def _retrieve_relevant_pages(
@@ -256,32 +314,50 @@ class QASystem:
         logger.info(f"Neighbor expansion: {len(hits)} hits + {len(extra)} neighbors = {len(results)} total")
         return results
 
-    def _follow_references(
-        self, question_embedding: list, retrieved_page_ids: List[str], seen_ids: set
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Find references semantically similar to the question, then follow RESOLVED_TO.
+    def _extract_references_from_draft(self, draft: str) -> List[str]:
+        """Ask the LLM to identify norm sections cited in the draft but not fully answered.
 
-        Uses vector search on the reference_embeddings index so only references whose
-        context is relevant to the question are followed — not all references on a page.
-
-        Args:
-            question_embedding: embedding of the user's question
-            retrieved_page_ids: page IDs from RRF retrieval; references must be CITED_ON
-                one of these pages (scope guard). Pass empty list to disable scoping.
-            seen_ids: page IDs already in context (deduplication)
-
-        Returns:
-            new_pages: target pages reached via resolved references
-            resolved: list of {full_reference, target_page_id} for debug log
+        Returns a list of search strings (e.g. ["DIN EN 1993-2 9.5.2"]) or [] if complete.
         """
-        max_pages = settings.agentic_max_references * settings.agentic_max_pages_per_ref
-        cypher = """
-            CALL db.index.vector.queryNodes($ref_index, $top_k_refs, $question_embedding)
+        prompt = REFERENCE_EXTRACTION_PROMPT.format(draft=draft)
+        try:
+            raw = self.ollama.chat([{"role": "user", "content": prompt}], temperature=0.0)
+        except Exception as e:
+            logger.warning(f"Reference extraction LLM call failed: {e}")
+            return []
+
+        # Strip any residual <think>...</think> blocks
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+
+        # Extract JSON array from response (handles markdown code fences)
+        match = re.search(r"\[.*?\]", raw, re.DOTALL)
+        if not match:
+            logger.info("Reference extraction: no JSON array found in response")
+            return []
+
+        try:
+            refs = json.loads(match.group())
+            if isinstance(refs, list):
+                result = [str(r).strip() for r in refs if r]
+                logger.info(f"Reference extraction: {result}")
+                return result[:settings.reference_extraction_max_refs]
+        except json.JSONDecodeError:
+            logger.warning(f"Reference extraction: failed to parse JSON: {match.group()!r}")
+
+        return []
+
+    def _fetch_reference_pages(
+        self, ref_strings: List[str], seen_ids: set
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """For each extracted reference string, search Reference nodes via fulltext,
+        follow RESOLVED_TO to target pages, and expand 1 NEXT_PAGE neighbor.
+
+        Returns (new_pages, resolved) where resolved logs which ref → which page.
+        """
+        ref_cypher = """
+            CALL db.index.fulltext.queryNodes($ref_index, $ref_string)
             YIELD node AS r, score
-            WHERE score >= $min_similarity
-              AND (size($retrieved_page_ids) = 0 OR EXISTS {
-                  MATCH (r)-[:CITED_ON]->(src:Page) WHERE src.id IN $retrieved_page_ids
-              })
+            WHERE score >= $threshold
             MATCH (r)-[:RESOLVED_TO]->(target:Page)
             WHERE NOT target.id IN $seen_ids
             MATCH (target)-[:BELONGS_TO]->(d:Document)
@@ -293,42 +369,77 @@ class QASystem:
                 target.header       AS header,
                 d.id                AS document_id,
                 d.name              AS document_name,
-                r.full_reference    AS _source_query
+                r.full_reference    AS _source_ref
             LIMIT $max_pages
         """
-        try:
-            rows = self.db.execute_query(cypher, {
-                "ref_index": settings.reference_vector_index_name,
-                "top_k_refs": settings.agentic_max_references,
-                "question_embedding": question_embedding,
-                "min_similarity": settings.reference_min_similarity,
-                "retrieved_page_ids": retrieved_page_ids,
-                "seen_ids": list(seen_ids),
-                "max_pages": max_pages,
-            })
-        except Exception as e:
-            logger.warning(f"Reference graph traversal failed: {e}")
-            return [], []
+        neighbor_depth = settings.reference_neighbor_pages
+        neighbor_cypher = f"""
+            MATCH (start:Page {{id: $page_id}})-[:NEXT_PAGE*1..{neighbor_depth}]->(nb:Page)
+            MATCH (nb)-[:BELONGS_TO]->(doc:Document)
+            RETURN
+                nb.id           AS page_id,
+                nb.page_number  AS page_number,
+                nb.markdown     AS markdown,
+                nb.tables_json  AS tables_json,
+                nb.header       AS header,
+                doc.id          AS document_id,
+                doc.name        AS document_name,
+                $base_score     AS score
+        """
 
-        new_pages = []
-        resolved = []
-        for row in rows:
-            pid = row.get("page_id")
-            if pid and pid not in seen_ids:
-                new_pages.append({k: v for k, v in row.items() if not k.startswith("_")})
-                resolved.append({
-                    "full_reference": row.get("_source_query"),
+        local_seen = set(seen_ids)
+        all_pages: List[Dict[str, Any]] = []
+        all_resolved: List[Dict[str, Any]] = []
+
+        for ref_str in ref_strings:
+            try:
+                rows = self.db.execute_query(ref_cypher, {
+                    "ref_index": settings.reference_fulltext_index_name,
+                    "ref_string": ref_str,
+                    "threshold": settings.reference_resolve_score_threshold,
+                    "seen_ids": list(local_seen),
+                    "max_pages": settings.reference_extraction_max_pages,
+                })
+            except Exception as e:
+                logger.warning(f"Reference fetch failed for '{ref_str}': {e}")
+                continue
+
+            for row in rows:
+                pid = row.get("page_id")
+                if not pid or pid in local_seen:
+                    continue
+                local_seen.add(pid)
+                page = {k: v for k, v in row.items() if not k.startswith("_")}
+                all_pages.append(page)
+                all_resolved.append({
+                    "ref_string": ref_str,
+                    "full_reference": row.get("_source_ref"),
                     "target_page_id": pid,
                 })
 
+                # Expand NEXT_PAGE neighbors of the resolved page
+                if neighbor_depth > 0:
+                    try:
+                        neighbors = self.db.execute_query(neighbor_cypher, {
+                            "page_id": pid,
+                            "base_score": 0.0,
+                        })
+                        for nb in neighbors:
+                            nb_id = nb.get("page_id")
+                            if nb_id and nb_id not in local_seen:
+                                local_seen.add(nb_id)
+                                all_pages.append(nb)
+                    except Exception as e:
+                        logger.warning(f"Neighbor expansion failed for ref page {pid}: {e}")
+
         logger.info(
-            f"Question-aware reference traversal: {len(retrieved_page_ids)} scope page(s) → "
-            f"{len(resolved)} reference(s) → {len(new_pages)} new page(s)"
+            f"Reference fetch: {len(ref_strings)} string(s) → "
+            f"{len(all_resolved)} resolved ref(s) → {len(all_pages)} page(s)"
         )
-        return new_pages, resolved
+        return all_pages, all_resolved
 
     def _build_context(self, pages: List[Dict[str, Any]]) -> str:
-        budget_chars = (settings.ollama_num_ctx - CONTEXT_RESERVED_TOKENS) * CHARS_PER_TOKEN
+        budget_chars = (settings.ollama_num_ctx - settings.context_reserved_tokens) * settings.chars_per_token
 
         parts = []
         used = 0

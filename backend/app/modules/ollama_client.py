@@ -50,7 +50,7 @@ class OllamaClient:
             data = response.json()
             return data.get("embeddings", [[]])[0]
         except Exception as e:
-            logger.error(f"Error generating embedding: {str(e)}")
+            logger.error(f"generate_embedding() failed (model={settings.ollama_embedding_model}): {e}", exc_info=True)
             raise
     
     def generate_text(
@@ -99,26 +99,41 @@ class OllamaClient:
     
     def chat(self, messages: list, temperature: float = 0.0) -> str:
         """Non-streaming chat — returns full response string.
+        Uses stream=True internally to avoid read-timeout on long responses;
+        tokens are collected and returned as a single string.
         Thinking is disabled (think=False) so models like qwen3 return content directly."""
-        response = requests.post(
-            f"{self.base_url}/api/chat",
-            json={
-                "model": settings.ollama_llm_model,
-                "messages": messages,
-                "stream": False,
-                "think": False,
-                "options": {"temperature": temperature, "num_ctx": settings.ollama_num_ctx},
-            },
-            timeout=600,
-        )
-        response.raise_for_status()
-        return response.json().get("message", {}).get("content", "").strip()
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": settings.ollama_llm_model,
+                    "messages": messages,
+                    "stream": True,
+                    "think": False,
+                    "options": {"temperature": temperature, "num_ctx": settings.ollama_num_ctx},
+                },
+                stream=True,
+                timeout=settings.ollama_chat_timeout,
+            )
+            response.raise_for_status()
+            content = ""
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    content += data.get("message", {}).get("content", "")
+                    if data.get("done"):
+                        break
+            return content.strip()
+        except Exception as e:
+            logger.error(f"chat() failed (model={settings.ollama_llm_model}): {e}", exc_info=True)
+            raise
 
     def chat_stream(
         self,
         messages: list,
         model: Optional[str] = None,
         temperature: float = 0.1,
+        think: bool = False,
     ) -> Generator[str, None, None]:
         """Stream chat response token by token using /api/chat."""
         if model is None:
@@ -131,13 +146,14 @@ class OllamaClient:
                     "model": model,
                     "messages": messages,
                     "stream": True,
+                    "think": think,
                     "options": {
                         "temperature": temperature,
                         "num_ctx": settings.ollama_num_ctx,
                     },
                 },
                 stream=True,
-                timeout=300,
+                timeout=settings.ollama_chat_timeout,
             )
             response.raise_for_status()
             for line in response.iter_lines():
@@ -149,7 +165,7 @@ class OllamaClient:
                     if data.get("done"):
                         break
         except Exception as e:
-            logger.error(f"Error in chat stream: {str(e)}")
+            logger.error(f"chat_stream() failed (model={model}): {e}", exc_info=True)
             raise
 
     def list_models(self) -> list:

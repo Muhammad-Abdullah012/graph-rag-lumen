@@ -10,7 +10,7 @@ RUN npm i
 COPY frontend/src ./src
 COPY frontend/public ./public
 
-ENV REACT_APP_API_URL=http://localhost:9000
+ENV REACT_APP_API_URL=https://test.data-style.com
 
 RUN npm run build
 

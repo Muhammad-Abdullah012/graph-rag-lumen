@@ -9,14 +9,22 @@ import './QAChat.css';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
+function stripTagFromInlineMath(content) {
+  // Match inline math: single $ ... $ (not preceded/followed by another $)
+  return content.replace(
+    /(?<!\$)\$(?!\$)([\s\S]*?)(?<!\$)\$(?!\$)/g,
+    (match, inner) => '$' + inner.replace(/\\tag\s*\*?\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}/g, '') + '$'
+  );
+}
+
 /**
  * Decode HTML entities that OCR/PDF extraction embeds inside LaTeX formulas.
  * Without this, KaTeX throws "Expected '}', got '&'" on strings like
  * \sum_{\mathrm{i} &gt; 1}  (should be >).
  */
 function decodeLatexEntities(content) {
-  return content
-    .replace(/\\tag\*?\{[^}]*\}/g, '')
+  return stripTagFromInlineMath(content)
+    .replace(/\\tag\s*\*?\s*\{[^}]*\}/g, '')
     .replace(/&gt;/g, '>')
     .replace(/&lt;/g, '<')
     .replace(/&amp;/g, '&')
@@ -198,6 +206,15 @@ function QAChat() {
         }
         return prev;
       });
+    } else if (event.type === 'error') {
+      setMessages((prev) => {
+        const msgs = [...prev];
+        const last = msgs[msgs.length - 1];
+        const errMsg = { role: 'assistant', content: `Fehler: ${event.message}`, streaming: false, tools_used: [] };
+        if (last?.streaming) return [...msgs.slice(0, -1), errMsg];
+        return [...msgs, errMsg];
+      });
+      setStreamStatus('');
     } else if (event.type === 'done') {
       // Replace the streaming placeholder with the finalised, post-processed answer
       setMessages((prev) => {

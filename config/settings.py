@@ -44,6 +44,8 @@ class Settings(BaseSettings):
 
     # LLM context window
     ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
+    # Per-chunk read timeout for streaming Ollama calls (seconds)
+    ollama_chat_timeout: int = int(os.getenv("OLLAMA_CHAT_TIMEOUT", "300"))
 
     # Retrieval
     retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
@@ -57,15 +59,22 @@ class Settings(BaseSettings):
     images_path: str = os.getenv("IMAGES_PATH", "/backend/images")
     batch_poll_interval: int = int(os.getenv("BATCH_POLL_INTERVAL", "5"))
 
-    # Agentic retrieval (graph-based reference following)
-    agentic_max_iterations: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "2"))
-    agentic_max_references: int = int(os.getenv("AGENTIC_MAX_REFERENCES", "3"))
-    agentic_max_pages_per_ref: int = int(os.getenv("AGENTIC_MAX_PAGES_PER_REF", "2"))
+    # Agentic retrieval (2-call: draft → extract refs → fetch → final)
+    reference_extraction_max_refs: int = int(os.getenv("REFERENCE_EXTRACTION_MAX_REFS", "5"))
+    reference_extraction_max_pages: int = int(os.getenv("REFERENCE_EXTRACTION_MAX_PAGES", "3"))
+    reference_neighbor_pages: int = int(os.getenv("REFERENCE_NEIGHBOR_PAGES", "1"))
 
     # Reference / Table / Image node extraction
     reference_context_chars: int = int(os.getenv("REFERENCE_CONTEXT_CHARS", "100"))
     reference_resolve_score_threshold: float = float(os.getenv("REFERENCE_RESOLVE_SCORE_THRESHOLD", "2.0"))
-    reference_min_similarity: float = float(os.getenv("REFERENCE_MIN_SIMILARITY", "0.5"))
+
+    # Context budget
+    chars_per_token: int = int(os.getenv("CHARS_PER_TOKEN", "4"))
+    context_reserved_tokens: int = int(os.getenv("CONTEXT_RESERVED_TOKENS", "500"))
+
+    # SSE keepalive: emit a status ping every N tokens during draft generation
+    # to prevent proxies/browsers from closing the idle connection
+    draft_keepalive_interval: int = int(os.getenv("DRAFT_KEEPALIVE_INTERVAL", "30"))
 
     # Debug
     debug_log_path: str = os.getenv("DEBUG_LOG_PATH", "/app/debug_raw.jsonl")
