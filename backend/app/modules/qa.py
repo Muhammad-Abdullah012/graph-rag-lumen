@@ -2,7 +2,7 @@
 import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Generator
+from typing import List, Dict, Any, Generator, Tuple
 
 from backend.app.modules.database import get_neo4j_connection
 from backend.app.modules.ollama_client import get_ollama_client
@@ -21,6 +21,8 @@ def _write_debug_log(system_message: str, prompt: str, answer: str, retrieved_pa
         "vector_hits": retrieved_pages.get("vector_hits", []),
         "fulltext_hits": retrieved_pages.get("fulltext_hits", []),
         "merged_pages": retrieved_pages.get("merged_pages", []),
+        "resolved_references": retrieved_pages.get("resolved_references", []),
+        "reference_pages": retrieved_pages.get("reference_pages", []),
         "prompt": prompt,
         "answer": answer,
     }
@@ -29,6 +31,7 @@ def _write_debug_log(system_message: str, prompt: str, answer: str, retrieved_pa
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"Failed to write debug log: {str(e)}")
+
 
 
 SYSTEM_PROMPT = """You are a technical assistant for engineering standards and norms.
@@ -70,8 +73,38 @@ class QASystem:
             yield f"data: {json.dumps({'type': 'done', 'answer': 'I could not find relevant information to answer this question.', 'sources': [], 'tools_used': []})}\n\n"
             return
 
-        context = self._build_context(relevant_pages)
-        sources = self._extract_sources(relevant_pages)
+        # --- Agentic reference expansion (question-aware, graph-based) ---
+        top_k_pages = retrieval["top_k_pages"]
+        seen_ids: set = {p["page_id"] for p in relevant_pages if p.get("page_id")}
+        retrieved_page_ids = [p["page_id"] for p in top_k_pages if p.get("page_id")]
+        all_ref_pages: List[Dict[str, Any]] = []
+        all_resolved: List[Dict[str, Any]] = []
+
+        for _iter in range(settings.agentic_max_iterations):
+            if not retrieved_page_ids:
+                break
+            new_pages, resolved = self._follow_references(
+                question_embedding, retrieved_page_ids, seen_ids
+            )
+            if not new_pages:
+                break
+            yield f"data: {json.dumps({'type': 'status', 'message': f'Following {len(resolved)} reference(s) → {len(new_pages)} page(s)...'})}\n\n"
+            seen_ids.update(p["page_id"] for p in new_pages if p.get("page_id"))
+            all_ref_pages.extend(new_pages)
+            all_resolved.extend(resolved)
+            retrieved_page_ids = [p["page_id"] for p in new_pages if p.get("page_id")]
+
+        # Context order: top-K (question relevance) → references (graph-resolved) → neighbors (absorb cuts)
+        top_k_ids = {p["page_id"] for p in top_k_pages if p.get("page_id")}
+        neighbor_pages = [p for p in relevant_pages if p.get("page_id") not in top_k_ids]
+        ordered_pages = top_k_pages + all_ref_pages + neighbor_pages
+
+        retrieval["resolved_references"] = all_resolved
+        retrieval["reference_pages"] = all_ref_pages
+        # --- End agentic expansion ---
+
+        context = self._build_context(ordered_pages)
+        sources = self._extract_sources(ordered_pages)
 
         yield f"data: {json.dumps({'type': 'status', 'message': 'Generating answer...'})}\n\n"
 
@@ -104,7 +137,8 @@ class QASystem:
         return {
             "vector_hits": vector_hits,
             "fulltext_hits": fulltext_hits,
-            "merged_pages": final,
+            "top_k_pages": merged,       # RRF top-K only, before neighbor expansion
+            "merged_pages": final,       # top-K + neighbor-expanded pages
         }
 
     def _vector_search(self, embedding: list, top_k: int) -> List[Dict[str, Any]]:
@@ -221,6 +255,77 @@ class QASystem:
         results = hits + extra
         logger.info(f"Neighbor expansion: {len(hits)} hits + {len(extra)} neighbors = {len(results)} total")
         return results
+
+    def _follow_references(
+        self, question_embedding: list, retrieved_page_ids: List[str], seen_ids: set
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Find references semantically similar to the question, then follow RESOLVED_TO.
+
+        Uses vector search on the reference_embeddings index so only references whose
+        context is relevant to the question are followed — not all references on a page.
+
+        Args:
+            question_embedding: embedding of the user's question
+            retrieved_page_ids: page IDs from RRF retrieval; references must be CITED_ON
+                one of these pages (scope guard). Pass empty list to disable scoping.
+            seen_ids: page IDs already in context (deduplication)
+
+        Returns:
+            new_pages: target pages reached via resolved references
+            resolved: list of {full_reference, target_page_id} for debug log
+        """
+        max_pages = settings.agentic_max_references * settings.agentic_max_pages_per_ref
+        cypher = """
+            CALL db.index.vector.queryNodes($ref_index, $top_k_refs, $question_embedding)
+            YIELD node AS r, score
+            WHERE score >= $min_similarity
+              AND (size($retrieved_page_ids) = 0 OR EXISTS {
+                  MATCH (r)-[:CITED_ON]->(src:Page) WHERE src.id IN $retrieved_page_ids
+              })
+            MATCH (r)-[:RESOLVED_TO]->(target:Page)
+            WHERE NOT target.id IN $seen_ids
+            MATCH (target)-[:BELONGS_TO]->(d:Document)
+            RETURN DISTINCT
+                target.id           AS page_id,
+                target.page_number  AS page_number,
+                target.markdown     AS markdown,
+                target.tables_json  AS tables_json,
+                target.header       AS header,
+                d.id                AS document_id,
+                d.name              AS document_name,
+                r.full_reference    AS _source_query
+            LIMIT $max_pages
+        """
+        try:
+            rows = self.db.execute_query(cypher, {
+                "ref_index": settings.reference_vector_index_name,
+                "top_k_refs": settings.agentic_max_references,
+                "question_embedding": question_embedding,
+                "min_similarity": settings.reference_min_similarity,
+                "retrieved_page_ids": retrieved_page_ids,
+                "seen_ids": list(seen_ids),
+                "max_pages": max_pages,
+            })
+        except Exception as e:
+            logger.warning(f"Reference graph traversal failed: {e}")
+            return [], []
+
+        new_pages = []
+        resolved = []
+        for row in rows:
+            pid = row.get("page_id")
+            if pid and pid not in seen_ids:
+                new_pages.append({k: v for k, v in row.items() if not k.startswith("_")})
+                resolved.append({
+                    "full_reference": row.get("_source_query"),
+                    "target_page_id": pid,
+                })
+
+        logger.info(
+            f"Question-aware reference traversal: {len(retrieved_page_ids)} scope page(s) → "
+            f"{len(resolved)} reference(s) → {len(new_pages)} new page(s)"
+        )
+        return new_pages, resolved
 
     def _build_context(self, pages: List[Dict[str, Any]]) -> str:
         budget_chars = (settings.ollama_num_ctx - CONTEXT_RESERVED_TOKENS) * CHARS_PER_TOKEN

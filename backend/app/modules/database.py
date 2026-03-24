@@ -65,8 +65,8 @@ class Neo4jConnection:
             logger.error(f"Error executing query: {str(e)}")
             raise
     
-    def create_vector_index(self):
-        """Create vector similarity index for embeddings"""
+    def create_vector_index(self, dimension: int):
+        """Create vector similarity index for Page embeddings."""
         try:
             result = self.execute_query(
                 "SHOW INDEXES WHERE name = $index_name",
@@ -76,12 +76,7 @@ class Neo4jConnection:
                 logger.info(f"Vector index '{settings.vector_index_name}' already exists")
                 return
 
-            # Auto-detect embedding dimension from the model
-            from backend.app.modules.ollama_client import get_ollama_client
-            dimension = len(get_ollama_client().generate_embedding("dimension probe"))
-            logger.info(f"Detected embedding dimension: {dimension}")
-
-            create_query = f"""
+            self.execute_query(f"""
                 CREATE VECTOR INDEX {settings.vector_index_name}
                 FOR (n:Page) ON (n.embedding)
                 OPTIONS {{
@@ -90,8 +85,7 @@ class Neo4jConnection:
                         `vector.similarity_function`: 'cosine'
                     }}
                 }}
-            """
-            self.execute_query(create_query)
+            """)
             logger.info(f"Created vector index: {settings.vector_index_name}")
 
         except Exception as e:
@@ -114,6 +108,93 @@ class Neo4jConnection:
             logger.info(f"Created fulltext index: {settings.fulltext_index_name}")
         except Exception as e:
             logger.warning(f"Could not create fulltext index: {str(e)}")
+
+    def create_reference_indices(self, dimension: int):
+        """Create vector + fulltext indices for Reference nodes."""
+        vec_name = settings.reference_vector_index_name
+        ft_name = settings.reference_fulltext_index_name
+        try:
+            existing = {r["name"] for r in self.execute_query("SHOW INDEXES YIELD name")}
+
+            if vec_name not in existing:
+                self.execute_query(f"""
+                    CREATE VECTOR INDEX {vec_name}
+                    FOR (n:Reference) ON (n.embedding)
+                    OPTIONS {{
+                        indexConfig: {{
+                            `vector.dimensions`: {dimension},
+                            `vector.similarity_function`: 'cosine'
+                        }}
+                    }}
+                """)
+                logger.info(f"Created vector index: {vec_name}")
+
+            if ft_name not in existing:
+                self.execute_query(
+                    f"CREATE FULLTEXT INDEX {ft_name} "
+                    f"FOR (n:Reference) ON EACH [n.full_reference, n.norm, n.section]"
+                )
+                logger.info(f"Created fulltext index: {ft_name}")
+        except Exception as e:
+            logger.warning(f"Could not create reference indices: {e}")
+
+    def create_table_indices(self, dimension: int):
+        """Create vector + fulltext indices for Table nodes."""
+        vec_name = settings.table_vector_index_name
+        ft_name = settings.table_fulltext_index_name
+        try:
+            existing = {r["name"] for r in self.execute_query("SHOW INDEXES YIELD name")}
+
+            if vec_name not in existing:
+                self.execute_query(f"""
+                    CREATE VECTOR INDEX {vec_name}
+                    FOR (n:Table) ON (n.embedding)
+                    OPTIONS {{
+                        indexConfig: {{
+                            `vector.dimensions`: {dimension},
+                            `vector.similarity_function`: 'cosine'
+                        }}
+                    }}
+                """)
+                logger.info(f"Created vector index: {vec_name}")
+
+            if ft_name not in existing:
+                self.execute_query(
+                    f"CREATE FULLTEXT INDEX {ft_name} "
+                    f"FOR (n:Table) ON EACH [n.content, n.caption]"
+                )
+                logger.info(f"Created fulltext index: {ft_name}")
+        except Exception as e:
+            logger.warning(f"Could not create table indices: {e}")
+
+    def create_image_indices(self, dimension: int):
+        """Create vector + fulltext indices for Image nodes."""
+        vec_name = settings.image_vector_index_name
+        ft_name = settings.image_fulltext_index_name
+        try:
+            existing = {r["name"] for r in self.execute_query("SHOW INDEXES YIELD name")}
+
+            if vec_name not in existing:
+                self.execute_query(f"""
+                    CREATE VECTOR INDEX {vec_name}
+                    FOR (n:Image) ON (n.embedding)
+                    OPTIONS {{
+                        indexConfig: {{
+                            `vector.dimensions`: {dimension},
+                            `vector.similarity_function`: 'cosine'
+                        }}
+                    }}
+                """)
+                logger.info(f"Created vector index: {vec_name}")
+
+            if ft_name not in existing:
+                self.execute_query(
+                    f"CREATE FULLTEXT INDEX {ft_name} "
+                    f"FOR (n:Image) ON EACH [n.caption]"
+                )
+                logger.info(f"Created fulltext index: {ft_name}")
+        except Exception as e:
+            logger.warning(f"Could not create image indices: {e}")
 
     def create_constraints(self):
         """Create database constraints"""
@@ -144,8 +225,16 @@ def get_neo4j_connection() -> Neo4jConnection:
             try:
                 conn = Neo4jConnection()
                 conn.create_constraints()
-                conn.create_vector_index()
                 conn.create_fulltext_index()
+
+                from backend.app.modules.ollama_client import get_ollama_client
+                dimension = len(get_ollama_client().generate_embedding("dimension probe"))
+                logger.info(f"Detected embedding dimension: {dimension}")
+
+                conn.create_vector_index(dimension)
+                conn.create_reference_indices(dimension)
+                conn.create_table_indices(dimension)
+                conn.create_image_indices(dimension)
                 _neo4j_connection = conn
                 break
             except (ServiceUnavailable, TransientError) as e:

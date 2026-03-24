@@ -29,9 +29,18 @@ class Settings(BaseSettings):
     documents_path: str = os.getenv("DOCUMENTS_PATH", "/tmp/documents")
     documents_base_url: str = os.getenv("DOCUMENTS_BASE_URL", "http://localhost:8080/documents")
     
-    # Indexes
+    # Indexes — Page
     vector_index_name: str = os.getenv("VECTOR_INDEX_NAME", "page_embeddings")
     fulltext_index_name: str = os.getenv("FULLTEXT_INDEX_NAME", "page_fulltext")
+    # Indexes — Reference
+    reference_vector_index_name: str = os.getenv("REFERENCE_VECTOR_INDEX_NAME", "reference_embeddings")
+    reference_fulltext_index_name: str = os.getenv("REFERENCE_FULLTEXT_INDEX_NAME", "reference_fulltext")
+    # Indexes — Table
+    table_vector_index_name: str = os.getenv("TABLE_VECTOR_INDEX_NAME", "table_embeddings")
+    table_fulltext_index_name: str = os.getenv("TABLE_FULLTEXT_INDEX_NAME", "table_fulltext")
+    # Indexes — Image
+    image_vector_index_name: str = os.getenv("IMAGE_VECTOR_INDEX_NAME", "image_embeddings")
+    image_fulltext_index_name: str = os.getenv("IMAGE_FULLTEXT_INDEX_NAME", "image_fulltext")
 
     # LLM context window
     ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
@@ -47,6 +56,16 @@ class Settings(BaseSettings):
     json_output_path: str = os.getenv("JSON_OUTPUT_PATH", "/backend/json")
     images_path: str = os.getenv("IMAGES_PATH", "/backend/images")
     batch_poll_interval: int = int(os.getenv("BATCH_POLL_INTERVAL", "5"))
+
+    # Agentic retrieval (graph-based reference following)
+    agentic_max_iterations: int = int(os.getenv("AGENTIC_MAX_ITERATIONS", "2"))
+    agentic_max_references: int = int(os.getenv("AGENTIC_MAX_REFERENCES", "3"))
+    agentic_max_pages_per_ref: int = int(os.getenv("AGENTIC_MAX_PAGES_PER_REF", "2"))
+
+    # Reference / Table / Image node extraction
+    reference_context_chars: int = int(os.getenv("REFERENCE_CONTEXT_CHARS", "100"))
+    reference_resolve_score_threshold: float = float(os.getenv("REFERENCE_RESOLVE_SCORE_THRESHOLD", "2.0"))
+    reference_min_similarity: float = float(os.getenv("REFERENCE_MIN_SIMILARITY", "0.5"))
 
     # Debug
     debug_log_path: str = os.getenv("DEBUG_LOG_PATH", "/app/debug_raw.jsonl")

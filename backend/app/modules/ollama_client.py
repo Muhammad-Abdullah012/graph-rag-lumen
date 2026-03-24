@@ -97,6 +97,23 @@ class OllamaClient:
             logger.error(f"Error generating text: {str(e)}")
             raise
     
+    def chat(self, messages: list, temperature: float = 0.0) -> str:
+        """Non-streaming chat — returns full response string.
+        Thinking is disabled (think=False) so models like qwen3 return content directly."""
+        response = requests.post(
+            f"{self.base_url}/api/chat",
+            json={
+                "model": settings.ollama_llm_model,
+                "messages": messages,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": temperature, "num_ctx": settings.ollama_num_ctx},
+            },
+            timeout=600,
+        )
+        response.raise_for_status()
+        return response.json().get("message", {}).get("content", "").strip()
+
     def chat_stream(
         self,
         messages: list,
